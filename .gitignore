@@ -1,0 +1,28 @@
+# Python and build artifacts
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# Local media, analysis, and credentials
+media/
+output/
+projects/
+.env
+.env.*
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.srt
+*.vtt
+*.local.json
+.DS_Store

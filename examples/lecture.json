@@ -1,0 +1,40 @@
+{
+  "schema_version": "draft-0",
+  "profile": "lecture",
+  "sources": {
+    "screen": "../media/screen.mp4",
+    "speaker": "../media/speaker.mp4"
+  },
+  "composition": {
+    "canvas": "screen",
+    "preserve_screen_frame": true,
+    "speaker_overlay": {
+      "position": "top-right",
+      "width_fraction": 0.125,
+      "margin_fraction": 0.01,
+      "preserve_speaker_frame": true,
+      "preserve_aspect_ratio": true
+    }
+  },
+  "audio": {
+    "source": null,
+    "mix_sources": false
+  },
+  "sync": {
+    "reference": "screen",
+    "offset_seconds": null,
+    "require_offset_and_drift_validation": true
+  },
+  "editing": {
+    "pre_lecture": "auto_when_clear",
+    "long_silence": "auto_when_clear",
+    "speech_disfluency": "review_required",
+    "uncertain": "keep",
+    "protected_spans": []
+  },
+  "analysis": {
+    "cloud_enabled": false,
+    "provider": null
+  },
+  "output": "../output/lecture.mp4"
+}
