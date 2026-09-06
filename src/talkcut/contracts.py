@@ -296,7 +296,7 @@ def code_identity(repo_root: str | Path) -> dict[str, Any]:
 
     root = Path(repo_root).resolve()
     names: set[str] = set()
-    for directory in ("src", "tests", "schemas", ".github"):
+    for directory in ("src", "tests", "schemas", ".github", "examples"):
         base = root / directory
         if base.exists():
             names.update(

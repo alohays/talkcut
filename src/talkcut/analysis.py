@@ -400,10 +400,10 @@ def analyze_source(
     }
 
 
-def authorize_automatic_candidate(
-    analysis_ref: dict[str, str], candidate: dict[str, Any], plan: dict[str, Any]
+def verify_analysis_report(
+    analysis_ref: dict[str, str], plan: dict[str, Any]
 ) -> dict[str, Any]:
-    """Re-execute policy from original acoustic/context evidence before a cut."""
+    """Recompute the complete ledger even when no deletion was proposed."""
     from .project import verified_json
 
     recorded = verified_json(analysis_ref)
@@ -416,9 +416,7 @@ def authorize_automatic_candidate(
             "REVIEW_REQUIRED",
             "Real executed source analysis is required for automatic deletion",
         )
-    if candidate.get("test_only") or recorded.get("source_hashes") != plan.get(
-        "source_hashes"
-    ):
+    if recorded.get("source_hashes") != plan.get("source_hashes"):
         raise TalkCutError(
             "STALE_ANALYSIS", "Automatic candidate belongs to another source or fixture"
         )
@@ -456,6 +454,32 @@ def authorize_automatic_candidate(
         raise TalkCutError(
             "STALE_ANALYSIS", "Current plan changed the source protection evidence"
         )
+    for key in (
+        "status",
+        "domain",
+        "coverage",
+        "segments",
+        "protected_intervals",
+        "candidates",
+        "proposer_run_id",
+    ):
+        if recorded.get(key) != regenerated.get(key):
+            raise TalkCutError(
+                "STALE_ANALYSIS",
+                f"Recorded analysis {key} differs from source policy recomputation",
+            )
+    return regenerated
+
+
+def authorize_automatic_candidate(
+    analysis_ref: dict[str, str], candidate: dict[str, Any], plan: dict[str, Any]
+) -> dict[str, Any]:
+    """Re-execute policy from original acoustic/context evidence before a cut."""
+    if candidate.get("test_only"):
+        raise TalkCutError(
+            "STALE_ANALYSIS", "Automatic candidate belongs to another source or fixture"
+        )
+    regenerated = verify_analysis_report(analysis_ref, plan)
     current = next(
         (
             item

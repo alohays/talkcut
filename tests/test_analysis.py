@@ -278,5 +278,5 @@ def test_automatic_authorization_recomputes_policy_not_recorded_action(
         False
     )
     atomic_json(analysis_path, report)
-    with pytest.raises(TalkCutError, match="does not permit"):
+    with pytest.raises(TalkCutError, match="source policy recomputation"):
         authorize_automatic_candidate(artifact_ref(analysis_path), candidate, plan)

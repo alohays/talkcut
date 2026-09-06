@@ -140,7 +140,19 @@ def _receipt(ref: Any) -> dict[str, Any]:
     return value
 
 
-def _capability(value: dict[str, Any]) -> dict[str, Any]:
+PRECISION_REVIEW_SCOPES = {"source_sync", "seam", "lip_sync"}
+
+
+def precision_review_required(request: dict[str, Any]) -> bool:
+    return (
+        request.get("scope") in PRECISION_REVIEW_SCOPES
+        or request.get("details", {}).get("requires_dense_video") is True
+    )
+
+
+def _capability(
+    value: dict[str, Any], *, precision_required: bool = True
+) -> dict[str, Any]:
     _require(
         value.get("schema_version") == "review-capability/v1",
         "Executed capability record missing",
@@ -179,10 +191,17 @@ def _capability(value: dict[str, Any]) -> dict[str, Any]:
         "Actual observed frame timestamps unavailable",
     )
     gap = max(b - a for a, b in pairwise(timestamps))
-    _require(
-        gap <= Fraction(40, 1000),
-        "Actual supplied frames are too sparse for lip/seam timing; model uncertainty cannot override sampling",
-    )
+    if precision_required:
+        _require(
+            gap <= Fraction(40, 1000),
+            "Actual supplied frames are too sparse for lip/seam timing; model uncertainty cannot override sampling",
+        )
+    elif gap > Fraction(40, 1000):
+        _require(
+            isinstance(observation.get("sampling_limitations"), str)
+            and len(observation["sampling_limitations"].strip()) >= 30,
+            "Semantic AV capability must disclose sampling limits; it does not certify dense motion or lip timing",
+        )
     _require(
         observation.get("request_sha256") == execution["request"]["sha256"],
         "Observed input sampling is not bound to executed request",
@@ -228,6 +247,11 @@ def _capability(value: dict[str, Any]) -> dict[str, Any]:
         "model_revision": execution["model_revision"],
         "max_actual_frame_gap_ms": float(gap * 1000),
         "audio_continuous": True,
+        "precision_supported": gap <= Fraction(40, 1000),
+        "sampling_limitations": observation.get(
+            "sampling_limitations",
+            "Known timestamped frame sequence; no claim about unobserved events between samples",
+        ),
     }
 
 
@@ -237,7 +261,9 @@ def verify_context_execution(context: dict[str, Any]) -> dict[str, Any]:
         _require(
             not context.get("test_only"), "Fixture context cannot certify real source"
         )
-        capability = _capability(_artifact(context.get("capability")))
+        capability = _capability(
+            _artifact(context.get("capability")), precision_required=False
+        )
         execution = _receipt(context.get("receipt"))
         _require(
             execution["model_revision"] == capability["model_revision"],
@@ -274,6 +300,45 @@ def verify_context_execution(context: dict[str, Any]) -> dict[str, Any]:
             and context.get("prompt_sha256") == execution["prompt_sha256"],
             "Proposal provenance differs from actual execution",
         )
+        _require(
+            request.get("scope") == "analysis"
+            and request.get("schema_version") == "review-request/v1",
+            "Source analysis must identify the actual bounded AV request",
+        )
+        _require(
+            context.get("dependencies")
+            == request.get("dependencies")
+            == execution.get("dependencies"),
+            "Source context dependencies differ from actual provider inputs",
+        )
+        inputs = request.get("inputs", [])
+        _require(
+            inputs and [item["clip"] for item in inputs] == context.get("input_clips"),
+            "Source context clip order or actual extraction provenance is missing",
+        )
+        _require(
+            all(
+                item.get("parent_sha256") == context["source_sha256"] for item in inputs
+            ),
+            "Context was produced from different source media",
+        )
+        # A proposal is not an adversarial-review verdict, but its executed
+        # media inputs require the same byte/clock/extraction verification.
+        validate_review_request(
+            {
+                "scope": "analysis",
+                "dependencies": context["dependencies"],
+                "inputs": inputs,
+            },
+            execution,
+        )
+        submitted = [(as_fraction(a), as_fraction(b)) for a, b in request["intervals"]]
+        for segment in response["segments"]:
+            span = (as_fraction(segment["start"]), as_fraction(segment["end"]))
+            _require(
+                span[0] < span[1] and not _uncovered(span, submitted),
+                "Context claims source time that the provider did not receive",
+            )
         return {"status": "PASS", "capability": capability}
     except (
         TalkCutError,
@@ -877,7 +942,9 @@ def import_review(
             and record.get("owner_acceptance", "pending") == "pending",
             "Separate AI reviewer cannot claim owner approval",
         )
-        capability = _capability(capability_record)
+        capability = _capability(
+            capability_record, precision_required=precision_review_required(request)
+        )
         execution = _receipt(record.get("receipt"))
         _require(
             execution["model_revision"] == capability["model_revision"],
@@ -910,6 +977,13 @@ def import_review(
             _artifact(item["clip"], binary=True)
             _artifact(item["extraction_receipt"])
         response = _artifact(execution["response"])
+        if capability.get("precision_supported") is False:
+            _require(
+                isinstance(response.get("sampling_limitations"), str)
+                and len(response["sampling_limitations"].strip()) >= 30
+                and response.get("dense_motion_and_lip_verified") is False,
+                "Semantic-only response must preserve unknown dense motion/lip inspection and disclose sampling limits",
+            )
         _require(
             response.get("verdict") in ("PASS", "FAIL", "UNVERIFIED"),
             "Empty, truncated or malformed review response",
@@ -1147,3 +1221,253 @@ def verify_imported_review(import_ref: dict[str, str]) -> dict[str, Any]:
         "receipt": execution,
         "response": _artifact(execution["response"]),
     }
+
+
+def verify_artifact_audit(
+    audit_ref: dict[str, str],
+    *,
+    scope: str,
+    snapshot_ref: dict[str, str],
+    input_refs: list[dict[str, str]],
+    dependencies: dict[str, Any],
+    excluded_run_ids: set[str],
+) -> dict[str, Any]:
+    """Bind a separate artifact auditor to the exact submitted snapshot bytes.
+
+    This validates preserved provider provenance, not a cryptographic attestation
+    of remote execution. Callers must still validate the audit's domain-specific
+    observations (for example every inventory classification). Media judgments
+    additionally require the audiovisual review/capability path.
+    """
+    from datetime import datetime
+
+    envelope = _artifact(audit_ref)
+    _require(
+        envelope.get("schema_version") == "artifact-audit/v1"
+        and envelope.get("reviewer_role") == "independent_auditor",
+        "Typed independent artifact audit is missing",
+    )
+    snapshot = _artifact(snapshot_ref)
+    _require(isinstance(snapshot, dict), "Audit snapshot must be an object")
+    _require(bool(input_refs), "Audit cannot certify an empty input inventory")
+    for ref in input_refs:
+        _artifact(ref, binary=True)
+    execution = _receipt(envelope.get("receipt"))
+    request, response = (
+        _artifact(execution["request"]),
+        _artifact(execution["response"]),
+    )
+    _require(
+        bool(excluded_run_ids)
+        and execution["run_id"] not in excluded_run_ids
+        and execution["run_id"] == envelope.get("reviewer_run_id"),
+        "Auditor is not separate from the actual implementation/proposal",
+    )
+    started, finished = (
+        datetime.fromisoformat(execution[key]) for key in ("started_at", "finished_at")
+    )
+    _require(
+        started.tzinfo is not None
+        and finished.tzinfo is not None
+        and finished >= started,
+        "Auditor execution times are incomplete or reversed",
+    )
+    _require(
+        dependencies
+        and envelope.get("dependencies")
+        == execution.get("dependencies")
+        == request.get("dependencies")
+        == dependencies,
+        "Audit dependency snapshot differs from the current inputs",
+    )
+    _require(
+        request.get("scope") == scope
+        and request.get("snapshot_hash")
+        == response.get("snapshot_hash")
+        == envelope.get("snapshot_hash")
+        == snapshot_ref["sha256"],
+        "Actual auditor request/response targets a different snapshot or scope",
+    )
+    submitted = request.get("input_artifacts", [])
+    _require(isinstance(submitted, list) and submitted, "No actual audit inputs")
+    for ref in submitted:
+        _artifact(ref, binary=True)
+    expected = {ref["sha256"] for ref in [snapshot_ref, *input_refs]}
+    actual = {ref["sha256"] for ref in submitted}
+    _require(
+        expected == actual
+        and len(actual) == len(submitted)
+        and set(response.get("inspected_artifact_hashes", [])) == expected,
+        "Auditor did not receive and inspect the entire exact artifact inventory",
+    )
+    _require(
+        response.get("verdict") == "PASS"
+        and isinstance(response.get("reason"), str)
+        and len(response["reason"].strip()) >= 30
+        and isinstance(response.get("findings"), list),
+        "Audit has no substantive completed findings",
+    )
+    _require(
+        all(
+            isinstance(finding, dict)
+            and finding.get("severity") in {"P0", "P1", "P2", "P3"}
+            and finding.get("reason")
+            and finding.get("severity") not in {"P0", "P1"}
+            for finding in response["findings"]
+        ),
+        "Artifact audit retains unresolved or unrecognized findings",
+    )
+    return {
+        "envelope": envelope,
+        "snapshot": snapshot,
+        "receipt": execution,
+        "request": request,
+        "response": response,
+    }
+
+
+def register_review_import(
+    project_dir: Path, import_ref: dict[str, str], repo_root: Path
+) -> dict[str, Any]:
+    """Index revalidated actual review/capability refs without issuing readiness.
+
+    The original index is preserved before an atomic, revision-checked update.
+    Source-sync reviews remain source-anchor evidence and do not acquire final
+    output coverage by being indexed.
+    """
+    from .contracts import code_identity, verify_contract
+    from .project import load_project, project_lock
+
+    project_dir, repo_root = project_dir.resolve(), repo_root.resolve()
+    project_path, index_path = (
+        project_dir / "project.json",
+        project_dir / "acceptance.local.json",
+    )
+    initial_hash = sha256(project_path)
+    project = load_project(project_dir)
+    identity = code_identity(repo_root)
+    contract_path = project_dir / "frozen-contract.local.json"
+    contract = read_json(contract_path)
+    _require(
+        not verify_contract(contract, repo_root), "Current frozen contract is invalid"
+    )
+    proof = verify_imported_review(import_ref)
+    record, request = proof["record"], proof["request"]
+    _require(
+        record.get("schema_version") == "multimodal-review/v1"
+        and record.get("reviewer_role") == "adversarial_reviewer"
+        and record.get("owner_acceptance", "pending") == "pending"
+        and not record.get("test_only")
+        and not record.get("synthetic"),
+        "Only actual adversarial imports can enter the project review index",
+    )
+    expected = {
+        "source_hashes": {
+            role: item["sha256"] for role, item in project["sources"].items()
+        },
+        "code_tree_hash": identity["code_tree_hash"],
+        "contract_hash": sha256(contract_path),
+    }
+    deps = request["dependencies"]
+    _require(
+        all(deps.get(key) == value for key, value in expected.items()),
+        "Imported review does not belong to current registered sources/code/contract",
+    )
+    scope = request.get("scope")
+    _require(
+        scope
+        in {
+            "output",
+            "deletion",
+            "seam",
+            "analysis",
+            "layout",
+            "lip_sync",
+            "source_sync",
+        },
+        "Unknown project review scope",
+    )
+    if scope != "source_sync":
+        plan_ref, timeline_ref, render_ref = (
+            project[key] for key in ("active_plan", "active_timeline", "active_render")
+        )
+        plan, timeline, render = (
+            _artifact(ref) for ref in (plan_ref, timeline_ref, render_ref)
+        )
+        _artifact(render["output"], binary=True)
+        _require(
+            deps.get("plan_hash") == content_hash(plan)
+            and deps.get("timeline_hash") == timeline_ref["sha256"]
+            and deps.get("output_hash") == render["output"]["sha256"]
+            and timeline.get("plan_hash") == content_hash(plan)
+            and render.get("settings", {}).get("timeline") == timeline_ref
+            and render.get("settings", {}).get("plan") == plan_ref,
+            "Imported review targets an old plan, timeline or output",
+        )
+    imported = _artifact(import_ref)
+    record_ref = imported["artifact_refs"]["record"]
+    capability_ref = imported["artifact_refs"]["capability"]
+    # The same authority used by final evaluation validates the capability. This
+    # never constructs a capability PASS from the import envelope's status.
+    from .acceptance import Evaluator
+
+    validator = Evaluator(
+        project_dir, "review-index-registration", contract_path, repo_root
+    )
+    validator.deps = {**deps}
+    validator.load_capability(capability_ref)
+    if scope != "source_sync":
+        validator.index = read_json(index_path)
+        validator.bind_plan_timeline()
+        validator.source_domain = (
+            as_fraction(validator.timeline["domain"]["start"]),
+            as_fraction(validator.timeline["domain"]["end"]),
+        )
+        validator.output_domain = (
+            Fraction(),
+            as_fraction(validator.timeline["duration"]),
+        )
+        validator.load_review(record_ref)
+    with project_lock(project_dir):
+        _require(
+            sha256(project_path) == initial_hash,
+            "Project changed while the review was revalidated",
+        )
+        _require(
+            code_identity(repo_root)["code_tree_hash"] == identity["code_tree_hash"],
+            "Code changed while the review was revalidated",
+        )
+        index = read_json(index_path)
+        _require(
+            index.get("schema_version") == "acceptance-index/v1"
+            and index.get("owner_acceptance", "pending") == "pending",
+            "Existing private acceptance index is invalid",
+        )
+        before = artifact_ref(index_path)
+        backup = project_dir / "evidence" / "index-history" / f"{before['sha256']}.json"
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        if not backup.exists():
+            with backup.open("xb") as handle:
+                handle.write(index_path.read_bytes())
+        _require(sha256(backup) == before["sha256"], "Acceptance index backup differs")
+        if capability_ref not in index.setdefault("capabilities", []):
+            index["capabilities"].append(capability_ref)
+        if scope != "source_sync" and record_ref not in index.setdefault("reviews", []):
+            index["reviews"].append(record_ref)
+        atomic_json(index_path, index)
+    result = {
+        "schema_version": "review-registration/v1",
+        "status": "INDEXED",
+        "import": import_ref,
+        "record": record_ref,
+        "capability": capability_ref,
+        "scope": scope,
+        "project_revision": project["revision"],
+        "previous_index": artifact_ref(backup),
+        "index": artifact_ref(index_path),
+        "acceptance_status": "UNVERIFIED",
+        "owner_acceptance": "pending",
+    }
+    directory = project_dir / "review" / f"registration-{uuid4().hex}"
+    atomic_json(directory / "registration.json", result)
+    return {**result, "artifact_ref": artifact_ref(directory / "registration.json")}

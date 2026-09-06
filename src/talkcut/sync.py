@@ -19,6 +19,7 @@ from .project import (
     now,
     project_lock,
     save_revision,
+    store_artifact,
     verified_json,
 )
 
@@ -336,7 +337,7 @@ def verify_sync_model(ref: dict[str, str], project: dict[str, Any]) -> dict[str,
                     "Synchronization requires current screen and speaker source evidence",
                 )
             if (
-                request.get("scope") != "sync"
+                request.get("scope") != "source_sync"
                 or details.get("anchor_id") != anchor.get("id")
                 or request.get("dependencies", {}).get("source_hashes") != source_hashes
                 or details.get("timing") != timing
@@ -404,3 +405,56 @@ def verify_sync_model(ref: dict[str, str], project: dict[str, Any]) -> dict[str,
                 "Observed drift bound exceeds one local frame or 40ms",
             )
     return model
+
+
+def import_sync_model(
+    directory: str | Path, source: str | Path, expected_revision: int
+) -> dict[str, Any]:
+    """Persist an independently verified mapping and invalidate derived edits."""
+    directory = Path(directory)
+    with project_lock(directory):
+        project = load_project(directory)
+        if project["revision"] != expected_revision:
+            raise TalkCutError(
+                "REVISION_CONFLICT",
+                "Reopen the latest project before changing synchronization",
+            )
+        original_ref = artifact_ref(source)
+        model = verify_sync_model(original_ref, project)
+        imported = store_artifact(directory, "sync", model)
+        prior = {
+            key: project.get(key)
+            for key in ("sync", "active_plan", "active_timeline", "active_render")
+        }
+        project["sync"] = imported
+        project["audio_source"] = model["timing"]["audio_source"]
+        for key in ("active_plan", "active_timeline", "active_render"):
+            project[key] = None
+        project["owner_acceptance"] = "pending"
+        save_revision(
+            directory,
+            project,
+            expected_revision,
+            "sync_import",
+            {
+                "sync": imported,
+                "imported_from": original_ref,
+                "preserved_previous": prior,
+                "invalidated": [
+                    "plan",
+                    "timeline",
+                    "output_qc",
+                    "seams",
+                    "whole_output_review",
+                    "ready",
+                ],
+            },
+        )
+        return {
+            "schema_version": "sync-import/v1",
+            "status": "SOURCE_SYNC_VERIFIED",
+            "sync": imported,
+            "project_revision": project["revision"],
+            "output_sync": "UNVERIFIED",
+            "owner_acceptance": "pending",
+        }

@@ -25,8 +25,8 @@ def media(tmp_path_factory):
         run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"{color}=size=320x180:rate=1000/33",
              "-frames:v", str(count), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
              "-video_track_timescale", "45000", str(path)])
-    # The actual DGIST recording's terminal frame lasts 34,922 ticks, not
-    # one nominal 1,485-tick frame. Exercise this real failure mode publicly.
+    # Exercise a long terminal presentation interval. The real recording's
+    # 34,922-tick interval is its first frame; terminal behavior is synthetic.
     run(["ffmpeg", "-v", "error", "-i", str(raw_screen), "-c", "copy",
          "-bsf:v", "setts=duration='if(eq(N,399),34922,DURATION)'",
          "-video_track_timescale", "45000", str(screen)])

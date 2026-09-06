@@ -176,7 +176,11 @@ def init_project(
             "inspections": {},
             "sync": None,
             "audio_source": None,
-            "layout": {"width": 224, "height": 126, "margin_x": 20, "margin_y": 10},
+            "layout": {
+                "width_fraction": "1/8",
+                "margin_fraction": "1/100",
+                "position": "top-right",
+            },
             "cloud": {"enabled": False},
             "owner_acceptance": "pending",
             "events": [],

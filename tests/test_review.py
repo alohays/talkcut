@@ -98,7 +98,8 @@ def test_provider_failure_responses_cannot_create_coverage(
     tmp_path, monkeypatch, failure
 ):
     monkeypatch.setattr(
-        "talkcut.review._capability", lambda value: {"model_revision": "unit-negative"}
+        "talkcut.review._capability",
+        lambda value, **kwargs: {"model_revision": "unit-negative"},
     )
     request = {
         "schema_version": "review-request/v1",

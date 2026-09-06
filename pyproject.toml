@@ -1,7 +1,7 @@
 [project]
 name = "talkcut"
 version = "0.1.0a1"
-description = "An agent-driven lecture and podcast editing workflow — initial scaffold."
+description = "Reversible lecture editing with exact timelines and explicit audiovisual evidence gates."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
