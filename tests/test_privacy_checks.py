@@ -10,6 +10,7 @@ import io
 import json
 import shutil
 import subprocess
+import sys
 import tarfile
 import zipfile
 from pathlib import Path
@@ -503,6 +504,114 @@ def test_goal_checkpoint_history_requires_typed_current_and_preserved_bytes(tmp_
         assert bool(graph["historical_unresolved"]) == (damage == "missing_locator")
         if damage is None:
             assert {**preserved, "kind": "review"} in graph["known_refs"]
+
+
+def test_actual_evaluate_and_project_revision_preserve_reachable_metadata_history(tmp_path):
+    """Actual CLI FAIL reports and the normal revision writer, no media PASS."""
+    from talkcut.contracts import freeze_contract
+    from talkcut.project import load_project, project_lock, save_revision
+    directory, sources = private_project(tmp_path)
+    root = Path(privacy.__file__).resolve().parents[2]
+    contract = tmp_path / "frozen-contract.json"
+    note = tmp_path / "historical-project-note.txt"
+    note.write_text("An invented private transcript from a recorded project revision must remain protected.")
+    with project_lock(directory):
+        project = load_project(directory)
+        project["analysis"] = {"schema_version": "transcript/v1", "source_sha256": sources["screen"], **artifact_ref(note)}
+        save_revision(directory, project, project["revision"], "set-analysis-fixture", {})
+    argv = [sys.executable, "-m", "talkcut", "acceptance", "evaluate", str(directory),
+            "--render", "missing", "--contract", str(contract), "--json"]
+    first = subprocess.run(argv, cwd=root, capture_output=True, check=False)
+    assert first.returncode == 1
+    report = directory / "reports/acceptance-latest.local.json"
+    first_report = json.loads(first.stdout)
+    assert first_report["schema_version"] == "goal-acceptance/v1" and not first_report["goal_achieved"]
+    old_refs, locators = [], []
+    for path in (report, directory / "project.json"):
+        old = artifact_ref(path)
+        backup = tmp_path / old["sha256"]  # Suffixless archives must still be parsed.
+        backup.write_bytes(path.read_bytes())
+        old_refs.append(old)
+        locators.append(artifact_ref(backup))
+    # The old active-analysis reference disappears from the current project.
+    # Its exact saved revision must still be recursively inspected.
+    with project_lock(directory):
+        project = load_project(directory)
+        project["analysis"] = None
+        save_revision(directory, project, project["revision"], "reset-analysis-fixture", {})
+    # A real contract appearing between evaluations changes the actual report;
+    # all missing-media/reviewer gates still fail.
+    freeze_contract(root, contract)
+    second = subprocess.run(argv, cwd=root, capture_output=True, check=False)
+    assert second.returncode == 1 and artifact_ref(report) != old_refs[0]
+    assert json.loads(second.stdout)["owner_acceptance"] == "pending"
+    atomic_json(directory / "goal-handoff.local.json", {"before_normal_commands": old_refs})
+    known, phrases, graph = privacy._known_private_inventory(directory, sources, root, historical_artifacts=locators)
+    assert graph["historical_unresolved"] == [] and len(graph["historical_refs"]) == 2
+    assert note.read_text() in phrases and known[artifact_ref(note)["sha256"]] == "transcript"
+    for old, saved in zip(old_refs, locators, strict=True):
+        assert known[old["sha256"]] == known[artifact_ref(Path(old["path"]))["sha256"]] == "review"
+        assert {**saved, "kind": "review"} in graph["known_refs"]
+    inventory = privacy.build_private_inventory(directory, sources, root, historical_artifacts=locators)
+    assert inventory["unresolved"] == [] and inventory["classification_status"] == "UNVERIFIED"
+
+
+@pytest.mark.parametrize("metadata", ["project.json", "reports/acceptance-latest.local.json"])
+@pytest.mark.parametrize("damage", ["missing_locator", "wrong_bytes", "symlink", "old_schema", "old_owner", "current_owner", "wrong_source_or_criteria", "wrong_path"])
+def test_project_and_acceptance_report_history_rejects_invalid_provenance(tmp_path, repository, metadata, damage):
+    from talkcut.project import load_project, project_lock, save_revision
+    directory, sources = private_project(tmp_path)
+    path = directory / metadata
+    if metadata.startswith("reports/"):
+        atomic_json(path, {"schema_version": "goal-acceptance/v1", "criteria": [], "owner_acceptance": "pending"})
+    old = artifact_ref(path)
+    backup = tmp_path / "preserved-old-metadata"
+    backup.write_bytes(path.read_bytes())
+    saved = artifact_ref(backup)
+    if metadata == "project.json":
+        with project_lock(directory):
+            value = load_project(directory)
+            save_revision(directory, value, value["revision"], "metadata-regression", {})
+    else:
+        value = json.loads(path.read_text())
+        atomic_json(path, {**value, "criteria": [{"id": "AC01", "status": "UNVERIFIED"}]})
+    if damage == "wrong_bytes":
+        backup.write_text("Not the preserved bytes")
+    elif damage == "symlink":
+        contents = tmp_path / "real-old-metadata"
+        contents.write_bytes(backup.read_bytes())
+        backup.unlink()
+        backup.symlink_to(contents)
+    elif damage in {"old_schema", "old_owner", "wrong_source_or_criteria"}:
+        value = json.loads(backup.read_text())
+        if damage == "old_schema":
+            value["schema_version"] = "unrelated/v1"
+        elif damage == "old_owner":
+            value["owner_acceptance"] = "accepted"
+        elif metadata == "project.json":
+            value["sources"]["screen"]["sha256"] = "0" * 64
+        else:
+            value["criteria"] = {}
+        atomic_json(backup, value)
+        saved = artifact_ref(backup)
+        old["sha256"] = saved["sha256"]
+    elif damage == "current_owner":
+        value = json.loads(path.read_text())
+        atomic_json(path, {**value, "owner_acceptance": "accepted"})
+    elif damage == "wrong_path":
+        other = directory / "reviews" / path.name
+        other.parent.mkdir(exist_ok=True)
+        other.write_bytes(path.read_bytes())
+        old["path"] = str(other)
+    atomic_json(directory / "goal-handoff.local.json", {"old_metadata": old})
+    locators = [] if damage == "missing_locator" else [saved]
+    if damage == "missing_locator":
+        known, _, graph = privacy._known_private_inventory(directory, sources, repository, historical_artifacts=locators)
+        assert known[old["sha256"]] == "review" and len(graph["historical_unresolved"]) == 1
+        assert privacy.build_private_inventory(directory, sources, repository, historical_artifacts=locators)["unresolved"]
+    else:
+        with pytest.raises((TalkCutError, ValueError)):
+            privacy._known_private_inventory(directory, sources, repository, historical_artifacts=locators)
 
 
 @pytest.mark.parametrize("damage", [None, "wrong_snapshot", "missing_snapshot", "wrong_origin", "explicit_transcript", "transcript_json"])

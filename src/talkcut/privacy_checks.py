@@ -487,7 +487,8 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         name = str(path)
         ref = refs.get(name) or artifact_ref(path)
         if (expected is not None and ref["sha256"] != expected and historical and kind == "review"
-                and path in {directory / "acceptance.local.json", directory / "checkpoint.local.json"}):
+                and path in {directory / relative for relative in (
+                    "acceptance.local.json", "checkpoint.local.json", "project.json", "reports/acceptance-latest.local.json")}):
             # A checkpoint can truthfully describe an earlier mutable index.
             # Only these typed bookkeeping paths can have historical versions;
             # source, transcript and render references still require exact bytes.
@@ -510,7 +511,7 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
                 return
             old_path = _file(preserved)
             _require(old_path.stat().st_size <= MAX_UNIT_BYTES, "Historical bookkeeping exceeds the metadata inspection bound")
-            _private_bookkeeping_payload(path.name, old_path.read_bytes())
+            _private_bookkeeping_payload(path.relative_to(directory).as_posix(), old_path.read_bytes(), directory=directory)
             add(old_path, kind, expected, parse_json=True)
             row.update({"status": "RESOLVED", "preserved_ref": {"path": str(old_path), "sha256": expected}})
             return
@@ -672,13 +673,28 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         "reason": "Mandatory graph collected; exact task file inventory and separate classification audit have not yet been verified"}
 
 
-def _private_bookkeeping_payload(name: str, data: bytes) -> None:
+def _private_bookkeeping_payload(name: str, data: bytes, *, directory: Path | None = None) -> None:
     value = json.loads(data)
-    schema, content = {"acceptance.local.json": ("acceptance-index/v1", "checks"),
-                       "checkpoint.local.json": ("goal-checkpoint/v1", "criteria")}[name]
+    schema, content, kind = {"acceptance.local.json": ("acceptance-index/v1", "checks", dict),
+                            "checkpoint.local.json": ("goal-checkpoint/v1", "criteria", dict),
+                            "reports/acceptance-latest.local.json": ("goal-acceptance/v1", "criteria", list),
+                            "project.json": ("talkcut-project/v1", "sources", dict)}[name]
     _require(isinstance(value, dict) and value.get("schema_version") == schema
-             and value.get("owner_acceptance") == "pending" and isinstance(value.get(content), dict),
-             "Changed index/checkpoint is not supported private bookkeeping")
+             and value.get("owner_acceptance") == "pending" and isinstance(value.get(content), kind),
+             "Changed canonical metadata is not supported private bookkeeping")
+    if name == "project.json":
+        from .contracts import validate_project
+        validate_project(value)
+        _require(directory is not None, "Project history requires the registered project context")
+        assert directory is not None
+        current = load_project(directory, verify_sources=False)
+        identities = ("role", "path", "original_path", "sha256", "bytes", "durable")
+        old_sources = {role: {key: source.get(key) for key in identities} for role, source in value["sources"].items()}
+        current_sources = {role: {key: source.get(key) for key in identities} for role, source in current["sources"].items()}
+        _require(old_sources == current_sources, "Historical project changed registered source identities")
+        _require(len(value["events"]) == value["revision"] <= current["revision"]
+                 and value["events"] == current["events"][:value["revision"]],
+                 "Historical project is not a preserved revision of the current decision chain")
 
 
 def _bookkeeping(path: Path, directory: Path, *, referenced_input: bool = False) -> dict[str, Any] | None:
@@ -696,7 +712,9 @@ def _bookkeeping(path: Path, directory: Path, *, referenced_input: bool = False)
                          "Referenced publication input is incomplete")
                 return {"kind": "review", "state": "private_referenced_publication_measurement_input"}
         return None
-    index = relative.as_posix() in {"acceptance.local.json", "checkpoint.local.json"}
+    states = {"acceptance.local.json": "private_acceptance_index", "checkpoint.local.json": "private_goal_checkpoint",
+              "project.json": "private_project_revision", "reports/acceptance-latest.local.json": "private_acceptance_report"}
+    index = relative.as_posix() in states
     measurement = (len(relative.parts) == 3 and relative.parts[0] == "measurements"
                    and re.fullmatch(r"measurement-[a-f0-9]{32}", relative.parts[1]))
     if not index and not measurement:
@@ -715,8 +733,8 @@ def _bookkeeping(path: Path, directory: Path, *, referenced_input: bool = False)
     value = json.loads(data)
     _require(isinstance(value, dict), "Private bookkeeping must contain the expected JSON object")
     if index:
-        _private_bookkeeping_payload(path.name, data)
-        return {"kind": "review", "state": "private_acceptance_index" if path.name == "acceptance.local.json" else "private_goal_checkpoint"}
+        _private_bookkeeping_payload(relative.as_posix(), data, directory=directory)
+        return {"kind": "review", "state": states[relative.as_posix()]}
     schemas = {"stdout.json": "measurement-result/v1", "receipt.json": "execution-receipt/v1",
                "evidence.json": "measurement-check/v1", "run.json": "measurement-run/v1"}
     if path.name == "execution.json":
