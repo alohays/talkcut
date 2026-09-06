@@ -7,12 +7,30 @@ screen recordings and a small speaker overlay.
 This repository does not inspect, transcribe, synchronize, cut, or render media
 yet. The configuration example and workflow below describe the intended design.
 
+## Implementation plan
+
+- [RFC 0001: first DGIST lecture workflow](docs/plans/0001-dgist-first-lecture.md)
+  defines the scope, architecture, timing contracts, recovery behavior, and
+  implementation milestones (in Korean).
+- [Lecture review and acceptance protocol](docs/validation/lecture-review-protocol.md)
+  defines automated checks, separate AI review, complete deletion and output
+  coverage, regression rules, and final owner acceptance (in Korean).
+- [Autonomous implementation goal contract](docs/plans/0002-autonomous-goal-contract.md)
+  defines evidence-based completion criteria for implementation, the actual DGIST
+  output, recovery, and the authorized code release (in Korean).
+- [Copyable `/goal` prompt](docs/prompts/dgist-autonomous-goal.md) starts the planned
+  implementation in a new local task with explicit scope and stopping conditions.
+
+For the first DGIST workflow, intermediate review is delegated to AI. The owner
+reviews the completed final candidate later. `READY_FOR_OWNER` and
+`OWNER_ACCEPTED` are separate proposed states; neither is implemented yet.
+
 ## Initial workflow
 
 1. Inspect source metadata and establish a common timeline.
 2. Validate source synchronization at the beginning, middle, and end.
 3. Automatically select clear pre-lecture and long-silence cuts; propose speech
-   disfluency cuts for user review through an agent conversation.
+   disfluency cuts for separate review under the project's review policy.
 4. Apply one edit plan to screen, speaker, and the selected audio track.
 5. Render a small speaker overlay on the screen recording and validate the output.
 
@@ -47,7 +65,9 @@ and correction methods remain to be tested on representative footage.
 
 Clear pre-lecture material and excessively long silence may be removed
 automatically. Speech disfluencies mean verbal stumbles, repetitions, and restarts;
-their removal requires user review. All cuts must remain traceable and reversible.
+their removal requires review. In the DGIST plan, a separate AI reviewer handles
+intermediate decisions under the owner's delegation, and the owner checks the
+final result later. All cuts must remain traceable and reversible.
 
 Silence duration alone does not establish that a passage is disposable. Protect
 silent demos, audience response time, intentional pauses, and meaningful
