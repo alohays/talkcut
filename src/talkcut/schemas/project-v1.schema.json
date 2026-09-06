@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/alohays/talkcut/schemas/project-v1.schema.json",
+  "title": "TalkCut private project v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "revision",
+    "sources",
+    "events",
+    "owner_acceptance"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "talkcut-project/v1"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sources": {
+      "type": "object",
+      "required": [
+        "screen",
+        "speaker"
+      ],
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "path",
+          "sha256",
+          "bytes",
+          "role",
+          "durable"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "role": {
+            "type": "string",
+            "minLength": 1
+          },
+          "durable": {
+            "const": true
+          },
+          "original_path": {
+            "type": "string"
+          },
+          "registered_at": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "owner_acceptance": {
+      "enum": [
+        "pending",
+        "accepted",
+        "changes_requested"
+      ]
+    },
+    "created_at": {
+      "type": "string"
+    },
+    "inspections": {
+      "type": "object"
+    },
+    "sync": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "audio_source": {
+      "type": [
+        "string",
+        "object",
+        "null"
+      ]
+    },
+    "layout": {
+      "type": "object"
+    },
+    "cloud": {
+      "type": "object"
+    },
+    "active_plan": {
+      "type": [
+        "object",
+        "string",
+        "null"
+      ]
+    },
+    "active_render": {
+      "type": [
+        "object",
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": true
+}
