@@ -325,8 +325,62 @@ def _remote(raw: dict[str, Any], root: Path, assets: dict[str, dict[str, Any]], 
             "body_and_asset_bytes_match": True}
 
 
+def _public_source_candidates(root: Path | None, registered: set[str]) -> tuple[dict[str, list[dict[str, str]]], list[dict[str, Any]], set[str]]:
+    """Find byte identities, never infer privacy or a license from Git membership."""
+    if root is None or not (root / ".git").exists():
+        return {}, [], set()
+    traces: list[dict[str, Any]] = []
+    commits = _command(["git", "rev-list", "--all", "HEAD"], root, traces).decode().splitlines()
+    _require(len(commits) <= MAX_COMMITS, "Public-source candidate history exceeds inspection bounds")
+    objects: dict[str, list[dict[str, str]]] = {}
+    for commit in commits:
+        tree = _command(["git", "ls-tree", "-r", "-z", "--full-tree", commit], root, traces)
+        for row in tree.split(b"\0"):
+            if not row:
+                continue
+            header, raw_path = row.split(b"\t", 1)
+            mode, kind, oid = header.decode("ascii").split()
+            name = raw_path.decode("utf-8")
+            parts = PurePosixPath(name).parts
+            source_path = parts[0] in {"src", "tests", "examples", "docs", "schemas", ".github"} or name in {
+                "README.md", "LICENSE", "CONTRIBUTING.md", "SECURITY.md", "pyproject.toml", "uv.lock", "pytest.ini"}
+            if source_path and mode in {"100644", "100755"} and kind == "blob":
+                objects.setdefault(oid, []).append({"commit": commit, "git_path": name, "git_blob": oid})
+    _require(len(objects) <= MAX_UNITS, "Public-source candidate object count exceeds inspection bounds")
+    candidates: dict[str, list[dict[str, str]]] = {}
+    transcript_hashes: set[str] = set()
+
+    def transcript_body(value: Any) -> bool:
+        if isinstance(value, dict):
+            return (value.get("schema_version") == "transcript/v1" and value.get("source_sha256") in registered
+                    or any(transcript_body(child) for child in value.values()))
+        return isinstance(value, list) and any(transcript_body(child) for child in value)
+    for oid, origins in objects.items():
+        size = int(_command(["git", "cat-file", "-s", oid], root, traces).decode())
+        if size > MAX_UNIT_BYTES:
+            continue
+        data = _command(["git", "cat-file", "blob", oid], root, traces)
+        # Binary fixtures are never a source-code privacy exception.
+        try:
+            decoded = data.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if "\x00" not in decoded:
+            digest = hashlib.sha256(data).hexdigest()
+            candidates[digest] = origins
+            try:
+                if transcript_body(json.loads(decoded)):
+                    transcript_hashes.add(digest)
+            except ValueError:
+                pass
+    return candidates, traces, transcript_hashes
+
+
 def _known_private_inventory(project_dir: Path | None, expected_source_hashes: dict[str, str] | None,
-                             repo_root: Path | None = None) -> tuple[dict[str, str], list[str], dict[str, Any]]:
+                             repo_root: Path | None = None, *,
+                             historical_artifacts: list[dict[str, Any]] | None = None,
+                             source_snapshots: list[dict[str, Any]] | None = None,
+                             publication_bodies: dict[str, dict[str, Any]] | None = None) -> tuple[dict[str, str], list[str], dict[str, Any]]:
     """Derive mandatory exclusions from the evaluator's registered task.
 
     Project source identities come from the evaluator, never the corpus author.
@@ -347,53 +401,213 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
     known: dict[str, str] = {}
     refs: dict[str, dict[str, Any]] = {}
     pending: list[tuple[Path, str]] = []
+    json_scheduled: set[str] = set()
     phrases: set[str] = set()
     unfollowed: list[dict[str, Any]] = []
+    historical_refs: dict[tuple[str, str], dict[str, Any]] = {}
+    public_candidates: dict[str, dict[str, Any]] = {}
+    unresolved_sources: dict[tuple[str, str], dict[str, Any]] = {}
+    source_candidates, source_candidate_commands, git_transcripts = _public_source_candidates(repo_root, set(registered.values()))
+    source_paths = {str((repo_root / origin["git_path"]).resolve())
+                    for origins in source_candidates.values() for origin in origins} if repo_root else set()
+    source_locators: dict[tuple[str, str], dict[str, Any]] = {}
+    source_snapshot_hashes: set[str] = set()
+    body_candidates: dict[tuple[str, str], str] = {}
+    for role, ref in (publication_bodies or {}).items():
+        _require(role in {"pr_body", "release_body"}, "Unknown publication body role")
+        path = _file(ref)
+        body_candidates[(str(path), ref["sha256"])] = role
+    _require(source_snapshots is None or isinstance(source_snapshots, list), "Source snapshots must be explicit original/snapshot pairs")
+    for locator in source_snapshots or []:
+        original, snapshot = locator["original"], locator["snapshot"]
+        origin = Path(original["path"])
+        _require(repo_root is not None and origin.is_absolute() and origin == origin.resolve() and any(
+            origin.is_relative_to(repo_root / name) for name in ("src", "tests", "examples", "docs", "schemas", ".github")),
+            "A source snapshot locator must name a canonical public source path")
+        _require(original["sha256"] == snapshot["sha256"], "Preserved source snapshot differs from its original digest")
+        _file(snapshot)
+        source_locators[(str(origin), original["sha256"])] = snapshot
+        source_snapshot_hashes.add(original["sha256"])
+    preserved_by_hash: dict[str, dict[str, Any]] = {}
+    _require(historical_artifacts is None or isinstance(historical_artifacts, list),
+             "Historical private artifact locators must be an explicit list")
+    for ref in historical_artifacts or []:
+        _file(ref)
+        preserved_by_hash[ref["sha256"]] = ref
     digests = set(registered.values())
     media_suffixes = {".mp4", ".mov", ".webm", ".mkv", ".wav", ".mp3", ".aac", ".m4a", ".flac", ".png", ".jpg", ".jpeg"}
     rank = {"review": 0, "transcript": 1, "media": 2}
 
-    def add(path: Path, kind: str, expected: str | None = None) -> None:
+    def explicit_transcript(value: Any) -> bool:
+        return (isinstance(value, dict) and value.get("schema_version") == "transcript/v1"
+                and value.get("source_sha256") in digests)
+
+    def contains_transcript(value: Any) -> bool:
+        if explicit_transcript(value):
+            return True
+        if isinstance(value, dict):
+            return any(contains_transcript(child) for child in value.values())
+        return isinstance(value, list) and any(contains_transcript(child) for child in value)
+
+    def protect_values(value: Any, key: str = "") -> None:
+        """Protect this file's private strings; never follow its artifact refs."""
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                protect_values(child, child_key)
+        elif isinstance(value, list):
+            for child in value:
+                protect_values(child, key)
+        elif (isinstance(value, str) and len(value.strip()) >= 40 and
+              (key in {"text", "word", "utterance", "transcript", "sentence"}
+               or (not Path(value).is_absolute() and not re.fullmatch(r"[a-f0-9]{64}", value)))):
+            phrases.add(value)
+
+    def inspect_text(path: Path, protect: bool, parse_json: bool = False) -> None:
+        if path.stat().st_size > MAX_UNIT_BYTES:
+            return
+        try:
+            body = path.read_text()
+        except UnicodeDecodeError:
+            return  # Exact binary bytes remain mandatory, without a text claim.
+        try:
+            value = json.loads(body)
+        except ValueError:
+            if protect:
+                phrases.update(line for line in body.splitlines() if len(line.strip()) >= 40)
+        else:
+            if protect or explicit_transcript(value):
+                protect_values(value)
+            if str(path) not in json_scheduled and (protect or parse_json or path.suffix.lower() == ".json"):
+                pending.append((path, refs[str(path)]["kind"]))
+                json_scheduled.add(str(path))
+
+    def add(path: Path, kind: str, expected: str | None = None, *,
+            historical: bool = False, parse_json: bool = False) -> None:
         _require(path.is_absolute() and path.is_file() and not path.is_symlink(), "Known private artifact is missing or is a symlink")
         name = str(path)
+        ref = refs.get(name) or artifact_ref(path)
+        if (expected is not None and ref["sha256"] != expected and historical and kind == "review"
+                and path in {directory / "acceptance.local.json", directory / "checkpoint.local.json"}):
+            # A checkpoint can truthfully describe an earlier mutable index.
+            # Only these typed bookkeeping paths can have historical versions;
+            # source, transcript and render references still require exact bytes.
+            _bookkeeping(path, directory)
+            _require(re.fullmatch(r"[a-f0-9]{64}", expected), "Historical bookkeeping digest is invalid")
+            add(path, kind)
+            key = (name, expected)
+            if key in historical_refs:
+                return
+            preserved = preserved_by_hash.get(expected)
+            row: dict[str, Any] = {"path": name, "sha256": expected, "kind": kind,
+                                   "current_ref": {"path": name, "sha256": ref["sha256"]}}
+            historical_refs[key] = row
+            if preserved is None:
+                # This is a deny-list digest, not an assertion that its bytes
+                # were read. No artifact ref is fabricated, and unresolved
+                # history prevents an inventory/audit completeness verdict.
+                known.setdefault(expected, "review")
+                row.update({"status": "UNVERIFIED", "reason": "Historical bookkeeping bytes are not preserved by an explicit verified locator"})
+                return
+            old_path = _file(preserved)
+            _require(old_path.stat().st_size <= MAX_UNIT_BYTES, "Historical bookkeeping exceeds the metadata inspection bound")
+            _private_bookkeeping_payload(path.name, old_path.read_bytes())
+            add(old_path, kind, expected, parse_json=True)
+            row.update({"status": "RESOLVED", "preserved_ref": {"path": str(old_path), "sha256": expected}})
+            return
         if name in refs:
             _require(expected is None or refs[name]["sha256"] == expected, "Known private reference was relabelled")
+            if rank[kind] > rank[refs[name]["kind"]]:
+                refs[name]["kind"] = kind
+            if rank[kind] > rank.get(known.get(ref["sha256"], ""), -1):
+                known[ref["sha256"]] = kind
+            if kind == "transcript" or parse_json:
+                inspect_text(path, kind == "transcript", parse_json)
             return
         _require(len(refs) < MAX_UNITS, "Known private graph exceeds inspection limits")
-        ref = artifact_ref(path)
         _require(expected is None or ref["sha256"] == expected, "Known private artifact differs from its registered hash")
         refs[name] = {**ref, "kind": kind}
         if rank[kind] > rank.get(known.get(ref["sha256"], ""), -1):
             known[ref["sha256"]] = kind
-        if path.suffix.lower() == ".json" and path.stat().st_size <= MAX_UNIT_BYTES:
-            pending.append((path, kind))
-        elif kind == "transcript" and path.stat().st_size <= MAX_UNIT_BYTES:
-            try:
-                phrases.update(line for line in path.read_text().splitlines() if len(line.strip()) >= 40)
-            except UnicodeDecodeError:
-                pass  # Exact file bytes remain included; no text coverage is claimed.
+        if kind == "transcript" or parse_json or path.suffix.lower() == ".json":
+            inspect_text(path, kind == "transcript", parse_json)
 
     def walk(value: Any, transcript: bool = False, key: str = "") -> None:
-        if key in {"toolchain", "producer", "code_identity", "tools_before", "tools_after"}:
+        if key in {"toolchain", "producer", "code_identity", "tools_before", "tools_after"} and not transcript and not contains_transcript(value):
             return
         if isinstance(value, dict):
-            transcript = transcript or (value.get("schema_version") == "transcript/v1" and value.get("source_sha256") in digests)
+            transcript = transcript or explicit_transcript(value)
+            if transcript:
+                protect_values(value)
             if isinstance(value.get("path"), str) and isinstance(value.get("sha256"), str):
                 path = Path(value["path"])
-                kind = "media" if path.suffix.lower() in media_suffixes else "transcript" if transcript else "review"
-                public_code = repo_root is not None and any(path.is_absolute() and path.resolve().is_relative_to(repo_root / name)
-                                                            for name in ("src", "tests", "examples", "docs", ".github", "schemas"))
-                if not public_code and path.is_absolute() and (path.resolve().is_relative_to(directory) or value["sha256"] in digests or transcript):
-                    add(path, kind, value["sha256"])
+                code_or_archive = path.suffix.lower() in {".py", ".pyi", ".pyc", ".so", ".dylib", ".whl"} or path.name.endswith(".tar.gz")
+                kind = "media" if value["sha256"] in digests else "transcript" if transcript else "media" if path.suffix.lower() in media_suffixes else "review"
+                canonical_path = path if path.is_absolute() else (repo_root or directory) / path
+                transcript = transcript or value["sha256"] in git_transcripts
+                if transcript and kind != "media":
+                    kind = "transcript"
+                public_code = repo_root is not None and any(
+                    canonical_path.resolve() == (repo_root / origin["git_path"]).resolve()
+                    for origin in source_candidates.get(value["sha256"], []))
+                if transcript or value["sha256"] in known:
+                    # Registered private provenance outranks suffixes, Git byte
+                    # coincidences and paths inside public-code directories.
+                    add(canonical_path, kind if transcript else known[value["sha256"]], value["sha256"], historical=True)
+                elif not public_code and kind != "media" and (code_or_archive or value["sha256"] in source_candidates or value["sha256"] in source_snapshot_hashes
+                                                              or (str(canonical_path), value["sha256"]) in body_candidates):
+                    # References from an ASR/runtime/audit manifest do not make
+                    # copied code or packages lecture content. Keep the exact
+                    # files in the denominator as UNCLASSIFIED, never public.
+                    candidate_path = path if path.is_absolute() else (repo_root or directory) / path
+                    original_ref = {"path": str(candidate_path), "sha256": value["sha256"]}
+                    ref = source_locators.get((str(candidate_path), value["sha256"]), original_ref)
+                    if (ref is original_ref and str(candidate_path) in source_paths
+                            and candidate_path == candidate_path.resolve() and not candidate_path.is_symlink()
+                            and candidate_path.is_file() and sha256(candidate_path) != value["sha256"]):
+                        _require(re.fullmatch(r"[a-f0-9]{64}", value["sha256"]), "Historical source digest is invalid")
+                        # This historical claim has no verified bytes. Keep it
+                        # outside actual artifact refs and block completeness;
+                        # unrelated payload/known-private observations can run.
+                        unresolved_sources[(str(candidate_path), value["sha256"])] = {
+                            **original_ref, "classification": "UNCLASSIFIED", "status": "UNVERIFIED",
+                            "current_ref": artifact_ref(candidate_path),
+                            "reason": "Historical source bytes are not preserved by an explicit verified locator"}
+                    else:
+                        collect_candidate(candidate_path, original_ref, ref)
+                elif not public_code and path.is_absolute() and (path.resolve().is_relative_to(directory) or value["sha256"] in digests or transcript):
+                    add(path, kind, value["sha256"], historical=True)
                 elif not public_code:
                     unfollowed.append({"path": value["path"], "sha256": value["sha256"], "reason": "External/relative reference is not classified by the known private graph"})
-            if transcript and isinstance(value.get("text"), str) and len(value["text"].strip()) >= 40:
-                phrases.add(value["text"])
             for child_key, child in value.items():
                 walk(child, transcript, child_key)
         elif isinstance(value, list):
             for child in value:
                 walk(child, transcript)
+
+    def collect_candidate(candidate_path: Path, original_ref: dict[str, Any], ref: dict[str, Any]) -> None:
+        actual_path = _file(ref)
+        # A JSON transcript renamed as code is still private. A
+        # source locator cannot restore changed transcript bytes.
+        candidate_body = None
+        if actual_path.stat().st_size <= MAX_UNIT_BYTES:
+            try:
+                candidate_body = json.loads(actual_path.read_text())
+            except (ValueError, UnicodeDecodeError):
+                candidate_body = None
+        if contains_transcript(candidate_body):
+            add(candidate_path, "transcript", ref["sha256"])
+        else:
+            role = body_candidates.get((str(candidate_path), ref["sha256"]))
+            candidate = {**ref, "classification": "UNCLASSIFIED",
+                         "reason": "Declared publication body requires independent content classification" if role else "Code/archive or matching source bytes require independent content and provenance classification",
+                         "matching_git_source_bytes": source_candidates.get(ref["sha256"], [])}
+            if role:
+                candidate["publication_role"] = role
+            if ref is not original_ref:
+                candidate["original_reference"] = original_ref
+                candidate["preservation"] = "Exact historical source bytes; no current-path equivalence or public approval"
+            public_candidates[str(actual_path)] = candidate
+            unfollowed.append({**ref, "reason": candidate["reason"]})
 
     def contains_registered(value: Any) -> bool:
         if isinstance(value, str):
@@ -417,7 +631,7 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
     if (directory / "transcripts").is_dir():
         for path in sorted((directory / "transcripts").rglob("*")):
             if path.is_file():
-                kind = "media" if path.suffix.lower() in media_suffixes else "transcript" if path.suffix.lower() in {".txt", ".json", ".srt", ".vtt"} else "review"
+                kind = "media" if path.suffix.lower() in media_suffixes else "transcript"
                 add(path.absolute(), kind)
     omitted_public_work = {"implementation-staging", "snapshot", "development-env", "isolated-env", "pytest-basetemp", "recovery-example", "editorial-policy-tmp"}
     for base in ("renders", "reviews", "review", "analysis", "evidence", "capability", "checkpoints", "reports"):
@@ -430,18 +644,41 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
                 continue  # Completeness remains UNVERIFIED, never a zero count.
             if contains_registered(value):
                 add(path.absolute(), "transcript" if isinstance(value, dict) and value.get("schema_version") == "transcript/v1" else "review")
+    for ref in (publication_bodies or {}).values():
+        path = _file(ref)
+        if ref["sha256"] in known:
+            add(path, known[ref["sha256"]], ref["sha256"])
+        else:
+            collect_candidate(path, ref, ref)
     while pending:
         path, kind = pending.pop()
         try:
             value = json.loads(path.read_text())
         except (ValueError, UnicodeDecodeError):
             continue
-        walk(value, kind == "transcript")
+        # Namespace/filename privacy protects this file's body, independently
+        # from the provenance of files it references. Only an explicit,
+        # source-bound transcript marker propagates across artifact edges.
+        walk(value)
     return known, sorted(phrases), {"completeness": "UNVERIFIED", "project": str(directory), "source_hashes": registered,
         "known_refs": list(refs.values()), "known_ref_count": len(refs), "derived_phrase_count": len(phrases),
         "unfollowed_refs": unfollowed,
+        "historical_refs": list(historical_refs.values()),
+        "historical_unresolved": [row for row in historical_refs.values() if row["status"] != "RESOLVED"],
+        "unresolved_source_candidates": list(unresolved_sources.values()),
+        "public_work_candidates": [row for row in public_candidates.values() if row["sha256"] not in known],
+        "public_source_candidate_commands": source_candidate_commands,
         "scope": "Registered task project files and source/derived provenance references",
         "reason": "Mandatory graph collected; exact task file inventory and separate classification audit have not yet been verified"}
+
+
+def _private_bookkeeping_payload(name: str, data: bytes) -> None:
+    value = json.loads(data)
+    schema, content = {"acceptance.local.json": ("acceptance-index/v1", "checks"),
+                       "checkpoint.local.json": ("goal-checkpoint/v1", "criteria")}[name]
+    _require(isinstance(value, dict) and value.get("schema_version") == schema
+             and value.get("owner_acceptance") == "pending" and isinstance(value.get(content), dict),
+             "Changed index/checkpoint is not supported private bookkeeping")
 
 
 def _bookkeeping(path: Path, directory: Path, *, referenced_input: bool = False) -> dict[str, Any] | None:
@@ -459,7 +696,7 @@ def _bookkeeping(path: Path, directory: Path, *, referenced_input: bool = False)
                          "Referenced publication input is incomplete")
                 return {"kind": "review", "state": "private_referenced_publication_measurement_input"}
         return None
-    index = relative.as_posix() == "acceptance.local.json"
+    index = relative.as_posix() in {"acceptance.local.json", "checkpoint.local.json"}
     measurement = (len(relative.parts) == 3 and relative.parts[0] == "measurements"
                    and re.fullmatch(r"measurement-[a-f0-9]{32}", relative.parts[1]))
     if not index and not measurement:
@@ -478,9 +715,8 @@ def _bookkeeping(path: Path, directory: Path, *, referenced_input: bool = False)
     value = json.loads(data)
     _require(isinstance(value, dict), "Private bookkeeping must contain the expected JSON object")
     if index:
-        _require(value.get("schema_version") == "acceptance-index/v1" and value.get("owner_acceptance") == "pending"
-                 and isinstance(value.get("checks"), dict), "Changed acceptance index is not supported private bookkeeping")
-        return {"kind": "review", "state": "private_acceptance_index"}
+        _private_bookkeeping_payload(path.name, data)
+        return {"kind": "review", "state": "private_acceptance_index" if path.name == "acceptance.local.json" else "private_goal_checkpoint"}
     schemas = {"stdout.json": "measurement-result/v1", "receipt.json": "execution-receipt/v1",
                "evidence.json": "measurement-check/v1", "run.json": "measurement-run/v1"}
     if path.name == "execution.json":
@@ -499,7 +735,10 @@ def _bookkeeping(path: Path, directory: Path, *, referenced_input: bool = False)
 
 
 def build_private_inventory(project_dir: str | Path, expected_source_hashes: dict[str, str],
-                            repo_root: str | Path, *, archive_dir: str | Path | None = None) -> dict[str, Any]:
+                            repo_root: str | Path, *, archive_dir: str | Path | None = None,
+                            historical_artifacts: list[dict[str, Any]] | None = None,
+                            source_snapshots: list[dict[str, Any]] | None = None,
+                            publication_bodies: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     """Collect the finite task denominator for a separate privacy auditor.
 
     Save result, audit and optional archive_dir outside the task project. The
@@ -509,11 +748,13 @@ def build_private_inventory(project_dir: str | Path, expected_source_hashes: dic
     inferred confidential media. No caller-selected directory exclusion exists.
     """
     directory, root = Path(project_dir).resolve(), Path(repo_root).resolve()
-    _, _, known = _known_private_inventory(directory, expected_source_hashes, root)
+    _, _, known = _known_private_inventory(directory, expected_source_hashes, root,
+                                          historical_artifacts=historical_artifacts, source_snapshots=source_snapshots,
+                                          publication_bodies=publication_bodies)
     entries = {ref["path"]: {**ref, "entry_type": "file", "classification": ref["kind"]}
                for ref in known["known_refs"]}
     names: set[str] = set()
-    unresolved: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = [*known["historical_unresolved"], *known["unresolved_source_candidates"]]
 
     def collect(path: Path, expected: str | None = None) -> None:
         name = str(path)
@@ -584,7 +825,9 @@ def _audited_private_inventory(raw: dict[str, Any], directory: Path | None,
     snapshot_ref = raw["private_inventory_snapshot"]
     _require(not _file(snapshot_ref).is_relative_to(directory.resolve()), "Inventory snapshot must be outside the project it inventories")
     snapshot = _json(snapshot_ref)
-    current = build_private_inventory(directory, expected_sources, root)
+    current = build_private_inventory(directory, expected_sources, root,
+                                      historical_artifacts=raw.get("historical_artifacts"), source_snapshots=raw.get("source_snapshots"),
+                                      publication_bodies={role: raw[role] for role in ("pr_body", "release_body") if role in raw})
     _require(snapshot.get("schema_version") == "private-task-inventory/v1" and snapshot.get("project") == current["project"]
              and snapshot.get("scope") == current["scope"] and snapshot.get("dependencies") == current["dependencies"]
              and not snapshot.get("unresolved") and not current["unresolved"],
@@ -698,7 +941,10 @@ def verify_release_privacy(raw_ref: dict[str, Any], repo_root: str | Path, *, pr
         corpus_available = True
         refs.append(raw["private_corpus"])
     submitted = set(private)
-    known, derived_phrases, private_inventory = _known_private_inventory(project_dir, expected_source_hashes, root)
+    known, derived_phrases, private_inventory = _known_private_inventory(project_dir, expected_source_hashes, root,
+                                                                      historical_artifacts=raw.get("historical_artifacts"),
+                                                                      source_snapshots=raw.get("source_snapshots"),
+                                                                      publication_bodies={role: raw[role] for role in ("pr_body", "release_body")})
     private_inventory["missing_from_submitted_corpus"] = sorted(set(known) - submitted)
     private.update(known)
     phrases = sorted(set(phrases) | set(derived_phrases))

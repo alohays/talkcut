@@ -223,6 +223,541 @@ def private_project(tmp_path):
     return directory, {role: source["sha256"] for role, source in value["sources"].items()}
 
 
+def historical_indexes(tmp_path, directory, count=1):
+    """Keep actual old index bytes; expected digests alone are not evidence."""
+    index = directory / "acceptance.local.json"
+    history = tmp_path / "preserved-indexes"
+    history.mkdir()
+    old_refs, preserved = [], []
+    for version in range(count):
+        atomic_json(index, {"schema_version": "acceptance-index/v1", "owner_acceptance": "pending",
+                            "checks": {}, "fixture_revision": version})
+        ref = artifact_ref(index)
+        target = history / ref["sha256"]
+        target.write_bytes(index.read_bytes())
+        old_refs.append(ref)
+        preserved.append(artifact_ref(target))
+    atomic_json(index, {"schema_version": "acceptance-index/v1", "owner_acceptance": "pending",
+                        "checks": {}, "fixture_revision": count})
+    atomic_json(directory / "checkpoint.local.json", {"previous_index_versions": old_refs})
+    return index, old_refs, preserved
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_actual_preserved_index_versions_are_distinct_mandatory_private_nodes(tmp_path, repository, count):
+    directory, sources = private_project(tmp_path)
+    index, old_refs, preserved = historical_indexes(tmp_path, directory, count)
+    known, _, report = privacy._known_private_inventory(directory, sources, repository, historical_artifacts=preserved)
+    actual = artifact_ref(index)
+    assert report["historical_unresolved"] == []
+    assert len(report["historical_refs"]) == count
+    assert all(row["status"] == "RESOLVED" for row in report["historical_refs"])
+    assert known[actual["sha256"]] == "review"
+    for old, saved in zip(old_refs, preserved, strict=True):
+        assert known[old["sha256"]] == "review"
+        assert {**saved, "kind": "review"} in report["known_refs"]
+        assert {**old, "kind": "review"} not in report["known_refs"]
+    snapshot = privacy.build_private_inventory(directory, sources, repository, historical_artifacts=preserved)
+    assert snapshot["unresolved"] == []
+    assert all(any(row["path"] == ref["path"] and row["sha256"] == ref["sha256"]
+                   and row["classification"] == "review" for row in snapshot["entries"]) for ref in preserved)
+    assert snapshot["classification_status"] == "UNVERIFIED"
+
+
+def test_unread_historical_index_allows_observation_but_never_complete_corpus(tmp_path, repository, monkeypatch):
+    directory, sources = private_project(tmp_path)
+    _, old_refs, preserved = historical_indexes(tmp_path, directory)
+    Path(preserved[0]["path"]).unlink()
+    known, _, report = privacy._known_private_inventory(directory, sources, repository)
+    assert known[old_refs[0]["sha256"]] == "review"  # Deny-list hash only; bytes remain unread.
+    assert all(ref["sha256"] != old_refs[0]["sha256"] for ref in report["known_refs"])
+    assert len(report["historical_unresolved"]) == 1
+    snapshot = privacy.build_private_inventory(directory, sources, repository)
+    assert snapshot["unresolved"] == report["historical_unresolved"]
+    ref = publication_input(repository, tmp_path)
+    result = privacy.verify_release_privacy(ref, repository, project_dir=directory, expected_source_hashes=sources)
+    assert result["coverage"]["all_selected_payloads_read"] is True
+    assert result["coverage"]["private_corpus_complete"] is None
+    assert result["status"] == "UNVERIFIED"
+    assert result["measurements"]["private_transcript_count"] is None
+    snapshot_path = tmp_path / "unresolved-snapshot.json"
+    atomic_json(snapshot_path, snapshot)
+    from talkcut import review
+    monkeypatch.setattr(review, "verify_artifact_audit", lambda *args, **kwargs: pytest.fail("Unread historical bytes must reject before any audit verdict"))
+    with pytest.raises(TalkCutError, match="unresolved"):
+        privacy._audited_private_inventory({"private_inventory_snapshot": artifact_ref(snapshot_path),
+                                            "inventory_audit": {"test_only": True}}, directory, sources, repository, {}, [])
+
+
+def test_suffixless_history_archive_is_parsed_even_if_first_seen_as_ordinary_ref(tmp_path, repository):
+    directory, sources = private_project(tmp_path)
+    index = directory / "acceptance.local.json"
+    note = directory / "historical-private-note.txt"
+    note.write_text("An authored private note reachable only through the preserved historical index.")
+    atomic_json(index, {"schema_version": "acceptance-index/v1", "owner_acceptance": "pending", "checks": {"note": artifact_ref(note)}})
+    old = artifact_ref(index)
+    archive = directory / old["sha256"]
+    archive.write_bytes(index.read_bytes())
+    saved = artifact_ref(archive)
+    atomic_json(index, {"schema_version": "acceptance-index/v1", "owner_acceptance": "pending", "checks": {}})
+    # Dict traversal sees the ordinary suffixless file first. Its later parse
+    # promotion must still follow all historical refs exactly once.
+    atomic_json(directory / "checkpoint.local.json", {"a_archive": saved, "z_historical": old})
+    known, _, report = privacy._known_private_inventory(directory, sources, repository, historical_artifacts=[saved])
+    assert known[artifact_ref(note)["sha256"]] == "review"
+    assert report["historical_unresolved"] == []
+    assert sum(ref["path"] == str(archive) for ref in report["known_refs"]) == 1
+    snapshot = privacy.build_private_inventory(directory, sources, repository, historical_artifacts=[saved])
+    assert next(row for row in snapshot["entries"] if row["path"] == str(note))["classification"] == "review"
+
+
+def test_unread_prior_digest_still_detects_published_old_index_bytes(tmp_path, repository):
+    directory, sources = private_project(tmp_path)
+    _, old_refs, preserved = historical_indexes(tmp_path, directory)
+    old_path = Path(preserved[0]["path"])
+    (repository / "mislabelled-public-notes.json").write_bytes(old_path.read_bytes())
+    commit(repository)
+    old_path.unlink()
+    result = privacy.verify_release_privacy(publication_input(repository, tmp_path), repository,
+                                           project_dir=directory, expected_source_hashes=sources)
+    assert result["status"] == "FAIL"
+    assert any(row.get("sha256") == old_refs[0]["sha256"] for row in result["findings"])
+    assert result["private_inventory"]["historical_unresolved"]
+    assert result["coverage"]["private_corpus_complete"] is None
+    assert result["measurements"]["private_transcript_count"] is None
+
+
+def test_forged_historical_index_hash_cannot_relabel_registered_media(tmp_path, repository):
+    directory, sources = private_project(tmp_path)
+    index = directory / "acceptance.local.json"
+    atomic_json(index, {"schema_version": "acceptance-index/v1", "owner_acceptance": "pending", "checks": {}})
+    atomic_json(directory / "checkpoint.local.json", {"forged_prior_index": {"path": str(index), "sha256": sources["screen"]}})
+    with pytest.raises(TalkCutError, match="relabelled"):
+        privacy._known_private_inventory(directory, sources, repository)
+
+
+def test_asr_runtime_code_is_inventory_candidate_without_becoming_speech(tmp_path, repository):
+    directory, sources = private_project(tmp_path)
+    transcripts = directory / "transcripts"
+    transcripts.mkdir()
+    runtime = directory / "runtime/tokenizer.py"
+    runtime.parent.mkdir()
+    code_line = "from collections import defaultdict as synthetic_public_fixture_collection"
+    runtime.write_text(code_line + "\n")
+    (repository / "public-helper.py").write_bytes(runtime.read_bytes())
+    commit(repository)
+    metadata = transcripts / "asr-runtime-provenance.json"
+    atomic_json(metadata, {"python_executable": "/generated/fixture/python", "packages": {},
+                           "actual_whisper_source_assets_and_mlx_binary": [artifact_ref(runtime)],
+                           "toolchain_tree_hash": "1" * 64})
+    spoken = "This authored sentence is the actual synthetic transcript content that remains protected."
+    atomic_json(transcripts / "normalized.json", {"schema_version": "transcript/v1", "source_sha256": sources["screen"],
+                                                "segments": [{"text": spoken}]})
+    atomic_json(transcripts / "raw.json", {"text": spoken, "segments": [{"text": spoken}], "language": "en"})
+    atomic_json(transcripts / "unknown.json", {"schema": "unknown-transcript/v1", "utterance": "An unknown transcript shape still contains this substantial private utterance."})
+    known, phrases, report = privacy._known_private_inventory(directory, sources, repository)
+    assert code_line not in phrases and spoken in phrases
+    assert "An unknown transcript shape still contains this substantial private utterance." in phrases
+    assert known[artifact_ref(metadata)["sha256"]] == "transcript"
+    assert artifact_ref(runtime)["sha256"] not in known
+    assert next(row for row in report["public_work_candidates"] if row["path"] == str(runtime))["classification"] == "UNCLASSIFIED"
+    snapshot = privacy.build_private_inventory(directory, sources, repository)
+    assert next(row for row in snapshot["entries"] if row["path"] == str(runtime))["classification"] == "UNCLASSIFIED"
+    assert snapshot["classification_status"] == "UNVERIFIED"
+    result = privacy.verify_release_privacy(publication_input(repository, tmp_path), repository,
+                                           project_dir=directory, expected_source_hashes=sources)
+    assert result["observed_matches"]["private_transcript_count"] == 0
+    assert result["measurements"]["private_transcript_count"] is None
+    assert result["coverage"]["private_corpus_complete"] is None
+
+
+def test_referenced_public_source_copy_and_archive_require_classification(tmp_path, repository):
+    directory, sources = private_project(tmp_path)
+    copy = directory / "audit-code-copy.txt"
+    copy.write_bytes((repository / "README.md").read_bytes())
+    package = directory / "candidate.whl"
+    package.write_bytes(archive_bytes({"talkcut/__init__.py": b"# authored public fixture package\n"}))
+    atomic_json(directory / "checkpoint.local.json", {"copy": artifact_ref(copy), "package": artifact_ref(package)})
+    known, _, report = privacy._known_private_inventory(directory, sources, repository)
+    assert all(artifact_ref(path)["sha256"] not in known for path in (copy, package))
+    candidates = {row["path"]: row for row in report["public_work_candidates"]}
+    assert candidates[str(copy)]["matching_git_source_bytes"]
+    assert candidates[str(package)]["classification"] == "UNCLASSIFIED"
+    snapshot = privacy.build_private_inventory(directory, sources, repository)
+    assert all(next(row for row in snapshot["entries"] if row["path"] == str(path))["classification"] == "UNCLASSIFIED"
+               for path in (copy, package))
+
+
+def test_relative_historical_public_readme_ref_remains_covered_by_git_payload(tmp_path, repository):
+    directory, sources = private_project(tmp_path)
+    prior = {"path": "README.md", "sha256": artifact_ref(repository / "README.md")["sha256"]}
+    (repository / "README.md").write_text("Updated public fixture documentation\n")
+    commit(repository)
+    atomic_json(directory / "goal-handoff.local.json", {"prior_public_document": prior})
+    known, _, report = privacy._known_private_inventory(directory, sources, repository)
+    assert prior["sha256"] not in known
+    assert all(ref["path"] != "README.md" for ref in report["unfollowed_refs"])
+    snapshot = privacy.build_private_inventory(directory, sources, repository)
+    assert not snapshot["unresolved"]
+    result = privacy.verify_release_privacy(publication_input(repository, tmp_path), repository,
+                                           project_dir=directory, expected_source_hashes=sources)
+    assert any(unit["sha256"] == prior["sha256"] for unit in result["units"])
+    assert len(result["git"]["reachable_commits"]) == 2
+    assert result["coverage"]["private_corpus_complete"] is None
+
+
+@pytest.mark.parametrize("representation", ["unknown_schema", "metadata_schema", "runtime_manifest", "plain_py", "json_py"])
+def test_transcript_namespace_body_protection_does_not_depend_on_labels(tmp_path, repository, representation):
+    directory, sources = private_project(tmp_path)
+    transcripts = directory / "transcripts"
+    transcripts.mkdir()
+    phrase = "An authored confidential lecture sentence about nine silver pentagons beside an amber ocean."
+    target = transcripts / ("recording.py" if representation.endswith("py") else "recording.json")
+    if representation == "plain_py":
+        target.write_text(phrase + "\n")
+    elif representation == "json_py":
+        atomic_json(target, {"text": phrase})
+    elif representation == "runtime_manifest":
+        atomic_json(target, {"python_executable": "/generated/python", "packages": {"utterance": phrase},
+                             "actual_whisper_source_assets_and_mlx_binary": [], "toolchain_tree_hash": "0" * 64})
+    else:
+        atomic_json(target, {"schema": "talkcut-private-asr-evidence/v1" if representation == "metadata_schema" else "unknown/v1",
+                             "utterance": phrase})
+    (repository / "excerpt.txt").write_text("Public wrapper\n" + phrase + "\nUnrelated suffix\n")
+    commit(repository)
+    result = privacy.verify_release_privacy(publication_input(repository, tmp_path), repository,
+                                           project_dir=directory, expected_source_hashes=sources)
+    assert result["status"] == "FAIL"
+    assert any(row["kind"] == "protected_transcript_phrase" for row in result["findings"])
+    assert artifact_ref(target)["sha256"] in {ref["sha256"] for ref in result["private_inventory"]["known_refs"]}
+    assert result["coverage"]["private_corpus_complete"] is None
+
+
+@pytest.mark.parametrize("location", ["external", "external_py", "external_json_py", "public_docs", "public_duplicate"])
+def test_explicit_registered_transcript_precedes_all_public_candidate_routes(tmp_path, repository, location):
+    directory, sources = private_project(tmp_path)
+    phrase = "An explicitly registered private transcript sentence about turquoise moons and seven copper stars."
+    if location == "public_docs":
+        target = repository / "docs/recording.txt"
+        target.parent.mkdir()
+    else:
+        target = tmp_path / ("recording.py" if "py" in location else "recording.txt")
+    if location == "external_json_py":
+        atomic_json(target, {"text": phrase})
+    else:
+        target.write_text(phrase + "\n")
+    atomic_json(directory / "checkpoint.local.json", {"producer": {"transcript": {
+        "schema_version": "transcript/v1", "source_sha256": sources["screen"], **artifact_ref(target)}}})
+    if location == "public_duplicate":
+        (repository / "docs").mkdir()
+        (repository / "docs/public-copy.txt").write_bytes(target.read_bytes())
+    (repository / "excerpt.txt").write_text("Unrelated prefix\n" + phrase + "\nUnrelated suffix\n")
+    commit(repository)
+    result = privacy.verify_release_privacy(publication_input(repository, tmp_path), repository,
+                                           project_dir=directory, expected_source_hashes=sources)
+    assert result["status"] == "FAIL"
+    assert any(row["kind"] == "protected_transcript_phrase" for row in result["findings"])
+    assert any(ref["path"] == str(target) and ref["kind"] == "transcript" for ref in result["private_inventory"]["known_refs"])
+    snapshot = privacy.build_private_inventory(directory, sources, repository)
+    assert next(row for row in snapshot["entries"] if row["path"] == str(target))["classification"] == "transcript"
+    assert result["coverage"]["private_corpus_complete"] is None
+
+
+def test_public_source_directory_alone_cannot_hide_wrong_historical_locator(tmp_path, repository):
+    directory, sources = private_project(tmp_path)
+    old = artifact_ref(repository / "README.md")
+    atomic_json(directory / "goal-handoff.local.json", {"forged_path": {**old, "path": "docs/nonexistent.txt"}})
+    with pytest.raises(TalkCutError, match="absent"):
+        privacy._known_private_inventory(directory, sources, repository)
+
+
+@pytest.mark.parametrize("damage", [None, "missing_locator", "forged_bytes", "current_owner", "old_schema"])
+def test_goal_checkpoint_history_requires_typed_current_and_preserved_bytes(tmp_path, repository, damage):
+    directory, sources = private_project(tmp_path)
+    checkpoint = directory / "checkpoint.local.json"
+    original = {"schema_version": "goal-checkpoint/v1", "owner_acceptance": "pending", "criteria": {"AC01": "UNVERIFIED"}}
+    atomic_json(checkpoint, original)
+    old_ref = artifact_ref(checkpoint)
+    backup = tmp_path / "old-checkpoint"
+    backup.write_bytes(checkpoint.read_bytes())
+    preserved = artifact_ref(backup)
+    atomic_json(checkpoint, {**original, "criteria": {"AC01": "PASS"}})
+    atomic_json(directory / "goal-handoff.local.json", {"recorded_old_checkpoint": old_ref})
+    if damage == "forged_bytes":
+        backup.write_text("Changed old bytes")
+    elif damage == "current_owner":
+        atomic_json(checkpoint, {**original, "owner_acceptance": "accepted"})
+    elif damage == "old_schema":
+        atomic_json(backup, {"schema_version": "unrelated/v1", "owner_acceptance": "pending", "criteria": {}})
+        preserved = artifact_ref(backup)
+        atomic_json(directory / "goal-handoff.local.json", {"recorded_old_checkpoint": {"path": str(checkpoint), "sha256": preserved["sha256"]}})
+    locators = [] if damage == "missing_locator" else [preserved]
+    if damage in {"forged_bytes", "current_owner", "old_schema"}:
+        with pytest.raises(TalkCutError):
+            privacy._known_private_inventory(directory, sources, repository, historical_artifacts=locators)
+    else:
+        known, _, graph = privacy._known_private_inventory(directory, sources, repository, historical_artifacts=locators)
+        assert known[old_ref["sha256"]] == known[artifact_ref(checkpoint)["sha256"]] == "review"
+        snapshot = privacy.build_private_inventory(directory, sources, repository, historical_artifacts=locators)
+        assert bool(snapshot["unresolved"]) == (damage == "missing_locator")
+        assert bool(graph["historical_unresolved"]) == (damage == "missing_locator")
+        if damage is None:
+            assert {**preserved, "kind": "review"} in graph["known_refs"]
+
+
+@pytest.mark.parametrize("damage", [None, "wrong_snapshot", "missing_snapshot", "wrong_origin", "explicit_transcript", "transcript_json"])
+def test_preserved_source_locator_is_unclassified_and_cannot_restore_private_changes(tmp_path, repository, damage):
+    directory, sources = private_project(tmp_path)
+    original = repository / "src/helper.py"
+    original.parent.mkdir()
+    if damage in {"explicit_transcript", "transcript_json"}:
+        atomic_json(original, {"schema_version": "transcript/v1", "source_sha256": sources["screen"],
+                               "text": "A protected private transcript that must not be recovered as a public source candidate."})
+    else:
+        original.write_text("def generated_helper():\n    return 7\n")
+    old_ref = artifact_ref(original)
+    saved = tmp_path / "immutable-source-snapshot.txt"
+    saved.write_bytes(original.read_bytes())
+    locator = {"original": old_ref, "snapshot": artifact_ref(saved)}
+    original.write_text("def generated_helper():\n    return 8\n")
+    edge = old_ref if damage != "explicit_transcript" else {**old_ref, "schema_version": "transcript/v1", "source_sha256": sources["screen"]}
+    atomic_json(directory / "checkpoint.local.json", {"prior_code": edge})
+    if damage == "wrong_snapshot":
+        saved.write_text("Different bytes from the recorded snapshot")
+    elif damage == "missing_snapshot":
+        saved.unlink()
+    elif damage == "wrong_origin":
+        locator["original"] = {**old_ref, "path": str(directory / "private.py")}
+    if damage is not None:
+        with pytest.raises(TalkCutError):
+            privacy._known_private_inventory(directory, sources, repository, source_snapshots=[locator])
+    else:
+        known, _, graph = privacy._known_private_inventory(directory, sources, repository, source_snapshots=[locator])
+        assert old_ref["sha256"] not in known
+        candidate = next(row for row in graph["public_work_candidates"] if row["path"] == str(saved))
+        assert candidate["classification"] == "UNCLASSIFIED" and candidate["original_reference"] == old_ref
+        assert candidate["sha256"] == artifact_ref(saved)["sha256"]
+        snapshot = privacy.build_private_inventory(directory, sources, repository, source_snapshots=[locator])
+        assert next(row for row in snapshot["entries"] if row["path"] == str(saved))["classification"] == "UNCLASSIFIED"
+        assert snapshot["classification_status"] == "UNVERIFIED"
+
+
+def test_unpreserved_public_source_keeps_observations_but_blocks_inventory_audit(tmp_path, repository, monkeypatch):
+    directory, sources = private_project(tmp_path)
+    original = repository / "src/helper.py"
+    original.parent.mkdir()
+    original.write_text("def helper():\n    return 1\n")
+    commit(repository)
+    original.write_text("def helper():\n    return 2\n")
+    old_ref = artifact_ref(original)
+    original.write_text("def helper():\n    return 3\n")
+    private = tmp_path / "external-transcript.txt"
+    private.write_text("This invented private statement remains protected through an unresolved source edge.")
+    # Nested private evidence still has to be traversed after the unread edge.
+    atomic_json(directory / "checkpoint.local.json", {"prior_code": {
+        **old_ref, "nested": {"schema_version": "transcript/v1", "source_sha256": sources["screen"], **artifact_ref(private)}}})
+    known, phrases, graph = privacy._known_private_inventory(directory, sources, repository)
+    assert old_ref["sha256"] not in known
+    assert all(ref["sha256"] != old_ref["sha256"] for ref in graph["known_refs"])
+    assert known[artifact_ref(private)["sha256"]] == "transcript" and private.read_text() in phrases
+    unresolved = graph["unresolved_source_candidates"]
+    assert len(unresolved) == 1 and unresolved[0]["sha256"] == old_ref["sha256"]
+    assert unresolved[0]["current_ref"] == artifact_ref(original)
+    assert unresolved[0]["status"] == "UNVERIFIED"
+    snapshot = privacy.build_private_inventory(directory, sources, repository)
+    assert snapshot["unresolved"] == unresolved
+    result = privacy.verify_release_privacy(publication_input(repository, tmp_path), repository,
+                                           project_dir=directory, expected_source_hashes=sources)
+    assert result["coverage"]["all_selected_payloads_read"] is True
+    assert result["coverage"]["private_corpus_complete"] is None and result["status"] == "UNVERIFIED"
+    assert result["measurements"]["private_transcript_count"] is None
+    snapshot_path = tmp_path / "unresolved-source-inventory.json"
+    atomic_json(snapshot_path, snapshot)
+    from talkcut import review
+    monkeypatch.setattr(review, "verify_artifact_audit", lambda *args, **kwargs: pytest.fail("Unread source bytes cannot be approved by classification"))
+    with pytest.raises(TalkCutError, match="unresolved"):
+        privacy._audited_private_inventory({"private_inventory_snapshot": artifact_ref(snapshot_path),
+                                            "inventory_audit": {"test_only": True}}, directory, sources, repository, {}, [])
+
+
+@pytest.mark.parametrize("damage", ["missing", "symlink", "invalid_digest", "explicit_transcript"])
+def test_unpreserved_source_observation_does_not_ignore_invalid_or_private_refs(tmp_path, repository, damage):
+    directory, sources = private_project(tmp_path)
+    original = repository / "src/helper.py"
+    original.parent.mkdir()
+    original.write_text("def helper():\n    return 1\n")
+    commit(repository)
+    original.write_text("def helper():\n    return 2\n")
+    old_ref = artifact_ref(original)
+    original.write_text("def helper():\n    return 3\n")
+    if damage == "missing":
+        original.unlink()
+    elif damage == "symlink":
+        target = tmp_path / "actual-helper.py"
+        target.write_bytes(original.read_bytes())
+        original.unlink()
+        original.symlink_to(target)
+    elif damage == "invalid_digest":
+        old_ref["sha256"] = "not-a-digest"
+    else:
+        old_ref.update({"schema_version": "transcript/v1", "source_sha256": sources["screen"]})
+    atomic_json(directory / "checkpoint.local.json", {"prior_code": old_ref})
+    with pytest.raises(TalkCutError):
+        privacy._known_private_inventory(directory, sources, repository)
+
+
+@pytest.mark.parametrize("historical", [False, True])
+def test_exact_git_json_transcript_is_private_before_public_source_matching(tmp_path, repository, historical):
+    directory, sources = private_project(tmp_path)
+    transcript = repository / "docs/foo.json"
+    transcript.parent.mkdir()
+    text = "A private invented lecture statement inside a canonical Git source path must stay protected."
+    atomic_json(transcript, {"schema_version": "transcript/v1", "source_sha256": sources["screen"], "text": text})
+    old = artifact_ref(transcript)
+    commit(repository)
+    atomic_json(directory / "checkpoint.local.json", {"generic_ref": old})
+    if historical:
+        transcript.write_text("{}\n")
+        commit(repository)
+        with pytest.raises(TalkCutError):
+            privacy._known_private_inventory(directory, sources, repository)
+    else:
+        known, phrases, graph = privacy._known_private_inventory(directory, sources, repository)
+        assert known[old["sha256"]] == "transcript" and text in phrases
+        assert {**old, "kind": "transcript"} in graph["known_refs"]
+        scanner = privacy.Scan(known, phrases)
+        privacy._git_inventory(repository, git(repository, "rev-parse", "HEAD"), scanner, [])
+        assert scanner.transcripts and scanner.findings
+
+
+@pytest.mark.parametrize("private_kind", [None, "transcript_marker", "known_review", "registered_source"])
+def test_typed_publication_body_is_unclassified_unless_private_provenance_wins(tmp_path, repository, private_kind):
+    directory, sources = private_project(tmp_path)
+    raw_ref = publication_input(repository, tmp_path)
+    raw = privacy._json(raw_ref)
+    if private_kind == "transcript_marker":
+        body = directory / "proposed-body.md"
+        atomic_json(body, {"schema_version": "transcript/v1", "source_sha256": sources["screen"],
+                           "text": "An invented private lecture phrase cannot be published by relabelling its body role."})
+        raw["pr_body"] = artifact_ref(body)
+    elif private_kind == "known_review":
+        body = directory / "reviews/private.json"
+        body.parent.mkdir()
+        atomic_json(body, {"source_sha256": sources["screen"], "private_review": "Confidential authored fixture review metadata"})
+        raw["pr_body"] = artifact_ref(body)
+    elif private_kind == "registered_source":
+        body = directory / "sources/screen.bin"
+        project = json.loads((directory / "project.json").read_text())
+        raw["pr_body"] = {"path": project["sources"]["screen"]["path"], "sha256": sources["screen"]}
+    else:
+        body = directory / "draft-note.md"
+        body.write_bytes(Path(raw["pr_body"]["path"]).read_bytes())
+        raw["pr_body"] = artifact_ref(body)
+        # A previous computed inventory is reference evidence, not authority
+        # that can turn intended publication bytes into private lecture data.
+        atomic_json(directory / "checkpoint.local.json", {"old_inventory": {"known_refs": [{**raw["pr_body"], "kind": "review"}]}})
+    atomic_json(Path(raw_ref["path"]), raw)
+    result = privacy.verify_release_privacy(artifact_ref(Path(raw_ref["path"])), repository,
+                                           project_dir=directory, expected_source_hashes=sources)
+    graph = result["private_inventory"]
+    if private_kind is None:
+        candidate = next(row for row in graph["public_work_candidates"] if row["sha256"] == raw["pr_body"]["sha256"])
+        assert candidate["publication_role"] == "pr_body" and candidate["classification"] == "UNCLASSIFIED"
+        assert result["observed_matches"]["private_transcript_count"] == 0
+        assert result["status"] == "UNVERIFIED" and result["coverage"]["private_corpus_complete"] is None
+    else:
+        assert any(ref["sha256"] == raw["pr_body"]["sha256"] for ref in graph["known_refs"])
+        assert result["status"] == "FAIL" and result["findings"]
+
+
+@pytest.mark.parametrize("kind", ["registered_source", "transcript", "private_review"])
+def test_public_byte_match_cannot_override_known_private_content(tmp_path, repository, kind):
+    directory, sources = private_project(tmp_path)
+    if kind == "registered_source":
+        original = Path(json.loads((directory / "project.json").read_text())["sources"]["screen"]["path"])
+    elif kind == "transcript":
+        original = directory / "transcripts/unknown.py"
+        original.parent.mkdir()
+        original.write_text("A private transcript deliberately renamed with a public-looking code extension.\n")
+    else:
+        original = directory / "evidence/private-review.json"
+        original.parent.mkdir()
+        atomic_json(original, {"source_sha256": sources["screen"], "reason": "Actual authored private review fixture; never declassify based on a public duplicate"})
+    # This deliberately leaked Git copy must not become its own justification.
+    public = repository / "docs/leaked-copy.md"
+    public.parent.mkdir()
+    public.write_bytes(original.read_bytes())
+    commit(repository)
+    alias = directory / "public-looking.py"
+    alias.write_bytes(original.read_bytes())
+    atomic_json(directory / "checkpoint.local.json", {"alias": artifact_ref(alias)})
+    result = privacy.verify_release_privacy(publication_input(repository, tmp_path), repository,
+                                           project_dir=directory, expected_source_hashes=sources)
+    assert result["status"] == "FAIL"
+    assert any(row.get("sha256") == artifact_ref(original)["sha256"] for row in result["findings"])
+    assert all(row["sha256"] != artifact_ref(original)["sha256"] for row in result["private_inventory"]["public_work_candidates"])
+    assert result["coverage"]["private_corpus_complete"] is None
+
+
+@pytest.mark.parametrize("damage", ["missing", "wrong_bytes", "symlink", "forged_hash", "wrong_old_schema"])
+def test_historical_locator_requires_actual_unchanged_regular_index_bytes(tmp_path, repository, damage):
+    directory, sources = private_project(tmp_path)
+    _, _, preserved = historical_indexes(tmp_path, directory)
+    path = Path(preserved[0]["path"])
+    if damage == "missing":
+        path.unlink()
+    elif damage == "wrong_bytes":
+        path.write_text("Changed after the actual old digest was recorded")
+    elif damage == "symlink":
+        real = tmp_path / "old-index-copy.json"
+        real.write_bytes(path.read_bytes())
+        path.unlink()
+        path.symlink_to(real)
+    elif damage == "forged_hash":
+        preserved[0]["sha256"] = "0" * 64
+    else:
+        # A forged old index with internally consistent SHA still lacks its
+        # required schema. Keep the old reference bound to these same bytes.
+        atomic_json(path, {"schema_version": "unrelated/v1", "owner_acceptance": "pending", "checks": {}})
+        preserved[0] = artifact_ref(path)
+        atomic_json(directory / "checkpoint.local.json", {"previous_index": {
+            "path": str(directory / "acceptance.local.json"), "sha256": preserved[0]["sha256"]}})
+    with pytest.raises(TalkCutError):
+        privacy._known_private_inventory(directory, sources, repository, historical_artifacts=preserved)
+
+
+@pytest.mark.parametrize("field,value", [("schema_version", "unrelated/v1"), ("owner_acceptance", "accepted"), ("checks", [])])
+def test_historical_locator_cannot_hide_invalid_current_index(tmp_path, repository, field, value):
+    directory, sources = private_project(tmp_path)
+    index, _, preserved = historical_indexes(tmp_path, directory)
+    current = json.loads(index.read_text())
+    current[field] = value
+    atomic_json(index, current)
+    with pytest.raises(TalkCutError, match="bookkeeping"):
+        privacy._known_private_inventory(directory, sources, repository, historical_artifacts=preserved)
+
+
+@pytest.mark.parametrize("kind", ["source", "transcript", "render", "inspection"])
+def test_history_does_not_relax_immutable_source_or_artifact_references(tmp_path, repository, kind):
+    directory, sources = private_project(tmp_path)
+    if kind == "source":
+        project = json.loads((directory / "project.json").read_text())
+        path = Path(project["sources"]["screen"]["path"])
+    else:
+        suffix = ".mp4" if kind == "render" else ".json"
+        path = directory / (kind + suffix)
+        atomic_json(path, {"schema_version": "transcript/v1" if kind == "transcript" else "fixture/v1",
+                           "source_sha256": sources["screen"], "text": "An authored private reference fixture only"})
+    old_ref = artifact_ref(path)
+    backup = tmp_path / "immutable-backup"
+    backup.write_bytes(path.read_bytes())
+    atomic_json(directory / "checkpoint.local.json", {"immutable": old_ref})
+    path.chmod(0o600)  # Fault injection into this generated source fixture only.
+    path.write_bytes(b"Changed immutable private artifact bytes")
+    with pytest.raises(TalkCutError, match="registered hash|Registered source bytes changed"):
+        privacy._known_private_inventory(directory, sources, repository, historical_artifacts=[artifact_ref(backup)])
+
+
 def test_one_hash_corpus_cannot_omit_registered_task_transcript(repository, tmp_path, monkeypatch):
     directory, sources = private_project(tmp_path)
     transcripts = directory / "transcripts"
@@ -348,7 +883,10 @@ def test_transcript_symlink_is_not_silently_followed_outside_task(tmp_path):
 
 def classification_control(tmp_path, directory, sources, repository):
     """Authored adapter control only; real provider binding has separate tests."""
-    snapshot = privacy.build_private_inventory(directory, sources, repository, archive_dir=tmp_path / "frozen-private-inputs")
+    raw_ref = publication_input(repository, tmp_path)
+    raw = privacy._json(raw_ref)
+    snapshot = privacy.build_private_inventory(directory, sources, repository, archive_dir=tmp_path / "frozen-private-inputs",
+                                               publication_bodies={role: raw[role] for role in ("pr_body", "release_body")})
     snapshot_path = tmp_path / "inventory.json"
     atomic_json(snapshot_path, snapshot)
     response = {"private_classifications": [
@@ -356,8 +894,12 @@ def classification_control(tmp_path, directory, sources, repository):
          "classification": row["classification"] if row["classification"] != "UNCLASSIFIED" else "review",
          "reason": "Authored structural fixture classifies task material private; not a media or provider certificate"}
         for row in snapshot["entries"]]}
-    raw_ref = publication_input(repository, tmp_path)
-    raw = privacy._json(raw_ref)
+    public_bodies = {raw[role]["path"]: raw[role] for role in ("pr_body", "release_body")}
+    for row in response["private_classifications"]:
+        if row["path"] in public_bodies:
+            row.update({"classification": "public_work", "evidence_refs": [public_bodies[row["path"]]],
+                        "reason": "Authored public fixture body from publication_input; structural adapter control only"})
+    response["inspected_artifact_hashes"] = [ref["sha256"] for ref in public_bodies.values()]
     raw.update({"private_inventory_snapshot": artifact_ref(snapshot_path), "inventory_audit": {"test_only": True},
                 "implementation_run_ids": ["authored-fixture-builder"]})
     atomic_json(tmp_path / "publication.json", raw)
