@@ -881,7 +881,7 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         for ref in [replay["bundle"], *replay["artifacts"], *replay["external_inputs"]]:
             collect_candidate(Path(ref["path"]), ref, ref)
         for link in replay["external_tool_links"]:
-            unfollowed.append({"path": link["link_path"], "sha256": link["link_bytes_sha256"],
+            unfollowed.append({"path": link["link_path"], "sha256": link["link_bytes_sha256"], "reference_type": "symlink_literal",
                                "reason": "Exact current execution-tool alias; link bytes and canonical target both inventoried"})
     for source in auxiliary_source_current:
         original, preserved = source["original_reference"], source["preserved_ref"]
@@ -1283,16 +1283,44 @@ def build_private_inventory(project_dir: str | Path, expected_source_hashes: dic
     names: set[str] = set()
     unresolved: list[dict[str, Any]] = [*known["historical_unresolved"], *known["unresolved_source_candidates"]]
 
-    def collect(path: Path, expected: str | None = None) -> None:
+    alias_observations: dict[str, dict[str, Any]] = {}
+
+    def collect(path: Path, expected: str | None = None, *, literal_link: bool = False) -> None:
         name = str(path)
+        if expected is not None and not literal_link:
+            try:
+                aliased = (path.is_symlink() or path.parent != path.parent.resolve()
+                           or entries.get(name, {}).get("entry_type") == "symlink" or name in alias_observations)
+                if aliased:
+                    from .native_provenance import alias_snapshot
+
+                    observed = alias_snapshot(str(path))
+                    _require(observed["target"]["sha256"] == expected, "Inventory alias target bytes changed")
+                    _require(name not in alias_observations or alias_observations[name] == observed,
+                             "Inventory alias chain or target identity changed")
+                    alias_observations[name] = observed
+                    for hop in observed["hops"]:
+                        collect(Path(hop["path"]), hop["link_bytes_sha256"], literal_link=True)
+                    collect(Path(observed["target"]["path"]), expected)
+                    return
+            except (OSError, RuntimeError) as exc:
+                raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Inventory alias is missing, cyclic or ambiguous") from exc
         if name in entries:
-            _require(expected is None or entries[name]["sha256"] == expected, "Inventory reference changed")
+            row = entries[name]
+            if row["entry_type"] == "symlink":
+                _require(path.is_symlink() and os.readlink(path) == row["target"], "Inventory link literal changed")
+                _require(expected is None or literal_link and row["sha256"] == expected, "Inventory link reference changed")
+            else:
+                _require(not literal_link and (expected is None or row["sha256"] == expected), "Inventory reference changed")
             return
+        _require(not literal_link or path.is_symlink(), "Inventory literal-link reference is not a symlink")
         _require(len(entries) < MAX_TASK_FILES, "Task inventory exceeds the declared file-count bound")
         if path.is_symlink():
             target = os.readlink(path)
+            digest = hashlib.sha256(os.fsencode(target)).hexdigest()
+            _require(expected is None or literal_link and digest == expected, "Inventory link literal bytes changed")
             entries[name] = {"path": name, "entry_type": "symlink", "target": target,
-                             "sha256": hashlib.sha256(os.fsencode(target)).hexdigest(), "classification": "UNCLASSIFIED"}
+                             "sha256": digest, "classification": "UNCLASSIFIED"}
         elif path.is_file():
             ref = artifact_ref(path)
             _require(expected is None or ref["sha256"] == expected, "Task provenance reference bytes changed")
@@ -1313,7 +1341,8 @@ def build_private_inventory(project_dir: str | Path, expected_source_hashes: dic
             collect(path)
     for ref in known["unfollowed_refs"]:
         path = Path(ref["path"])
-        collect(path if path.is_absolute() else root / path, ref["sha256"])
+        collect(path if path.is_absolute() else root / path, ref["sha256"],
+                literal_link=ref.get("reference_type") == "symlink_literal")
     current_names = {str(Path(parent) / name) for parent, folders, files in os.walk(directory, followlinks=False, onerror=unreadable_task)
                      for name in files + [item for item in folders if (Path(parent) / item).is_symlink()]}
     _require(names == current_names, "Task inventory changed while being collected")
