@@ -69,3 +69,20 @@ Synthetic timing and recovery controls establish technical behavior. They do not
 establish spoken editorial accuracy, audiovisual capability or final lecture
 acceptance. Those measurements remain unknown until their separate required
 inputs and executed reviews are available.
+
+## Explicit origins for copied private observations
+
+The privacy inventory distinguishes an observation's copied source metadata from
+an executable artifact reference. A copied source tree requires an explicitly
+selected parent, an exact full manifest and the original recorder under the same
+observation context. The inventory rechecks every source entry against its
+registered authority. A recorder in another array element or inside the copied
+manifest cannot supply that authority; relative paths never acquire a guessed
+repository root.
+
+Preserved verification-command observations also require their original and
+current bytes, exact command structure and bound logs. Resolving an observation's
+origin does not change the historical command's outcome or certify its execution.
+Unknown references and malformed evidence remain failures. These checks support
+the inventory; they do not establish that a particular private project is ready
+for publication.

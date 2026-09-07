@@ -392,7 +392,9 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
                              auxiliary_runtime_requests: list[dict[str, Any]] | None = None,
                              native_runtime_request_observations: list[dict[str, Any]] | None = None,
                              native_runtime_alias_reobservations: list[dict[str, Any]] | None = None,
+                             historical_verification_command_observations: list[dict[str, Any]] | None = None,
                              auxiliary_source_trees: list[dict[str, Any]] | None = None,
+                             auxiliary_source_tree_reobservations: list[dict[str, Any]] | None = None,
                              auxiliary_historical_source_trees: list[dict[str, Any]] | None = None) -> tuple[dict[str, str], list[str], dict[str, Any]]:
     """Derive mandatory exclusions from the evaluator's registered task.
 
@@ -418,18 +420,28 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
                                                             native_runtime_observations, directory, repo_root, set(registered.values()))
     native_reobservation_edges = {(row["parent"]["path"], tuple(row["edge"])): row for row in native_reobservations}
     native_reobservation_consumed: set[tuple[str, tuple[str | int, ...]]] = set()
+    command_history = _historical_verification_command_inventory(historical_verification_command_observations,
+                                                                 directory, repo_root, set(registered.values()))
+    command_history_by_key = {(row["original"]["path"], row["original"]["sha256"]): row for row in command_history}
+    command_history_followed: set[tuple[str, str]] = set()
     runtime_observations = [*auxiliary_runtime_observations, *native_runtime_observations]
     _require(len({row["request"]["path"] for row in runtime_observations}) == len(runtime_observations),
              "Runtime request cannot have conflicting auxiliary/native observation roles")
     current_tree_observations = _auxiliary_source_tree_inventory(auxiliary_source_trees, directory, repo_root, set(registered.values()))
     historical_tree_observations = _auxiliary_historical_source_tree_inventory(auxiliary_historical_source_trees, directory, repo_root, set(registered.values()))
     source_tree_observations = [*current_tree_observations, *historical_tree_observations]
+    source_tree_reobservations = _source_tree_reobservation_inventory(auxiliary_source_tree_reobservations,
+                                                                     current_tree_observations, directory, repo_root, set(registered.values()))
     source_tree_bindings: dict[tuple[str, tuple[str | int, ...]], dict[str, Any]] = {}
     for observation in source_tree_observations:
         for binding in observation["bindings"]:
             binding_key = (binding["parent"]["path"], tuple(binding["edge"]))
             _require(binding_key not in source_tree_bindings, "Conflicting current/historical source tree origin binding")
             source_tree_bindings[binding_key] = observation
+    for copied_tree in source_tree_reobservations:
+        binding_key = (copied_tree["parent"]["path"], tuple(copied_tree["edge"]))
+        _require(binding_key not in source_tree_bindings, "Source tree reobservation conflicts with an existing current/historical binding")
+        source_tree_bindings[binding_key] = next(row for row in current_tree_observations if row["build"] == copied_tree["authority_build"])
     runtime_edges = {(observation["request"]["path"], library["declared_reference"]["path"], library["declared_reference"]["sha256"]): library
                      for observation in runtime_observations for library in observation["libraries"]}
     # A diagnostic may repeat an already observed alias identity. This map is
@@ -539,6 +551,8 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         key = (str(original_path), original["sha256"])
         _require(key not in auxiliary_locators or auxiliary_locators[key] == snapshot, "Conflicting auxiliary metadata locators")
         auxiliary_locators[key] = snapshot
+    _require(not set(command_history_by_key).intersection(auxiliary_locators),
+             "Formal command history cannot also use the auxiliary history role")
     digests = set(registered.values())
     media_suffixes = {".mp4", ".mov", ".webm", ".mkv", ".wav", ".mp3", ".aac", ".m4a", ".flac", ".png", ".jpg", ".jpeg"}
     rank = {"review": 0, "transcript": 1, "media": 2}
@@ -591,6 +605,20 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         _require(path.is_absolute() and path.is_file() and not path.is_symlink(), "Known private artifact is missing or is a symlink")
         name = str(path)
         ref = refs.get(name) or artifact_ref(path)
+        formal_history = command_history_by_key.get((name, expected)) if expected is not None else None
+        if formal_history is not None:
+            _require(historical and kind == "review" and ref["sha256"] == formal_history["current"]["sha256"],
+                     "Historical command bytes cannot replace current or private source identity")
+            assert expected is not None
+            key = (name, expected)
+            if key in command_history_followed:
+                return
+            command_history_followed.add(key)
+            for actual in (formal_history["current"], formal_history["snapshot"]):
+                actual_path = Path(actual["path"])
+                add(actual_path, "review", actual["sha256"], parse_json=True)
+                inspect_text(actual_path, True, parse_json=True)
+            return
         if (expected is not None and ref["sha256"] != expected and historical and kind == "review"
                 and path in {directory / relative for relative in (
                     "acceptance.local.json", "checkpoint.local.json", "project.json", "reports/acceptance-latest.local.json")}):
@@ -831,8 +859,19 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         for library in observation["libraries"]:
             ref = library["target"]
             collect_candidate(Path(ref["path"]), ref, ref)
+    for observation in command_history:
+        original = observation["original"]
+        add(Path(original["path"]), "review", original["sha256"], historical=True, parse_json=True)
+        for actual in [observation["parent"], *observation["log_refs"]]:
+            actual_path = Path(actual["path"])
+            add(actual_path, "review", actual["sha256"], parse_json=True)
+            inspect_text(actual_path, True, parse_json=True)
     for observation in native_reobservations:
         parent_ref = observation["parent"]
+        add(Path(parent_ref["path"]), "review", parent_ref["sha256"], parse_json=True)
+        inspect_text(Path(parent_ref["path"]), True, parse_json=True)
+    for copied_tree in source_tree_reobservations:
+        parent_ref = copied_tree["parent"]
         add(Path(parent_ref["path"]), "review", parent_ref["sha256"], parse_json=True)
         inspect_text(Path(parent_ref["path"]), True, parse_json=True)
     for observation in source_tree_observations:
@@ -899,6 +938,11 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
     _require(current_tree_observations == _auxiliary_source_tree_inventory(auxiliary_source_trees, directory, repo_root, digests)
              and historical_tree_observations == _auxiliary_historical_source_tree_inventory(auxiliary_historical_source_trees, directory, repo_root, digests),
              "Auxiliary current/historical source tree origin, copies or bytes changed during inventory")
+    _require(source_tree_reobservations == _source_tree_reobservation_inventory(auxiliary_source_tree_reobservations,
+                                                                               current_tree_observations, directory, repo_root, digests),
+             "Source tree reobservation parent, recorder or authority changed during inventory")
+    _require(not any(known.get(row["parent"]["sha256"]) in {"media", "transcript"} for row in source_tree_reobservations),
+             "Protected source/transcript identity cannot become source tree reobservation metadata")
     for reuse in runtime_reuses.values():
         _file(reuse["parent"])
     _require(auxiliary_runtime_observations == _auxiliary_runtime_inventory(auxiliary_runtime_requests, directory, repo_root, digests)
@@ -911,6 +955,12 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
                 directory, repo_root, digests), "Native repeated alias parent, edge or current authority changed during inventory")
     _require(not any(library["target"]["sha256"] in known for observation in runtime_observations for library in observation["libraries"]),
              "Known private source/transcript/review cannot become an auxiliary runtime alias")
+    _require(command_history == _historical_verification_command_inventory(historical_verification_command_observations,
+                                                                          directory, repo_root, digests),
+             "Historical command current/preserved/origin/log bytes changed during inventory")
+    _require(not any(known.get(ref["sha256"]) in {"media", "transcript"}
+                     for row in command_history for ref in (row["current"], row["snapshot"], row["parent"])),
+             "Private media/transcript cannot become historical command metadata")
     fixture_hashes = {ref["sha256"] for observation in fixture_observations for row in observation["rows"]
                       for ref in (row["preserved_original"], row["actual_current"])}
     protected_fixture_hashes = {digest for digest in fixture_hashes if known.get(digest) in {"review", "transcript"}}
@@ -926,8 +976,10 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         "auxiliary_runtime_requests": auxiliary_runtime_observations,
         "native_runtime_request_observations": native_runtime_observations,
         "native_runtime_alias_reobservations": native_reobservations,
+        "historical_verification_command_observations": command_history,
         "auxiliary_runtime_reobservations": list(runtime_reuses.values()),
         "auxiliary_source_trees": current_tree_observations,
+        "auxiliary_source_tree_reobservations": source_tree_reobservations,
         "auxiliary_historical_source_trees": historical_tree_observations,
         "synthetic_failure_fixtures": fixture_observations,
         "historical_unresolved": [row for row in historical_refs.values() if row["status"] != "RESOLVED"],
@@ -1028,7 +1080,9 @@ def build_private_inventory(project_dir: str | Path, expected_source_hashes: dic
                             auxiliary_runtime_requests: list[dict[str, Any]] | None = None,
                              native_runtime_request_observations: list[dict[str, Any]] | None = None,
                              native_runtime_alias_reobservations: list[dict[str, Any]] | None = None,
+                             historical_verification_command_observations: list[dict[str, Any]] | None = None,
                              auxiliary_source_trees: list[dict[str, Any]] | None = None,
+                             auxiliary_source_tree_reobservations: list[dict[str, Any]] | None = None,
                              auxiliary_historical_source_trees: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Collect the finite task denominator for a separate privacy auditor.
 
@@ -1046,7 +1100,9 @@ def build_private_inventory(project_dir: str | Path, expected_source_hashes: dic
                                           auxiliary_runtime_requests=auxiliary_runtime_requests,
                                           native_runtime_request_observations=native_runtime_request_observations,
                                           native_runtime_alias_reobservations=native_runtime_alias_reobservations,
+                                          historical_verification_command_observations=historical_verification_command_observations,
                                           auxiliary_source_trees=auxiliary_source_trees,
+                                          auxiliary_source_tree_reobservations=auxiliary_source_tree_reobservations,
                                           auxiliary_historical_source_trees=auxiliary_historical_source_trees)
     entries = {ref["path"]: {**ref, "entry_type": "file", "classification": ref["kind"]}
                for ref in known["known_refs"]}
@@ -1141,7 +1197,9 @@ def _audited_private_inventory(raw: dict[str, Any], directory: Path | None,
                                       auxiliary_runtime_requests=raw.get("auxiliary_runtime_requests"),
                                       native_runtime_request_observations=raw.get("native_runtime_request_observations"),
                                       native_runtime_alias_reobservations=raw.get("native_runtime_alias_reobservations"),
+                                      historical_verification_command_observations=raw.get("historical_verification_command_observations"),
                                       auxiliary_source_trees=raw.get("auxiliary_source_trees"),
+                                      auxiliary_source_tree_reobservations=raw.get("auxiliary_source_tree_reobservations"),
                                       auxiliary_historical_source_trees=raw.get("auxiliary_historical_source_trees"))
     _require(snapshot.get("schema_version") == "private-task-inventory/v1" and snapshot.get("project") == current["project"]
              and snapshot.get("scope") == current["scope"] and snapshot.get("dependencies") == current["dependencies"]
@@ -1268,7 +1326,9 @@ def verify_release_privacy(raw_ref: dict[str, Any], repo_root: str | Path, *, pr
                                                                       auxiliary_runtime_requests=raw.get("auxiliary_runtime_requests"),
                                       native_runtime_request_observations=raw.get("native_runtime_request_observations"),
                                       native_runtime_alias_reobservations=raw.get("native_runtime_alias_reobservations"),
+                                      historical_verification_command_observations=raw.get("historical_verification_command_observations"),
                                       auxiliary_source_trees=raw.get("auxiliary_source_trees"),
+                                      auxiliary_source_tree_reobservations=raw.get("auxiliary_source_tree_reobservations"),
                                       auxiliary_historical_source_trees=raw.get("auxiliary_historical_source_trees"))
     private_inventory["missing_from_submitted_corpus"] = sorted(set(known) - submitted)
     private.update(known)
@@ -2151,6 +2211,261 @@ def _native_runtime_request_inventory(request_refs: list[dict[str, Any]] | None,
     separate and must reject absent/stale execution evidence independently.
     """
     return _runtime_library_inventory(request_refs, directory, repo, registered, native_request=True)
+
+
+def _source_tree_reobservation_inventory(locators: list[dict[str, Any]] | None,
+                                           authorities: list[dict[str, Any]], directory: Path,
+                                           repo: Path | None, registered: set[str]) -> list[dict[str, Any]]:
+    """Bind an explicit private copy to an already observed current tree.
+
+    The original closed producer supplies the root. A copied list never supplies
+    a root or certifies a build, runtime, historical execution or public status.
+    """
+    _require(locators is None or isinstance(locators, list), "Source tree reobservations require explicit locators")
+    _require(len(locators or []) <= 512, "Source tree reobservation count exceeds its finite bound")
+    observations: list[dict[str, Any]] = []
+    occupied: set[tuple[str, tuple[str | int, ...]]] = set()
+
+    def read(ref: Any) -> tuple[Path, os.stat_result]:
+        _require(isinstance(ref, dict) and {"path", "sha256"} <= set(ref) <= {"path", "sha256", "bytes"}
+                 and isinstance(ref.get("path"), str) and isinstance(ref.get("sha256"), str)
+                 and re.fullmatch(r"[a-f0-9]{64}", ref["sha256"]) is not None,
+                 "Source tree reobservation artifact ref is malformed")
+        try:
+            identity = Path(ref["path"]).lstat()
+        except OSError as error:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Source tree reobservation artifact is unavailable") from error
+        path = _file(ref)
+        _require(str(path) == ref["path"] and path == path.resolve() and path.is_relative_to(directory)
+                 and not any(path.is_relative_to(directory / name) for name in ("sources", "renders", "reviews", "review", "transcripts"))
+                 and path.name not in {"project.json", "acceptance.local.json"} and ref["sha256"] not in registered,
+                 "Source tree reobservation is outside its canonical current auxiliary scope")
+        _require(identity.st_size <= MAX_UNIT_BYTES and _source_file_identity(path.stat()) == _source_file_identity(identity)
+                 and ("bytes" not in ref or type(ref["bytes"]) is int and ref["bytes"] == identity.st_size),
+                 "Source tree reobservation artifact identity, bytes or bound changed")
+        return path, identity
+
+    def resolve(value: Any, expression: Any) -> tuple[Any, tuple[str | int, ...]]:
+        _require(isinstance(expression, str) and expression.startswith("/") and len(expression) <= 2048,
+                 "Source tree reobservation requires bounded exact JSON pointers")
+        tokens = expression[1:].split("/")
+        _require(all(token and re.search(r"~(?![01])", token) is None for token in tokens), "Source tree reobservation pointer is malformed")
+        edge: list[str | int] = []
+        for encoded in tokens:
+            token = encoded.replace("~1", "/").replace("~0", "~")
+            if isinstance(value, dict):
+                _require(token in value, "Source tree reobservation pointer is absent")
+                value = value[token]
+                edge.append(token)
+            elif isinstance(value, list):
+                _require(re.fullmatch(r"0|[1-9][0-9]*", token) is not None and int(token) < len(value),
+                         "Source tree reobservation array pointer is invalid")
+                value = value[int(token)]
+                edge.append(int(token))
+            else:
+                raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Source tree reobservation pointer crosses a scalar")
+        return value, tuple(edge)
+
+    for locator in locators or []:
+        _require(isinstance(locator, dict) and set(locator) == {"parent", "pointer", "authority_build", "recorder_pointer"},
+                 "Source tree reobservation locator has unsupported fields")
+        parent, parent_identity = read(locator["parent"])
+        authority_path, authority_identity = read(locator["authority_build"])
+        matches = [row for row in authorities if row["build"].get("path") == str(authority_path)
+                   and row["build"].get("sha256") == locator["authority_build"]["sha256"]
+                   and "physical_snapshot_directory" not in row]
+        _require(len(matches) == 1, "Source tree reobservation lacks one exact already observed current authority")
+        authority = matches[0]
+        _require(authority["claim_status"] == "UNVERIFIED", "Source tree reobservation cannot inherit an execution approval")
+        _auxiliary_json(parent, repo, registered)
+        def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            parsed: dict[str, Any] = {}
+            for name, value in pairs:
+                _require(name not in parsed, "Source tree reobservation parent has duplicate JSON keys")
+                parsed[name] = value
+            return parsed
+        body = json.loads(parent.read_bytes(), object_pairs_hook=unique)
+        value, edge = resolve(body, locator["pointer"])
+        recorder, recorder_edge = resolve(body, locator["recorder_pointer"])
+        owner_edge = edge[:-1]
+        same_level = edge != recorder_edge and owner_edge == recorder_edge[:-1]
+        owner: Any = body
+        for token in owner_edge:
+            owner = owner[token]
+        nested = (bool(owner_edge) and isinstance(owner, dict)
+                  and len(recorder_edge) > len(owner_edge) + 1
+                  and recorder_edge[:len(owner_edge)] == owner_edge
+                  and recorder_edge[:len(edge)] != edge)
+        _require(same_level or nested,
+                 "Source tree recorder pointer is outside its exact selected observation context")
+        _require(json.dumps(value, sort_keys=True, separators=(",", ":"))
+                 == json.dumps(authority["manifest_value"], sort_keys=True, separators=(",", ":")),
+                 "Source tree reobservation differs from the full typed current manifest")
+        build = _json(locator["authority_build"])
+        _require(isinstance(recorder, dict) and isinstance(build.get("runner"), dict)
+                 and all(recorder.get(key) == build["runner"].get(key) for key in ("path", "sha256")),
+                 "Source tree reobservation recorder is not the exact original producer path and hash")
+        recorder_path, recorder_identity = read(recorder)
+        manifest_path, manifest_identity = read(authority["selected_manifest"])
+        _require(len({parent, authority_path, recorder_path, manifest_path}) == 4,
+                 "Source tree reobservation roles must use distinct actual files")
+        key = (str(parent), edge)
+        _require(key not in occupied, "Duplicate/conflicting source tree reobservation edge")
+        occupied.add(key)
+        identities = [("parent", parent, parent_identity, locator["parent"]),
+                      ("authority", authority_path, authority_identity, locator["authority_build"]),
+                      ("recorder", recorder_path, recorder_identity, recorder),
+                      ("manifest", manifest_path, manifest_identity, authority["selected_manifest"])]
+        for _, path, identity, ref in identities:
+            _require(_source_file_identity(path.stat()) == _source_file_identity(identity)
+                     and artifact_ref(path)["sha256"] == ref["sha256"], "Source tree reobservation bytes changed during observation")
+        observations.append({"parent": artifact_ref(parent), "pointer": locator["pointer"], "edge": list(edge),
+                             "authority_build": authority["build"], "recorder_pointer": locator["recorder_pointer"],
+                             "recorder_edge": list(recorder_edge), "recorder": artifact_ref(recorder_path),
+                             "manifest": authority["selected_manifest"], "row_count": authority["row_count"],
+                             "total_bytes": authority["total_bytes"],
+                             "file_identities": {role: {"path": str(path), "identity": list(_source_file_identity(identity))}
+                                                 for role, path, identity, _ in identities},
+                             "claim_status": "UNVERIFIED", "execution_status": "UNVERIFIED", "classification_status": "UNVERIFIED",
+                             "scope": "Exact current private source copy and original recorder only; no root assertion, build/runtime/history, public or AV approval"})
+    return observations
+
+
+def _historical_verification_command_inventory(locators: list[dict[str, Any]] | None,
+                                               directory: Path, repo: Path | None,
+                                               registered: set[str]) -> list[dict[str, Any]]:
+    """Observe preserved command bytes plus the exact returned self-reference.
+
+    A closed structural relation recognizes one serialization update. It never
+    certifies that the command ran, its times are true, or its PASS claim holds.
+    Existing formal/execution and auxiliary-history validators are unchanged.
+    """
+    import math
+    from datetime import datetime
+
+    _require(locators is None or isinstance(locators, list), "Historical command observation requires explicit locators")
+    _require(len(locators or []) <= 512, "Historical command observation exceeds its finite bound")
+    results: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    required = {"schema_version", "name", "argv", "cwd", "started_at", "finished_at", "wall_seconds", "timeout_seconds",
+                "exit_code", "timed_out", "interrupted", "error", "status", "stdout", "stderr"}
+
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            _require(key not in result, "Historical command JSON has duplicate keys")
+            result[key] = value
+        return result
+
+    def actual(ref: Any) -> tuple[Path, os.stat_result]:
+        _require(isinstance(ref, dict) and set(ref) == {"path", "sha256"}
+                 and isinstance(ref.get("path"), str) and isinstance(ref.get("sha256"), str)
+                 and re.fullmatch(r"[a-f0-9]{64}", ref["sha256"]) is not None,
+                 "Historical command artifact locator is malformed")
+        try:
+            identity = Path(ref["path"]).lstat()
+        except OSError as exc:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Historical command artifact is unavailable") from exc
+        path = _file(ref)
+        _require(_source_file_identity(path.stat()) == _source_file_identity(identity),
+                 "Historical command artifact changed during its initial hash read")
+        _require(path == path.resolve() and path == Path(os.path.abspath(path)) and path.is_relative_to(directory)
+                 and not any(path.is_relative_to(directory / name) for name in ("sources", "renders", "reviews", "review", "transcripts"))
+                 and path.name not in {"project.json", "acceptance.local.json"} and ref["sha256"] not in registered,
+                 "Historical command bytes are outside their canonical private metadata scope")
+        _require(path.stat().st_size <= MAX_UNIT_BYTES, "Historical command metadata exceeds its byte bound")
+        return path, identity
+
+    for locator in locators or []:
+        _require(isinstance(locator, dict) and set(locator) == {"original", "snapshot", "current", "parent", "pointer"},
+                 "Historical command locator has unsupported fields")
+        original = locator["original"]
+        _require(isinstance(original, dict) and set(original) == {"path", "sha256"}
+                 and isinstance(original.get("path"), str) and isinstance(original.get("sha256"), str)
+                 and re.fullmatch(r"[a-f0-9]{64}", original["sha256"]) is not None,
+                 "Historical command original declaration is malformed")
+        paths = {key: actual(locator[key]) for key in ("current", "snapshot", "parent")}
+        current, snapshot, parent = (paths[key][0] for key in ("current", "snapshot", "parent"))
+        _require(original["path"] == str(current) and original["sha256"] == locator["snapshot"]["sha256"]
+                 and original["sha256"] != locator["current"]["sha256"] and len({current, snapshot, parent}) == 3,
+                 "Historical command original/current/preserved identity is not separate and exact")
+        key = (original["path"], original["sha256"])
+        _require(key not in seen, "Duplicate or conflicting historical command observation")
+        seen.add(key)
+        parent_value = _auxiliary_json(parent, repo, registered)
+        expression = locator["pointer"]
+        _require(isinstance(expression, str) and expression.startswith("/") and len(expression) <= 4096,
+                 "Historical command origin requires an exact bounded JSON pointer")
+        tokens = expression[1:].split("/")
+        _require(all(token and re.search(r"~(?![01])", token) is None for token in tokens), "Historical command pointer is malformed")
+        value: Any = parent_value
+        edge: list[str | int] = []
+        for encoded in tokens:
+            token = encoded.replace("~1", "/").replace("~0", "~")
+            if isinstance(value, dict):
+                _require(token in value, "Historical command origin pointer is missing")
+                edge.append(token)
+                value = value[token]
+            elif isinstance(value, list):
+                _require(re.fullmatch(r"0|[1-9][0-9]*", token) is not None and int(token) < len(value),
+                         "Historical command origin array pointer is invalid")
+                edge.append(int(token))
+                value = value[int(token)]
+            else:
+                raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Historical command pointer crosses a scalar")
+        _require(value == original, "Historical command private origin does not declare the exact original ref")
+        try:
+            old_value = json.loads(snapshot.read_bytes(), object_pairs_hook=unique)
+            current_value = json.loads(current.read_bytes(), object_pairs_hook=unique)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Historical command versions are not valid JSON") from exc
+        _require(isinstance(old_value, dict) and set(old_value) == required
+                 and old_value.get("schema_version") == "verification-command/v1"
+                 and json.dumps(current_value, sort_keys=True, separators=(",", ":"))
+                 == json.dumps({**old_value, "receipt": original}, sort_keys=True, separators=(",", ":")),
+                 "Unsupported historical command schema or changes beyond its exact original self-reference")
+        name, argv = old_value["name"], old_value["argv"]
+        _require(isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_-]+", name) is not None
+                 and current.name == f"{name}.command.json" and isinstance(argv, list) and bool(argv)
+                 and all(isinstance(arg, str) and "\x00" not in arg for arg in argv)
+                 and repo is not None and old_value["cwd"] == str(repo.resolve()),
+                 "Historical command name, argv, receipt path or canonical repository cwd is invalid")
+        _require(type(old_value["timed_out"]) is bool and type(old_value["interrupted"]) is bool
+                 and (old_value["exit_code"] is None or type(old_value["exit_code"]) is int)
+                 and (old_value["error"] is None or isinstance(old_value["error"], str)),
+                 "Historical command process record_key types are invalid")
+        for record_key in ("wall_seconds", "timeout_seconds"):
+            v = old_value[record_key]
+            _require(type(v) in (int, float) and math.isfinite(v) and v >= 0
+                     and (record_key != "timeout_seconds" or v > 0), "Historical command numeric time fields are invalid")
+        try:
+            started = datetime.fromisoformat(old_value["started_at"])
+            finished = datetime.fromisoformat(old_value["finished_at"])
+            _require(started.utcoffset() is not None and finished.utcoffset() is not None and started <= finished,
+                     "Historical command timestamps lack timezone or are reversed")
+        except (TypeError, ValueError) as exc:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Historical command timestamps are invalid") from exc
+        reported_status = "PASS" if old_value["exit_code"] == 0 and not (old_value["error"] or old_value["timed_out"] or old_value["interrupted"]) else "FAIL"
+        _require(old_value["status"] == reported_status, "Historical command declared status contradicts its own fields")
+        log_refs = []
+        for record_key in ("stdout", "stderr"):
+            log_ref = old_value[record_key]
+            log_path, identity = actual(log_ref)
+            _require(log_path == current.parent / f"{name}.{record_key}", "Historical command log is not the exact recorder path")
+            paths[record_key] = (log_path, identity)
+            log_refs.append(log_ref)
+        for record_key, (path, identity) in paths.items():
+            ref = old_value[record_key] if record_key in ("stdout", "stderr") else locator[record_key]
+            _require(_source_file_identity(path.stat()) == _source_file_identity(identity) and artifact_ref(path) == ref,
+                     "Historical command metadata/log bytes changed during observation")
+        results.append({**locator, "edge": edge, "log_refs": log_refs,
+                        "file_identities": {k: {"path": str(path), "identity": list(_source_file_identity(identity))}
+                                            for k, (path, identity) in paths.items()},
+                        "byte_update_relation": "Exact original command record plus original receipt reference only",
+                        "claimed_original_status": old_value["status"], "claimed_original_exit_code": old_value["exit_code"],
+                        "claim_status": "UNVERIFIED", "execution_status": "UNVERIFIED", "validation_status": "UNVERIFIED",
+                        "scope": "Preserved/current formal command bytes and private origin only; no execution, validation, semantic or publication approval"})
+    return results
 
 
 def _native_runtime_alias_inventory(locators: list[dict[str, Any]] | None,
