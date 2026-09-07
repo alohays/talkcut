@@ -16,6 +16,8 @@ import json
 import os
 import re
 import shutil
+import stat
+import struct
 import subprocess
 import tarfile
 import tempfile
@@ -386,7 +388,12 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
                              publication_bodies: dict[str, dict[str, Any]] | None = None,
                              synthetic_negative_runs: list[dict[str, Any]] | None = None,
                              synthetic_replay: dict[str, Any] | None = None,
-                             auxiliary_metadata_history: list[dict[str, Any]] | None = None) -> tuple[dict[str, str], list[str], dict[str, Any]]:
+                             auxiliary_metadata_history: list[dict[str, Any]] | None = None,
+                             auxiliary_runtime_requests: list[dict[str, Any]] | None = None,
+                             native_runtime_request_observations: list[dict[str, Any]] | None = None,
+                             native_runtime_alias_reobservations: list[dict[str, Any]] | None = None,
+                             auxiliary_source_trees: list[dict[str, Any]] | None = None,
+                             auxiliary_historical_source_trees: list[dict[str, Any]] | None = None) -> tuple[dict[str, str], list[str], dict[str, Any]]:
     """Derive mandatory exclusions from the evaluator's registered task.
 
     Project source identities come from the evaluator, never the corpus author.
@@ -405,6 +412,41 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
              and all(role in expected_source_hashes for role in ("screen", "speaker")),
              "Privacy inventory differs from evaluator-registered sources")
     fixture_claims, fixture_observations = _synthetic_failure_inventory(synthetic_negative_runs, repo_root, set(registered.values()), replay_ref=synthetic_replay)
+    auxiliary_runtime_observations = _auxiliary_runtime_inventory(auxiliary_runtime_requests, directory, repo_root, set(registered.values()))
+    native_runtime_observations = _native_runtime_request_inventory(native_runtime_request_observations, directory, repo_root, set(registered.values()))
+    native_reobservations = _native_runtime_alias_inventory(native_runtime_alias_reobservations,
+                                                            native_runtime_observations, directory, repo_root, set(registered.values()))
+    native_reobservation_edges = {(row["parent"]["path"], tuple(row["edge"])): row for row in native_reobservations}
+    native_reobservation_consumed: set[tuple[str, tuple[str | int, ...]]] = set()
+    runtime_observations = [*auxiliary_runtime_observations, *native_runtime_observations]
+    _require(len({row["request"]["path"] for row in runtime_observations}) == len(runtime_observations),
+             "Runtime request cannot have conflicting auxiliary/native observation roles")
+    current_tree_observations = _auxiliary_source_tree_inventory(auxiliary_source_trees, directory, repo_root, set(registered.values()))
+    historical_tree_observations = _auxiliary_historical_source_tree_inventory(auxiliary_historical_source_trees, directory, repo_root, set(registered.values()))
+    source_tree_observations = [*current_tree_observations, *historical_tree_observations]
+    source_tree_bindings: dict[tuple[str, tuple[str | int, ...]], dict[str, Any]] = {}
+    for observation in source_tree_observations:
+        for binding in observation["bindings"]:
+            binding_key = (binding["parent"]["path"], tuple(binding["edge"]))
+            _require(binding_key not in source_tree_bindings, "Conflicting current/historical source tree origin binding")
+            source_tree_bindings[binding_key] = observation
+    runtime_edges = {(observation["request"]["path"], library["declared_reference"]["path"], library["declared_reference"]["sha256"]): library
+                     for observation in runtime_observations for library in observation["libraries"]}
+    # A diagnostic may repeat an already observed alias identity. This map is
+    # byte authority only, not a statement that any repeated execution ran.
+    runtime_aliases: dict[tuple[str, str], dict[str, Any]] = {}
+    runtime_reuses: dict[tuple[str, tuple[str | int, ...]], dict[str, Any]] = {}
+    for observation in auxiliary_runtime_observations:
+        for library in observation["libraries"]:
+            for hop in library["hops"]:
+                alias_key = (hop["path"], library["target"]["sha256"])
+                row = {"request": observation["request"], "library": library}
+                if alias_key in runtime_aliases:
+                    previous = runtime_aliases[alias_key]["library"]
+                    _require(previous["target"] == library["target"] and previous["target_lstat"] == library["target_lstat"],
+                             "Auxiliary runtime alias identities conflict")
+                else:
+                    runtime_aliases[alias_key] = row
     known: dict[str, str] = {}
     refs: dict[str, dict[str, Any]] = {}
     pending: list[tuple[Path, str]] = []
@@ -619,7 +661,18 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         if kind == "transcript" or parse_json or path.suffix.lower() == ".json":
             inspect_text(path, kind == "transcript", parse_json)
 
-    def walk(value: Any, transcript: bool = False, key: str = "") -> None:
+    def walk(value: Any, transcript: bool = False, key: str = "", *,
+             origin_path: Path | None = None, edge: tuple[str | int, ...] = ()) -> None:
+        tree = source_tree_bindings.get((str(origin_path), edge))
+        if tree is not None:
+            _require(not transcript and not contains_transcript(value)
+                     and refs[str(origin_path)]["kind"] == "review" and value == tree["manifest_value"],
+                     "Private/formal source tree context or bound tree value changed")
+            # Only this exact manifest/copy subtree has a producer-bound root.
+            # Its original body stays private; truthful absolute file refs were
+            # already collected in full. No other relative reference changes.
+            protect_values(value)
+            return
         if key in {"toolchain", "producer", "code_identity", "tools_before", "tools_after"} and not transcript and not contains_transcript(value):
             return
         if isinstance(value, dict):
@@ -638,7 +691,50 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
                     canonical_path.resolve() == (repo_root / origin["git_path"]).resolve()
                     for origin in source_candidates.get(value["sha256"], []))
                 fixture = fixture_claims.get((str(canonical_path), value["sha256"]))
-                if fixture is not None:
+                runtime = runtime_edges.get((str(origin_path), str(canonical_path), value["sha256"]))
+                native_edge = native_reobservation_edges.get((str(origin_path), edge))
+                if native_edge is not None:
+                    _require(not transcript and kind != "media" and value["sha256"] not in known
+                             and value == native_edge["declared_reference"]
+                             and refs[str(origin_path)]["kind"] == "review"
+                             and refs[str(origin_path)]["sha256"] == native_edge["parent"]["sha256"],
+                             "Native repeated alias edge changed or conflicts with private source/transcript identity")
+                    library = native_edge["library_identity"]
+                    collect_candidate(Path(library["target"]["path"]), library["target"], library["target"])
+                    native_reobservation_consumed.add((str(origin_path), edge))
+                elif runtime is not None and len(edge) == 2 and edge[0] == "runtime_libraries" and type(edge[1]) is int:
+                    _require(not transcript and kind != "media" and value["sha256"] not in known,
+                             "Known private source/transcript/review cannot become an auxiliary runtime alias")
+                    collect_candidate(Path(runtime["target"]["path"]), runtime["target"], runtime["target"])
+                elif (str(canonical_path), value["sha256"]) in runtime_aliases:
+                    # Re-use only exact aliases from an explicit actual runtime
+                    # request; never infer authority from an extension or a new
+                    # parent claim. The entire auxiliary parent stays private.
+                    _require(not transcript and kind != "media" and value["sha256"] not in known,
+                             "Known private source/transcript/review cannot become an auxiliary runtime alias")
+                    _require(origin_path is not None and origin_path == origin_path.resolve()
+                             and origin_path.is_relative_to(directory)
+                             and not any(origin_path.is_relative_to(directory / name) for name in ("sources", "renders", "reviews", "review", "transcripts"))
+                             and origin_path.name not in {"project.json", "acceptance.local.json"},
+                             "Auxiliary runtime repeated reference has no canonical private auxiliary parent")
+                    assert origin_path is not None
+                    parent_ref = artifact_ref(origin_path)
+                    _require(str(origin_path) in refs and refs[str(origin_path)]["kind"] == "review"
+                             and parent_ref["sha256"] == refs[str(origin_path)]["sha256"],
+                             "Auxiliary runtime repeated parent is not a current private review artifact")
+                    _auxiliary_json(origin_path, repo_root, digests)
+                    authority = runtime_aliases[(str(canonical_path), value["sha256"])]
+                    library = authority["library"]
+                    _require("bytes" not in value or value["bytes"] == library["target_lstat"]["size"],
+                             "Auxiliary runtime repeated target byte count differs")
+                    inspect_text(origin_path, True, parse_json=True)
+                    collect_candidate(Path(library["target"]["path"]), library["target"], library["target"])
+                    runtime_reuses[(str(origin_path), edge)] = {
+                        "parent": parent_ref, "edge": list(edge), "declared_reference": value,
+                        "authority_request": authority["request"], "library_identity": library,
+                        "claim_status": "UNVERIFIED",
+                        "scope": "Repeated auxiliary alias bytes only; no execution, AI, formal proof or publication approval"}
+                elif fixture is not None:
                     _require(not transcript and value["sha256"] not in digests,
                              "Private source/transcript cannot use synthetic failure provenance")
                     for actual_ref in (fixture["preserved_original"], fixture["actual_current"]):
@@ -675,10 +771,10 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
                 elif not public_code:
                     unfollowed.append({"path": value["path"], "sha256": value["sha256"], "reason": "External/relative reference is not classified by the known private graph"})
             for child_key, child in value.items():
-                walk(child, transcript, child_key)
+                walk(child, transcript, child_key, origin_path=origin_path, edge=(*edge, child_key))
         elif isinstance(value, list):
-            for child in value:
-                walk(child, transcript)
+            for index, child in enumerate(value):
+                walk(child, transcript, origin_path=origin_path, edge=(*edge, index))
 
     def collect_candidate(candidate_path: Path, original_ref: dict[str, Any], ref: dict[str, Any]) -> None:
         actual_path = _file(ref)
@@ -728,6 +824,28 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         collect_candidate(Path(original["path"]), original, preserved)
         ref = source["current_ref"]
         collect_candidate(Path(ref["path"]), ref, ref)
+    for observation in runtime_observations:
+        parent_ref = observation["request"]
+        add(Path(parent_ref["path"]), "review", parent_ref["sha256"], parse_json=True)
+        inspect_text(Path(parent_ref["path"]), True, parse_json=True)
+        for library in observation["libraries"]:
+            ref = library["target"]
+            collect_candidate(Path(ref["path"]), ref, ref)
+    for observation in native_reobservations:
+        parent_ref = observation["parent"]
+        add(Path(parent_ref["path"]), "review", parent_ref["sha256"], parse_json=True)
+        inspect_text(Path(parent_ref["path"]), True, parse_json=True)
+    for observation in source_tree_observations:
+        for ref in observation["parents"]:
+            path = Path(ref["path"])
+            if path.suffix.lower() in {".py", ".pyi"}:
+                collect_candidate(path, ref, ref)
+            else:
+                add(path, "review", ref["sha256"], parse_json=True)
+                inspect_text(path, True, parse_json=True)
+        for row in [*observation["files"], *observation.get("current_files", [])]:
+            ref = row["actual"]
+            collect_candidate(Path(ref["path"]), ref, ref)
     # Explicit verified locators are a complete denominator even when the
     # incoming metadata edge is under a normally skipped tool/producer key.
     for (name, expected), snapshot in auxiliary_locators.items():
@@ -777,7 +895,22 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         # Namespace/filename privacy protects this file's body, independently
         # from the provenance of files it references. Only an explicit,
         # source-bound transcript marker propagates across artifact edges.
-        walk(value)
+        walk(value, origin_path=path)
+    _require(current_tree_observations == _auxiliary_source_tree_inventory(auxiliary_source_trees, directory, repo_root, digests)
+             and historical_tree_observations == _auxiliary_historical_source_tree_inventory(auxiliary_historical_source_trees, directory, repo_root, digests),
+             "Auxiliary current/historical source tree origin, copies or bytes changed during inventory")
+    for reuse in runtime_reuses.values():
+        _file(reuse["parent"])
+    _require(auxiliary_runtime_observations == _auxiliary_runtime_inventory(auxiliary_runtime_requests, directory, repo_root, digests)
+             and native_runtime_observations == _native_runtime_request_inventory(native_runtime_request_observations, directory, repo_root, digests),
+             "Current runtime request, link or target changed during inventory")
+    _require(native_reobservation_consumed == set(native_reobservation_edges),
+             "Native repeated alias locator did not name a consumed exact metadata edge")
+    _require(native_reobservations == _native_runtime_alias_inventory(native_runtime_alias_reobservations,
+                _native_runtime_request_inventory(native_runtime_request_observations, directory, repo_root, digests),
+                directory, repo_root, digests), "Native repeated alias parent, edge or current authority changed during inventory")
+    _require(not any(library["target"]["sha256"] in known for observation in runtime_observations for library in observation["libraries"]),
+             "Known private source/transcript/review cannot become an auxiliary runtime alias")
     fixture_hashes = {ref["sha256"] for observation in fixture_observations for row in observation["rows"]
                       for ref in (row["preserved_original"], row["actual_current"])}
     protected_fixture_hashes = {digest for digest in fixture_hashes if known.get(digest) in {"review", "transcript"}}
@@ -790,6 +923,12 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         "historical_refs": list(historical_refs.values()),
         "auxiliary_metadata_history": list(auxiliary_observations.values()),
         "auxiliary_execution_sources": auxiliary_source_current,
+        "auxiliary_runtime_requests": auxiliary_runtime_observations,
+        "native_runtime_request_observations": native_runtime_observations,
+        "native_runtime_alias_reobservations": native_reobservations,
+        "auxiliary_runtime_reobservations": list(runtime_reuses.values()),
+        "auxiliary_source_trees": current_tree_observations,
+        "auxiliary_historical_source_trees": historical_tree_observations,
         "synthetic_failure_fixtures": fixture_observations,
         "historical_unresolved": [row for row in historical_refs.values() if row["status"] != "RESOLVED"],
         "unresolved_source_candidates": list(unresolved_sources.values()),
@@ -885,7 +1024,12 @@ def build_private_inventory(project_dir: str | Path, expected_source_hashes: dic
                             publication_bodies: dict[str, dict[str, Any]] | None = None,
                             synthetic_negative_runs: list[dict[str, Any]] | None = None,
                              synthetic_replay: dict[str, Any] | None = None,
-                            auxiliary_metadata_history: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                            auxiliary_metadata_history: list[dict[str, Any]] | None = None,
+                            auxiliary_runtime_requests: list[dict[str, Any]] | None = None,
+                             native_runtime_request_observations: list[dict[str, Any]] | None = None,
+                             native_runtime_alias_reobservations: list[dict[str, Any]] | None = None,
+                             auxiliary_source_trees: list[dict[str, Any]] | None = None,
+                             auxiliary_historical_source_trees: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Collect the finite task denominator for a separate privacy auditor.
 
     Save result, audit and optional archive_dir outside the task project. The
@@ -898,9 +1042,22 @@ def build_private_inventory(project_dir: str | Path, expected_source_hashes: dic
     _, _, known = _known_private_inventory(directory, expected_source_hashes, root,
                                           historical_artifacts=historical_artifacts, source_snapshots=source_snapshots,
                                           publication_bodies=publication_bodies, synthetic_negative_runs=synthetic_negative_runs, synthetic_replay=synthetic_replay,
-                                          auxiliary_metadata_history=auxiliary_metadata_history)
+                                          auxiliary_metadata_history=auxiliary_metadata_history,
+                                          auxiliary_runtime_requests=auxiliary_runtime_requests,
+                                          native_runtime_request_observations=native_runtime_request_observations,
+                                          native_runtime_alias_reobservations=native_runtime_alias_reobservations,
+                                          auxiliary_source_trees=auxiliary_source_trees,
+                                          auxiliary_historical_source_trees=auxiliary_historical_source_trees)
     entries = {ref["path"]: {**ref, "entry_type": "file", "classification": ref["kind"]}
                for ref in known["known_refs"]}
+    for observation in [*known["auxiliary_runtime_requests"], *known["native_runtime_request_observations"]]:
+        for library in observation["libraries"]:
+            for hop in library["hops"]:
+                row = {"path": hop["path"], "entry_type": "symlink", "target": hop["target"],
+                       "sha256": hop["link_bytes_sha256"], "lstat": hop["lstat"], "classification": "UNCLASSIFIED"}
+                _require(row["path"] not in entries or entries[row["path"]] == row,
+                         "Auxiliary runtime link conflicts with an existing inventory role")
+                entries[row["path"]] = row
     names: set[str] = set()
     unresolved: list[dict[str, Any]] = [*known["historical_unresolved"], *known["unresolved_source_candidates"]]
 
@@ -922,9 +1079,12 @@ def build_private_inventory(project_dir: str | Path, expected_source_hashes: dic
         else:
             unresolved.append({"path": name, "reason": "Missing or unsupported task provenance artifact"})
 
+    def unreadable_task(error: OSError) -> None:
+        raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Task inventory traversal is unreadable") from error
+
     # os.walk does not follow directory symlinks. Their actual link bytes are
     # still inventoried, and publication scanning rejects links independently.
-    for parent, folders, files in os.walk(directory, followlinks=False):
+    for parent, folders, files in os.walk(directory, followlinks=False, onerror=unreadable_task):
         for name in sorted(files + [item for item in folders if (Path(parent) / item).is_symlink()]):
             path = Path(parent) / name
             names.add(str(path))
@@ -932,7 +1092,7 @@ def build_private_inventory(project_dir: str | Path, expected_source_hashes: dic
     for ref in known["unfollowed_refs"]:
         path = Path(ref["path"])
         collect(path if path.is_absolute() else root / path, ref["sha256"])
-    current_names = {str(Path(parent) / name) for parent, folders, files in os.walk(directory, followlinks=False)
+    current_names = {str(Path(parent) / name) for parent, folders, files in os.walk(directory, followlinks=False, onerror=unreadable_task)
                      for name in files + [item for item in folders if (Path(parent) / item).is_symlink()]}
     _require(names == current_names, "Task inventory changed while being collected")
     preserved: dict[str, dict[str, str]] = {}
@@ -977,7 +1137,12 @@ def _audited_private_inventory(raw: dict[str, Any], directory: Path | None,
                                       historical_artifacts=raw.get("historical_artifacts"), source_snapshots=raw.get("source_snapshots"),
                                       publication_bodies={role: raw[role] for role in ("pr_body", "release_body") if role in raw},
                                       synthetic_negative_runs=raw.get("synthetic_negative_runs"), synthetic_replay=raw.get("synthetic_replay"),
-                                      auxiliary_metadata_history=raw.get("auxiliary_metadata_history"))
+                                      auxiliary_metadata_history=raw.get("auxiliary_metadata_history"),
+                                      auxiliary_runtime_requests=raw.get("auxiliary_runtime_requests"),
+                                      native_runtime_request_observations=raw.get("native_runtime_request_observations"),
+                                      native_runtime_alias_reobservations=raw.get("native_runtime_alias_reobservations"),
+                                      auxiliary_source_trees=raw.get("auxiliary_source_trees"),
+                                      auxiliary_historical_source_trees=raw.get("auxiliary_historical_source_trees"))
     _require(snapshot.get("schema_version") == "private-task-inventory/v1" and snapshot.get("project") == current["project"]
              and snapshot.get("scope") == current["scope"] and snapshot.get("dependencies") == current["dependencies"]
              and not snapshot.get("unresolved") and not current["unresolved"],
@@ -1051,6 +1216,9 @@ def _audited_private_inventory(raw: dict[str, Any], directory: Path | None,
                                     "before_sha256": entry["sha256"], "after_sha256": latest["sha256"]})
         else:
             _require(current_entries[row["path"]] == entry, "Audited task symlink changed and needs another audit")
+            # The link's literal bytes are distinct private content from the
+            # regular target, and must enter the same exclusion corpus.
+            private[entry["sha256"]] = kind
     for path in sorted(set(current_entries) - set(old_entries)):
         latest = current_entries[path]
         operational = _bookkeeping(Path(path), directory.resolve(), referenced_input=path in referenced_inputs)
@@ -1096,7 +1264,12 @@ def verify_release_privacy(raw_ref: dict[str, Any], repo_root: str | Path, *, pr
                                                                       source_snapshots=raw.get("source_snapshots"),
                                                                       publication_bodies={role: raw[role] for role in ("pr_body", "release_body")},
                                                                       synthetic_negative_runs=raw.get("synthetic_negative_runs"), synthetic_replay=raw.get("synthetic_replay"),
-                                                                      auxiliary_metadata_history=raw.get("auxiliary_metadata_history"))
+                                                                      auxiliary_metadata_history=raw.get("auxiliary_metadata_history"),
+                                                                      auxiliary_runtime_requests=raw.get("auxiliary_runtime_requests"),
+                                      native_runtime_request_observations=raw.get("native_runtime_request_observations"),
+                                      native_runtime_alias_reobservations=raw.get("native_runtime_alias_reobservations"),
+                                      auxiliary_source_trees=raw.get("auxiliary_source_trees"),
+                                      auxiliary_historical_source_trees=raw.get("auxiliary_historical_source_trees"))
     private_inventory["missing_from_submitted_corpus"] = sorted(set(known) - submitted)
     private.update(known)
     phrases = sorted(set(phrases) | set(derived_phrases))
@@ -1523,14 +1696,646 @@ def _synthetic_failure_inventory(run_refs: list[dict[str, Any]] | None, repo: Pa
     return claims, observations
 
 
-def _auxiliary_json(path: Path, repo: Path | None, registered: set[str]) -> dict[str, Any]:
-    """Read auxiliary bytes without accepting a formal artifact's truth claims."""
-    _require(path.is_absolute() and path.is_file() and not path.is_symlink()
-             and path.stat().st_size <= MAX_UNIT_BYTES, "Auxiliary metadata exceeds the bounded JSON inspection limit")
-    try:
-        value = json.loads(path.read_bytes())
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Auxiliary historical bytes must be bounded JSON metadata") from exc
+_SOURCE_TREE_PRODUCER_TEMPLATE = r"""from pathlib import Path
+import subprocess, hashlib, json, time, datetime, os, sys
+base = Path(__file__).resolve().parent
+source = base / 'source'
+build = base / 'build'
+run = base / '__RUN_DIRECTORY__'
+run.mkdir()
+
+def ref(p):
+    data = p.read_bytes()
+    return {'path': str(p), 'sha256': hashlib.sha256(data).hexdigest(), 'bytes': len(data)}
+
+def tree():
+    rows = [{'path': str(p.relative_to(source)), 'sha256': hashlib.sha256(p.read_bytes()).hexdigest(), 'bytes': p.stat().st_size} for p in sorted(source.rglob('*')) if p.is_file()]
+    return {'files': rows, 'sha256': hashlib.sha256(json.dumps(rows, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+before = tree()
+(run / 'source-before.local.json').write_text(json.dumps(before, indent=2) + '\n')
+results = []
+commands = []
+for name, argv in commands:
+    out = run / (name + '.stdout.log')
+    err = run / (name + '.stderr.log')
+    started = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    ts = time.monotonic()
+    print(json.dumps({'status': 'STARTED', 'name': name, 'argv': argv}), flush=True)
+    with out.open('wb') as o, err.open('wb') as e:
+        p = subprocess.run(argv, stdout=o, stderr=e, cwd=source, env={**os.environ, 'DEVELOPER_DIR': '__DEVELOPER_DIR__', 'SDKROOT': '__SDKROOT__'})
+    row = {'name': name, 'argv': argv, 'cwd': str(source), 'environment_overrides': {'DEVELOPER_DIR': '__DEVELOPER_DIR__', 'SDKROOT': '__SDKROOT__'}, 'started_at': started, 'finished_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'elapsed_seconds': time.monotonic() - ts, 'exit_code': p.returncode, 'stdout': ref(out), 'stderr': ref(err)}
+    results.append(row)
+    (run / 'commands.local.json').write_text(json.dumps(results, indent=2) + '\n')
+    print(json.dumps({'status': 'COMPLETED' if not p.returncode else 'FAILED', 'name': name, 'elapsed_seconds': row['elapsed_seconds'], 'exit_code': p.returncode}), flush=True)
+    if p.returncode:
+        break
+after = tree()
+(run / 'source-after.local.json').write_text(json.dumps(after, indent=2) + '\n')
+binary = build / 'bin/llama-mtmd-cli'
+report = {'schema_version': 'private-runtime-build/v1', 'source_acquisition': ref(base / '__ACQUISITION_NAME__'), 'patch': ref(base / '__PATCH_NAME__'), 'patch_manifest': ref(base / '__PATCH_MANIFEST_NAME__'), 'runner': ref(Path(__file__).resolve()), 'source_before': ref(run / 'source-before.local.json'), 'source_after': ref(run / 'source-after.local.json'), 'source_unchanged_during_build': before == after, 'commands': results, 'binary': ref(binary) if binary.exists() else None, 'runtime_libraries': [{'requested_path': str(p), 'is_symlink': p.is_symlink(), 'link_target': os.readlink(p) if p.is_symlink() else None, 'canonical_file': ref(p.resolve())} for p in sorted((build / 'bin').glob('*.dylib')) if p.is_file()], 'status': 'BUILT_NOT_CAPABILITY_VALIDATED' if len(results) == len(commands) and all((r['exit_code'] == 0 for r in results)) and (before == after) else 'FAILED'}
+(run / 'result.local.json').write_text(json.dumps(report, indent=2) + '\n')
+print(json.dumps({'status': report['status'], 'result': ref(run / 'result.local.json')}), flush=True)
+"""
+
+
+def _validate_source_tree_command_roots(commands: Any, source: Path) -> None:
+    _require(isinstance(commands, list) and commands
+             and all(isinstance(command, dict) and command.get("cwd") == str(source) for command in commands),
+             "Auxiliary tree command working directories do not identify the producer source root")
+    assert isinstance(commands, list)
+    configured_roots: list[str] = []
+    for command in commands:
+        argv = command.get("argv")
+        _require(isinstance(argv, list) and argv and all(isinstance(arg, str) and arg for arg in argv),
+                 "Auxiliary tree build has malformed configured source commands")
+        assert isinstance(argv, list)
+        source_flags = [index for index, arg in enumerate(argv) if arg.startswith("-S")]
+        if source_flags:
+            _require(Path(argv[0]).name == "cmake" and len(source_flags) == 1
+                     and argv[source_flags[0]] == "-S"
+                     and argv[source_flags[0] + 1:source_flags[0] + 2] == [str(source)],
+                     "Auxiliary tree build has conflicting or unsupported configured source roots")
+            # Only the actual producer's explicit configure argument grammar is
+            # supported. Positional directories/presets/scripts cannot silently
+            # redirect an otherwise matching -S root.
+            position = 1
+            while position < len(argv):
+                argument = argv[position]
+                if argument in {"-S", "-B", "-G"}:
+                    _require(position + 1 < len(argv) and not argv[position + 1].startswith("-"),
+                             "Auxiliary tree configured source command has an incomplete option")
+                    position += 2
+                else:
+                    _require(argument.startswith("-D") and len(argument) > 2 and "=" in argument,
+                             "Auxiliary tree configured source command has unsupported root construction arguments")
+                    position += 1
+            configured_roots.append(argv[source_flags[0] + 1])
+        elif Path(argv[0]).name == "cmake":
+            _require(argv[1:] == ["--version"] or (len(argv) >= 3 and argv[1] == "--build"),
+                     "Auxiliary tree build has a configure command without an explicit source root")
+    _require(configured_roots and all(root == str(source) for root in configured_roots),
+             "Auxiliary tree build has no matching configured source root")
+
+
+def _validate_source_tree_producer(syntax: ast.Module, producer: Path,
+                                   build_path: Path, build: dict[str, Any]) -> None:
+    """Accept one closed recorder grammar, never arbitrary Python dataflow.
+
+    This checks the current source program and its referenced byte inventory.
+    It does not attest that this program ran, or that its imports/environment
+    were trusted during an earlier process execution.
+    """
+    base = producer.parent
+    source, build_directory = base / "source", base / "build"
+    run = build_path.parent
+    _require(run.parent == base and run.name not in {"source", "build"}
+             and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", run.name) is not None
+             and build_path == run / "result.local.json",
+             "Auxiliary source producer result has no supported source construction directory")
+    slots = {"__RUN_DIRECTORY__": run.name}
+    for field_name, marker in (("source_acquisition", "__ACQUISITION_NAME__"),
+                          ("patch", "__PATCH_NAME__"), ("patch_manifest", "__PATCH_MANIFEST_NAME__")):
+        _require(isinstance(build.get(field_name), dict), "Auxiliary source producer origin refs are incomplete")
+        path = _file(build[field_name])
+        _require(path.parent == base and path == path.resolve() and path != producer
+                 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", path.name) is not None,
+                 "Auxiliary source producer literal origin path does not match its source construction")
+        slots[marker] = path.name
+    for field_name, name in (("source_before", "source-before.local.json"), ("source_after", "source-after.local.json")):
+        _require(isinstance(build.get(field_name), dict) and _file(build[field_name]) == run / name,
+                 "Auxiliary source producer manifest paths differ from its fixed construction")
+    if build.get("binary") is not None:
+        _require(isinstance(build["binary"], dict)
+                 and _file(build["binary"]) == build_directory / "bin/llama-mtmd-cli",
+                 "Auxiliary source producer binary path differs from its fixed construction")
+    recorded = build.get("commands")
+    _require(isinstance(recorded, list) and 0 < len(recorded) <= 64
+             and all(isinstance(row, dict) for row in recorded),
+             "Auxiliary source producer needs bounded recorded source commands")
+    assert isinstance(recorded, list)
+    environment = recorded[0].get("environment_overrides")
+    _require(isinstance(environment, dict) and set(environment) == {"DEVELOPER_DIR", "SDKROOT"}
+             and all(isinstance(value, str) and 0 < len(value) <= 4096 and "\x00" not in value
+                     for value in environment.values()),
+             "Auxiliary source producer environment literal slots are unsupported")
+    assert isinstance(environment, dict)
+    slots.update({"__DEVELOPER_DIR__": environment["DEVELOPER_DIR"], "__SDKROOT__": environment["SDKROOT"]})
+    assignments = [node for node in syntax.body if isinstance(node, ast.Assign)
+                   and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                   and node.targets[0].id == "commands"]
+    _require(len(assignments) == 1 and isinstance(assignments[0].value, ast.List),
+             "Auxiliary source producer commands are not one supported literal array")
+    command_array = assignments[0].value
+    assert isinstance(command_array, ast.List)
+    _require(0 < len(command_array.elts) <= 64 and len(recorded) <= len(command_array.elts),
+             "Auxiliary source producer command denominator is unsupported")
+    declared: list[tuple[str, list[str]]] = []
+    for entry in command_array.elts:
+        _require(isinstance(entry, ast.Tuple) and len(entry.elts) == 2
+                 and isinstance(entry.elts[0], ast.Constant) and isinstance(entry.elts[0].value, str)
+                 and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", entry.elts[0].value) is not None
+                 and isinstance(entry.elts[1], ast.List) and 0 < len(entry.elts[1].elts) <= 256,
+                 "Auxiliary source producer has an unsupported source command row")
+        assert isinstance(entry, ast.Tuple) and isinstance(entry.elts[0], ast.Constant)
+        assert isinstance(entry.elts[0].value, str)
+        assert isinstance(entry.elts[1], ast.List)
+        arguments: list[str] = []
+        for argument in entry.elts[1].elts:
+            if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                _require(0 < len(argument.value) <= 4096 and "\x00" not in argument.value,
+                         "Auxiliary source producer command literal is invalid")
+                arguments.append(argument.value)
+            else:
+                _require(isinstance(argument, ast.Call) and isinstance(argument.func, ast.Name)
+                         and argument.func.id == "str" and not argument.keywords and len(argument.args) == 1
+                         and isinstance(argument.args[0], ast.Name) and argument.args[0].id in {"source", "build"},
+                         "Auxiliary source producer command escapes its literal source construction")
+                assert isinstance(argument, ast.Call) and isinstance(argument.args[0], ast.Name)
+                arguments.append(str(source if argument.args[0].id == "source" else build_directory))
+        declared.append((entry.elts[0].value, arguments))
+    _require(len({name for name, _ in declared}) == len(declared),
+             "Auxiliary source producer command names are duplicated")
+    _validate_source_tree_command_roots(
+        [{"cwd": str(source), "argv": arguments} for _, arguments in declared], source)
+    for record, (name, arguments) in zip(recorded, declared):
+        _require(record.get("name") == name and record.get("argv") == arguments
+                 and record.get("cwd") == str(source) and record.get("environment_overrides") == environment,
+                 "Auxiliary source producer recorded commands differ from its source construction")
+        for field_name, suffix in (("stdout", ".stdout.log"), ("stderr", ".stderr.log")):
+            _require(isinstance(record.get(field_name), dict) and _file(record[field_name]) == run / (name + suffix),
+                     "Auxiliary source producer command logs differ from its source construction")
+
+    class BindSlots(ast.NodeTransformer):
+        def visit_Constant(self, node: ast.Constant) -> ast.AST:
+            if isinstance(node.value, str) and node.value in slots:
+                return ast.copy_location(ast.Constant(slots[node.value]), node)
+            return node
+
+        def visit_Assign(self, node: ast.Assign) -> ast.AST:
+            if (len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == "commands"):
+                # Only the previously validated literal array is inserted. All
+                # surrounding names, imports, calls, functions and order stay fixed.
+                node.value = command_array
+                return node
+            return self.generic_visit(node)
+
+    expected = BindSlots().visit(ast.parse(_SOURCE_TREE_PRODUCER_TEMPLATE))
+    _require(ast.dump(syntax, include_attributes=False) == ast.dump(expected, include_attributes=False),
+             "Auxiliary source producer does not match the closed supported source construction grammar")
+
+
+def _auxiliary_source_tree_inventory(locators: list[dict[str, Any]] | None, directory: Path,
+                                     repo: Path | None, registered: set[str]) -> list[dict[str, Any]]:
+    return _source_tree_inventory(locators, directory, repo, registered, historical=False)
+
+
+def _auxiliary_historical_source_tree_inventory(locators: list[dict[str, Any]] | None, directory: Path,
+                                                repo: Path | None, registered: set[str]) -> list[dict[str, Any]]:
+    return _source_tree_inventory(locators, directory, repo, registered, historical=True)
+
+
+def _source_file_identity(info: os.stat_result) -> tuple[int, ...]:
+    """Read access may update atime; content/ownership/link identity must hold."""
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_uid,
+            info.st_gid, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _source_tree_inventory(locators: list[dict[str, Any]] | None, directory: Path,
+                           repo: Path | None, registered: set[str], *,
+                           historical: bool) -> list[dict[str, Any]]:
+    """Resolve a whole source-relative list through its exact original producer.
+
+    This proves current byte inventory only. Build/runtime claims remain
+    UNVERIFIED, and no root is accepted from the locator author's assertion.
+    """
+    _require(locators is None or isinstance(locators, list), "Auxiliary source trees require explicit locators")
+    _require(len(locators or []) <= 64, "Auxiliary source tree count exceeds its finite bound")
+    observations: list[dict[str, Any]] = []
+    occupied: set[tuple[str, tuple[str | int, ...]]] = set()
+    seen_builds: set[str] = set()
+    def canonical(path: Path) -> None:
+        _require(path.is_absolute() and path == path.resolve() and path.is_relative_to(directory),
+                 "Auxiliary source tree path is noncanonical, linked or outside its task")
+        _require(not any(path.is_relative_to(directory / name) for name in ("sources", "renders", "reviews", "review", "transcripts"))
+                 and path.name not in {"project.json", "acceptance.local.json"},
+                 "Protected private/formal paths cannot become auxiliary source tree inventories")
+
+    def read(ref: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
+        path = _file(ref)
+        canonical(path)
+        _require(path.stat().st_size <= MAX_UNIT_BYTES and ref["sha256"] not in registered,
+                 "Auxiliary tree metadata is oversized or a registered source")
+        _require("bytes" not in ref or ref["bytes"] == path.stat().st_size, "Auxiliary tree metadata byte count changed")
+        try:
+            value = json.loads(path.read_bytes())
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Auxiliary source tree metadata is not bounded JSON") from exc
+        _require(isinstance(value, dict), "Auxiliary source tree metadata must be an object")
+        return path, value
+
+    def same_ref(left: Any, right: Any) -> bool:
+        return (isinstance(left, dict) and isinstance(right, dict)
+                and left.get("path") == right.get("path") and left.get("sha256") == right.get("sha256"))
+
+    def pointer(value: dict[str, Any], expression: Any) -> tuple[Any, dict[str, Any], tuple[str | int, ...]]:
+        _require(isinstance(expression, str) and expression.startswith("/") and len(expression) <= 2048,
+                 "Auxiliary tree copy requires an exact JSON pointer")
+        tokens = expression[1:].split("/")
+        _require(all(token and re.search(r"~(?![01])", token) is None for token in tokens), "Auxiliary tree copy pointer is malformed")
+        edge: list[str | int] = []
+        item: Any = value
+        parent: Any = None
+        for token in tokens:
+            token = token.replace("~1", "/").replace("~0", "~")
+            parent = item
+            if isinstance(item, dict):
+                _require(token in item, "Auxiliary tree copy pointer is missing")
+                item = item[token]
+                edge.append(token)
+            elif isinstance(item, list):
+                _require(re.fullmatch(r"0|[1-9][0-9]*", token) is not None and int(token) < len(item),
+                         "Auxiliary tree copy array pointer is invalid")
+                item = item[int(token)]
+                edge.append(int(token))
+            else:
+                raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Auxiliary tree copy pointer crosses a scalar")
+        _require(isinstance(parent, dict) and edge[-1] == "actual_build_source_tree",
+                 "Auxiliary tree copy is not the explicit runtime tree role")
+        return item, parent, tuple(edge)
+
+    for locator in locators or []:
+        snapshot_ref = None
+        if historical:
+            _require(isinstance(locator, dict) and set(locator) == {"origin", "snapshot"}
+                     and isinstance(locator["origin"], dict) and isinstance(locator["snapshot"], dict),
+                     "Historical source tree requires an explicit original locator and complete snapshot")
+            snapshot_ref = locator["snapshot"]
+            locator = locator["origin"]
+        _require(isinstance(locator, dict) and set(locator) <= {"build", "manifest", "copies"}
+                 and {"build", "manifest"} <= set(locator), "Unsupported auxiliary source tree locator")
+        build_ref, selected_ref = locator["build"], locator["manifest"]
+        build_path, build = read(build_ref)
+        _require(str(build_path) not in seen_builds, "Auxiliary source tree build locator is duplicated")
+        seen_builds.add(str(build_path))
+        _require(build.get("schema_version") == "private-runtime-build/v1"
+                 and build.get("source_unchanged_during_build") is True,
+                 "Auxiliary tree origin is not an unchanged native build record")
+        for key in ("source_before", "source_after", "runner", "source_acquisition"):
+            _require(isinstance(build.get(key), dict), "Auxiliary tree build origin is incomplete")
+        before_path, before_value = read(build["source_before"])
+        after_path, after_value = read(build["source_after"])
+        selected_path, value = read(selected_ref)
+        _require(same_ref(selected_ref, build["source_before"]) or same_ref(selected_ref, build["source_after"]),
+                 "Auxiliary tree manifest is not referenced by its build parent")
+        _require(before_path != after_path and build["source_before"]["sha256"] == build["source_after"]["sha256"]
+                 and before_value == after_value == value, "Auxiliary build source manifests differ")
+        producer = _file(build["runner"])
+        canonical(producer)
+        _require(producer.stat().st_size <= MAX_UNIT_BYTES and sha256(producer) not in registered,
+                 "Auxiliary tree producer is oversized or a registered private source")
+        try:
+            syntax = ast.parse(producer.read_text())
+        except (ValueError, SyntaxError, UnicodeDecodeError) as exc:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Auxiliary tree producer is not inspectable Python") from exc
+        _validate_source_tree_producer(syntax, producer, build_path, build)
+        source = producer.parent / "source"
+        canonical(source)
+        _require(source.is_dir() and source != directory, "Auxiliary tree origin is not a canonical task source directory")
+        acquisition_path, acquisition = read(build["source_acquisition"])
+        _require(acquisition.get("copied_source") == str(source), "Auxiliary tree acquisition identifies another source root")
+        _validate_source_tree_command_roots(build.get("commands"), source)
+        _require(set(value) == {"files", "sha256"} and isinstance(value["files"], list)
+                 and 0 < len(value["files"]) <= MAX_TASK_FILES, "Auxiliary source tree list is missing or exceeds its bound")
+        rows = value["files"]
+        _require(hashlib.sha256(json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()).hexdigest() == value["sha256"],
+                 "Auxiliary source tree aggregate digest is invalid")
+        physical_source = source
+        snapshot_path = None
+        if historical:
+            assert snapshot_ref is not None
+            snapshot_path, snapshot = read(snapshot_ref)
+            expected_origin = {"build": build_ref, "manifest": selected_ref, "runner": build["runner"],
+                               "acquisition": build["source_acquisition"], "logical_source_root": str(source)}
+            _require(snapshot_path.name == "snapshot.json" and snapshot_path.stat().st_nlink == 1
+                     and set(snapshot) == {"schema_version", "origin", "tree", "claim_status"}
+                     and snapshot["schema_version"] == "historical-source-tree-snapshot/v1"
+                     and snapshot["origin"] == expected_origin and snapshot["tree"] == value
+                     and snapshot["claim_status"] == "UNVERIFIED",
+                     "Historical source snapshot differs from its exact original manifest/origin or scope")
+            physical_source = snapshot_path.parent / "source"
+            canonical(physical_source)
+            _require(physical_source.is_dir() and not physical_source.is_relative_to(source)
+                     and not source.is_relative_to(physical_source),
+                     "Historical physical tree must be a separate canonical complete copy")
+        files: list[dict[str, Any]] = []
+        names: set[str] = set()
+        total_bytes = 0
+        for row in rows:
+            _require(isinstance(row, dict) and set(row) == {"path", "sha256", "bytes"}
+                     and isinstance(row["path"], str) and re.fullmatch(r"[a-f0-9]{64}", str(row["sha256"]))
+                     and type(row["bytes"]) is int and row["bytes"] >= 0, "Auxiliary source tree row is malformed")
+            relative = Path(row["path"])
+            _require(not relative.is_absolute() and str(relative) == row["path"]
+                     and all(part not in {"", ".", ".."} for part in row["path"].split("/")),
+                     "Auxiliary source tree row is absolute, noncanonical or escapes its root")
+            target = physical_source / relative
+            canonical(target)
+            _require(target.is_relative_to(physical_source) and str(target) not in names and not target.is_symlink()
+                     and target.is_file(), "Auxiliary source tree target is duplicate, missing or linked")
+            names.add(str(target))
+            first = target.stat()
+            _require(stat.S_ISREG(first.st_mode) and first.st_size == row["bytes"], "Auxiliary source tree target size/type changed")
+            _require(not historical or first.st_nlink == 1, "Historical source snapshot contains a hard link")
+            actual = artifact_ref(target)
+            _require(_source_file_identity(target.stat()) == _source_file_identity(first) and actual["sha256"] == row["sha256"]
+                     and actual["sha256"] not in registered, "Auxiliary source tree target changed or is a registered private source")
+            total_bytes += first.st_size
+            _require(total_bytes <= MAX_TOTAL_BYTES, "Auxiliary source tree bytes exceed the finite inspection bound")
+            observed_file = {"original_relative_path": row["path"], "actual": actual, "bytes": first.st_size}
+            if historical:
+                observed_file["logical_source_path"] = str(source / relative)
+            files.append(observed_file)
+        physical: set[str] = set()
+        def unreadable_tree(error: OSError) -> None:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Auxiliary source tree traversal is unreadable") from error
+        for parent, folders, children in os.walk(physical_source, followlinks=False, onerror=unreadable_tree):
+            _require(not any((Path(parent) / name).is_symlink() for name in folders + children),
+                     "Auxiliary source tree contains a directory or file symlink")
+            for name in children:
+                path = Path(parent) / name
+                _require(path.is_file() and stat.S_ISREG(path.stat().st_mode), "Auxiliary source tree contains a nonregular file")
+                physical.add(str(path))
+                _require(len(physical) <= MAX_TASK_FILES, "Auxiliary current source tree exceeds its finite file bound")
+        _require(physical == names, "Auxiliary source tree has missing or extra current files")
+        bindings: list[dict[str, Any]] = []
+        parents = [artifact_ref(build_path), artifact_ref(producer), artifact_ref(acquisition_path)]
+        current_files: list[dict[str, Any]] = []
+        current_bytes = 0
+        if historical:
+            assert snapshot_path is not None
+            snapshot_binding_key = (str(snapshot_path), ("tree",))
+            _require(snapshot_binding_key not in occupied, "Conflicting historical snapshot tree binding")
+            occupied.add(snapshot_binding_key)
+            bindings.append({"parent": artifact_ref(snapshot_path), "edge": ["tree"]})
+            parents.append(artifact_ref(snapshot_path))
+            for current_parent, folders, children in os.walk(source, followlinks=False, onerror=unreadable_tree):
+                folders.sort()
+                _require(not any((Path(current_parent) / name).is_symlink() for name in folders + children),
+                         "Historical logical root current inventory contains a symlink")
+                for name in sorted(children):
+                    current = Path(current_parent) / name
+                    canonical(current)
+                    first_current = current.stat()
+                    _require(stat.S_ISREG(first_current.st_mode), "Historical logical root has a nonregular current file")
+                    current_ref = artifact_ref(current)
+                    _require(_source_file_identity(current.stat()) == _source_file_identity(first_current) and current_ref["sha256"] not in registered,
+                             "Historical logical root current bytes changed or are a registered private source")
+                    current_bytes += first_current.st_size
+                    current_files.append({"original_relative_path": str(current.relative_to(source)),
+                                          "actual": current_ref, "bytes": first_current.st_size})
+                    _require(len(current_files) <= MAX_TASK_FILES and current_bytes <= MAX_TOTAL_BYTES,
+                             "Historical logical root current inventory exceeds its finite bounds")
+        for manifest_path in (before_path, after_path):
+            binding_key = (str(manifest_path), ())
+            _require(binding_key not in occupied, "Conflicting auxiliary source tree manifest origin")
+            occupied.add(binding_key)
+            bindings.append({"parent": artifact_ref(manifest_path), "edge": []})
+            parents.append(artifact_ref(manifest_path))
+        copies = locator.get("copies", [])
+        _require(isinstance(copies, list) and len(copies) <= 512, "Auxiliary tree copy count exceeds its finite bound")
+        for copy in copies:
+            _require(isinstance(copy, dict) and set(copy) == {"parent", "pointer"}, "Auxiliary tree copy locator is malformed")
+            copy_path, copy_value = read(copy["parent"])
+            _auxiliary_json(copy_path, repo, registered)
+            actual_value, owner, edge = pointer(copy_value, copy["pointer"])
+            _require(actual_value == value, "Auxiliary inline tree copy differs from its complete original manifest")
+            origin_fields = {"build_receipt": build_ref, "build_source_before": build["source_before"],
+                             "build_source_after": build["source_after"], "build_runner": build["runner"],
+                             "source_acquisition": build["source_acquisition"]}
+            _require(all(same_ref(owner.get(key), ref) for key, ref in origin_fields.items()),
+                     "Auxiliary inline source tree copy has a different build origin")
+            for ref in origin_fields.values():
+                _file(ref)
+            copy_key = (str(copy_path), edge)
+            _require(copy_key not in occupied, "Duplicate/conflicting auxiliary tree copy pointer")
+            occupied.add(copy_key)
+            bindings.append({"parent": artifact_ref(copy_path), "edge": list(edge)})
+            parents.append(artifact_ref(copy_path))
+        for ref in parents:
+            _file(ref)
+        observation = {"build": build_ref, "selected_manifest": artifact_ref(selected_path), "source_directory": str(source),
+                       "manifest_value": value, "parents": parents, "bindings": bindings, "files": files,
+                       "row_count": len(rows), "total_bytes": total_bytes, "claim_status": "UNVERIFIED",
+                       "scope": "Root-bound auxiliary source bytes only; no build, execution, AI, public classification or publication approval"}
+        if historical:
+            observation.update({"physical_snapshot_directory": str(physical_source), "snapshot": snapshot_ref,
+                                "current_files": current_files, "current_total_bytes": current_bytes,
+                                "scope": "Complete historical byte relocation plus current logical-root inventory only; no past execution, current runtime, AI, public classification or publication approval"})
+        observations.append(observation)
+    return observations
+
+
+def _auxiliary_runtime_inventory(request_refs: list[dict[str, Any]] | None, directory: Path,
+                                 repo: Path | None, registered: set[str]) -> list[dict[str, Any]]:
+    """Observe exact auxiliary library edges; protected metadata still rejects."""
+    return _runtime_library_inventory(request_refs, directory, repo, registered, native_request=False)
+
+
+def _native_runtime_request_inventory(request_refs: list[dict[str, Any]] | None, directory: Path,
+                                      repo: Path | None, registered: set[str]) -> list[dict[str, Any]]:
+    """Observe the current bytes of one supported request role, never execution.
+
+    This role cannot use metadata history or grant alias authority to another
+    parent. Native process, intake, capability and review validators remain
+    separate and must reject absent/stale execution evidence independently.
+    """
+    return _runtime_library_inventory(request_refs, directory, repo, registered, native_request=True)
+
+
+def _native_runtime_alias_inventory(locators: list[dict[str, Any]] | None,
+                                    native_observations: list[dict[str, Any]], directory: Path,
+                                    repo: Path | None, registered: set[str]) -> list[dict[str, Any]]:
+    """Bind explicit current diagnostic edges to already observed native bytes.
+
+    A locator never authorizes an unlisted parent/sibling, history or execution.
+    The caller constructs native observations with the strict current-byte
+    reader and repeats that complete kernel/link/target check after graph walk.
+    """
+    _require(locators is None or isinstance(locators, list), "Native alias repetitions require an explicit locator list")
+    _require(len(locators or []) <= 4096, "Native alias repetitions exceed the finite edge inspection bound")
+    observations: list[dict[str, Any]] = []
+    seen: set[tuple[str, tuple[str | int, ...]]] = set()
+    for locator in locators or []:
+        _require(isinstance(locator, dict) and set(locator) == {"parent", "pointer", "authority_request", "library_index"},
+                 "Native repeated alias locator has unsupported fields")
+        parent = _file(locator["parent"])
+        _require(parent == parent.resolve() and parent == Path(os.path.abspath(parent))
+                 and parent.is_relative_to(directory) and parent.name not in {"project.json", "acceptance.local.json"}
+                 and not any(parent.is_relative_to(directory / name) for name in ("sources", "renders", "reviews", "review", "transcripts"))
+                 and locator["parent"]["sha256"] not in registered,
+                 "Native repeated alias parent is noncanonical, outside task or protected")
+        payload = _auxiliary_json(parent, repo, registered)
+        matches = [row for row in native_observations if row["request"] == locator["authority_request"]]
+        _require(len(matches) == 1, "Native repeated alias has no exact current request authority")
+        authority = matches[0]
+        index = locator["library_index"]
+        _require(type(index) is int and 0 <= index < len(authority["libraries"]), "Native repeated alias library index is invalid")
+        library = authority["libraries"][index]
+        _require(bool(library["hops"]), "Native repeated alias authority does not name an actual alias")
+        expression = locator["pointer"]
+        _require(isinstance(expression, str) and expression.startswith("/") and len(expression) <= 4096,
+                 "Native repeated alias requires an exact bounded JSON pointer")
+        tokens = expression[1:].split("/")
+        _require(all(token and re.search(r"~(?![01])", token) is None for token in tokens),
+                 "Native repeated alias JSON pointer is malformed")
+        value: Any = payload
+        edge: list[str | int] = []
+        for encoded in tokens:
+            token = encoded.replace("~1", "/").replace("~0", "~")
+            if isinstance(value, dict):
+                _require(token in value, "Native repeated alias pointer is missing")
+                edge.append(token)
+                value = value[token]
+            elif isinstance(value, list):
+                _require(re.fullmatch(r"0|[1-9][0-9]*", token) is not None and int(token) < len(value),
+                         "Native repeated alias array pointer is invalid")
+                edge.append(int(token))
+                value = value[int(token)]
+            else:
+                raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Native repeated alias pointer crosses a scalar")
+        _require(isinstance(value, dict) and set(value) in ({"path", "sha256"}, {"path", "sha256", "bytes"})
+                 and value["path"] == library["declared_reference"]["path"]
+                 and value["sha256"] == library["declared_reference"]["sha256"]
+                 and ("bytes" not in value or type(value["bytes"]) is int and value["bytes"] == library["target_lstat"]["size"]),
+                 "Native repeated alias edge differs from the exact current declared library")
+        key = (str(parent), tuple(edge))
+        _require(key not in seen, "Duplicate or conflicting native repeated alias pointer")
+        seen.add(key)
+        _require(artifact_ref(parent) == locator["parent"], "Native repeated alias parent bytes changed during observation")
+        observations.append({"parent": locator["parent"], "pointer": expression, "edge": edge,
+                             "authority_request": locator["authority_request"], "library_index": index,
+                             "declared_reference": value, "library_identity": library,
+                             "claim_status": "UNVERIFIED", "execution_status": "UNVERIFIED", "history_supported": False,
+                             "scope": "Explicit current auxiliary diagnostic alias bytes only; entire parent private; no history, execution, intake, calibration, review or publication approval"})
+    return observations
+
+
+def _runtime_library_inventory(request_refs: list[dict[str, Any]] | None, directory: Path,
+                               repo: Path | None, registered: set[str], *,
+                               native_request: bool) -> list[dict[str, Any]]:
+    """Current parent and library bytes only; no execution/history approval."""
+    _require(request_refs is None or isinstance(request_refs, list), "Auxiliary runtime requests require explicit hashed request locators")
+    _require(len(request_refs or []) <= 512, "Auxiliary runtime request count exceeds its finite inspection bound")
+    observations: list[dict[str, Any]] = []
+    seen_requests: set[str] = set()
+
+    def supported_path(path: Path) -> None:
+        _require(path.is_absolute() and path == Path(os.path.abspath(path)) and path.parent == path.parent.resolve(),
+                 "Auxiliary runtime path is noncanonical or traverses a directory alias")
+        _require(not any(path.is_relative_to(directory / name) for name in ("sources", "renders", "reviews", "review", "transcripts")),
+                 "Private source/transcript/render/review paths cannot become auxiliary runtime aliases")
+
+    def status(path: Path) -> dict[str, int]:
+        try:
+            value = path.lstat()
+        except OSError as exc:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Auxiliary runtime target or alias is missing") from exc
+        return {"mode": value.st_mode, "size": value.st_size, "device": value.st_dev, "inode": value.st_ino,
+                "mtime_ns": value.st_mtime_ns, "ctime_ns": value.st_ctime_ns}
+
+    def binary_format(path: Path) -> str:
+        with path.open("rb") as handle:
+            header = handle.read(64)
+        if len(header) >= 32 and header[:4] in {b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf"}:
+            endian = "<" if header[0] in {0xCE, 0xCF} else ">"
+            _require(struct.unpack(endian + "I", header[12:16])[0] == 6, "Auxiliary runtime target is not a Mach-O shared library")
+            return "Mach-O MH_DYLIB"
+        if len(header) >= 32 and header[:4] == b"\x7fELF" and header[4] in {1, 2} and header[5] in {1, 2}:
+            endian = "<" if header[5] == 1 else ">"
+            _require(struct.unpack(endian + "H", header[16:18])[0] == 3, "Auxiliary runtime target is not an ELF dynamic object")
+            return "ELF ET_DYN"
+        raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Auxiliary runtime target lacks a supported shared-library binary header")
+
+    for request_ref in request_refs or []:
+        parent = _file(request_ref)
+        supported_path(parent)
+        _require(parent.is_relative_to(directory) and parent.name not in {"project.json", "acceptance.local.json"}
+                 and request_ref["sha256"] not in registered and str(parent) not in seen_requests,
+                 "Auxiliary runtime request is outside its task, duplicated or a protected source identity")
+        seen_requests.add(str(parent))
+        payload = (_native_runtime_request_json(parent, repo, registered) if native_request
+                   else _auxiliary_json(parent, repo, registered))
+        libraries = payload.get("runtime_libraries")
+        _require(isinstance(libraries, list) and 0 < len(libraries) <= 512,
+                 "Auxiliary runtime request has no bounded actual runtime_libraries edge")
+        assert isinstance(libraries, list)
+        rows = []
+        declared_paths: set[str] = set()
+        for ref in libraries:
+            _require(isinstance(ref, dict) and isinstance(ref.get("path"), str)
+                     and isinstance(ref.get("sha256"), str) and re.fullmatch(r"[a-f0-9]{64}", ref["sha256"])
+                     and ref["sha256"] not in registered and ref["path"] not in declared_paths,
+                     "Auxiliary runtime edge is duplicated, malformed or a registered private source")
+            declared_paths.add(ref["path"])
+            path = Path(ref["path"])
+            _require(str(path) == ref["path"], "Auxiliary runtime declared path is not canonical")
+            original = path
+            hops: list[dict[str, Any]] = []
+            visited: set[str] = set()
+            while True:
+                supported_path(path)
+                _require(str(path) not in visited and len(visited) < 32, "Auxiliary runtime aliases contain a cycle or exceed the hop bound")
+                visited.add(str(path))
+                before = status(path)
+                if stat.S_ISLNK(before["mode"]):
+                    link = os.readlink(path)
+                    encoded = os.fsencode(link)
+                    # Lexical collapse before following a directory symlink
+                    # can point at different bytes than the kernel opens.
+                    # Such paths are outside this bounded alias scope.
+                    _require(not any(part in {".", ".."} for part in link.split("/")),
+                             "Auxiliary runtime link text is noncanonical or traverses a directory alias")
+                    _require(status(path) == before and before["size"] == len(encoded), "Auxiliary runtime alias changed while being read")
+                    hops.append({"path": str(path), "target": link, "link_bytes_hex": encoded.hex(),
+                                 "link_bytes_sha256": hashlib.sha256(encoded).hexdigest(), "lstat": before})
+                    path = path.parent / link if not Path(link).is_absolute() else Path(link)
+                    continue
+                _require(stat.S_ISREG(before["mode"]), "Auxiliary runtime target is not a regular file")
+                target = artifact_ref(path)
+                _require(target["sha256"] == ref["sha256"] and target["sha256"] not in registered,
+                         "Auxiliary runtime target bytes changed or match a registered private source")
+                _require("bytes" not in ref or ref["bytes"] == before["size"], "Auxiliary runtime declared target byte count changed")
+                kind = binary_format(path)
+                _require(status(path) == before, "Auxiliary runtime target changed while being read")
+                try:
+                    actual_path = original.resolve(strict=True)
+                    actual_stat = original.stat()
+                    actual_identity = {"mode": actual_stat.st_mode, "size": actual_stat.st_size,
+                                       "device": actual_stat.st_dev, "inode": actual_stat.st_ino,
+                                       "mtime_ns": actual_stat.st_mtime_ns, "ctime_ns": actual_stat.st_ctime_ns}
+                    _require(actual_path == path and actual_identity == before and sha256(original) == target["sha256"],
+                             "Auxiliary runtime kernel resolution or opened target bytes changed")
+                except OSError as exc:
+                    raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Auxiliary runtime kernel target is unavailable") from exc
+                _require(status(path) == before and all(status(Path(hop["path"])) == hop["lstat"] for hop in hops),
+                         "Auxiliary runtime alias or target changed during kernel resolution verification")
+                rows.append({"declared_reference": ref, "hops": hops, "target": target,
+                             "target_lstat": before, "binary_format": kind, "classification": "UNCLASSIFIED"})
+                break
+        _require(artifact_ref(parent) == {"path": request_ref["path"], "sha256": request_ref["sha256"]},
+                 "Auxiliary runtime parent request changed while reading its library edges")
+        observation: dict[str, Any] = {"request": request_ref, "libraries": rows, "claim_status": "UNVERIFIED",
+                       "scope": "Exact auxiliary runtime request, link text and target byte inventory only; no execution, AI or publication approval"}
+        if native_request:
+            observation.update({"observation_role": "current_native_runtime_request_bytes",
+                                "execution_status": "UNVERIFIED", "history_supported": False,
+                                "scope": "Exact current native request and runtime_libraries bytes only; parent remains private; no history, process, intake, capability, review or publication approval"})
+        observations.append(observation)
+    return observations
+
+
+def _contains_formal_schema(value: Any, repo: Path | None, registered: set[str]) -> bool:
     reserved: set[str] = set(re.findall(r"[a-z][a-z0-9_-]*/v[0-9]+", Path(__file__).read_text()))
     if repo is not None:
         for base, pattern in ((repo / "src/talkcut", "*.py"), (repo / "schemas", "*.json")):
@@ -1542,6 +2347,34 @@ def _auxiliary_json(path: Path, repo: Path | None, registered: set[str]) -> dict
                     or item.get("schema_version") == "transcript/v1" and item.get("source_sha256") in registered
                     or any(immutable_claim(child) for child in item.values()))
         return isinstance(item, list) and any(immutable_claim(child) for child in item)
-    _require(isinstance(value, dict) and not immutable_claim(value),
+    return immutable_claim(value)
+
+
+def _native_runtime_request_json(path: Path, repo: Path | None, registered: set[str]) -> dict[str, Any]:
+    """Read only a current audio-request role; this is not a receipt validator."""
+    _require(path.is_absolute() and path == path.resolve() and path.is_file() and not path.is_symlink()
+             and path.stat().st_size <= MAX_UNIT_BYTES and sha256(path) not in registered,
+             "Current native request is missing, linked, oversized or a registered source")
+    try:
+        value = json.loads(path.read_bytes())
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Current native request is not bounded JSON") from exc
+    _require(isinstance(value, dict) and value.get("schema_version") == "local-audio-calibration-request/v1"
+             and value.get("input_modality") == "audio" and value.get("video_input") is None,
+             "Unsupported current native request role")
+    _require(not _contains_formal_schema({key: child for key, child in value.items() if key != "schema_version"}, repo, registered),
+             "Nested formal source/review/measurement claims cannot use native runtime byte observation")
+    return value
+
+
+def _auxiliary_json(path: Path, repo: Path | None, registered: set[str]) -> dict[str, Any]:
+    """Read auxiliary bytes without accepting a formal artifact's truth claims."""
+    _require(path.is_absolute() and path.is_file() and not path.is_symlink()
+             and path.stat().st_size <= MAX_UNIT_BYTES, "Auxiliary metadata exceeds the bounded JSON inspection limit")
+    try:
+        value = json.loads(path.read_bytes())
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Auxiliary historical bytes must be bounded JSON metadata") from exc
+    _require(isinstance(value, dict) and not _contains_formal_schema(value, repo, registered),
              "Immutable source/transcript/review/measurement/render evidence cannot use auxiliary history")
     return value
