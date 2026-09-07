@@ -393,6 +393,7 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
                              auxiliary_runtime_requests: list[dict[str, Any]] | None = None,
                              native_runtime_request_observations: list[dict[str, Any]] | None = None,
                              native_runtime_alias_reobservations: list[dict[str, Any]] | None = None,
+                             inventory_alias_row_reobservations: list[dict[str, Any]] | None = None,
                              historical_verification_command_observations: list[dict[str, Any]] | None = None,
                              auxiliary_source_trees: list[dict[str, Any]] | None = None,
                              auxiliary_source_tree_reobservations: list[dict[str, Any]] | None = None,
@@ -422,6 +423,10 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
                                                             native_runtime_observations, directory, repo_root, set(registered.values()))
     native_reobservation_edges = {(row["parent"]["path"], tuple(row["edge"])): row for row in native_reobservations}
     native_reobservation_consumed: set[tuple[str, tuple[str | int, ...]]] = set()
+    inventory_alias_rows = _inventory_alias_row_inventory(inventory_alias_row_reobservations, directory, repo_root,
+                                                         set(registered.values()), synthetic_replay)
+    inventory_alias_edges = {(row["parent"]["path"], tuple(row["edge"])): row for row in inventory_alias_rows}
+    inventory_alias_consumed: set[tuple[str, tuple[str | int, ...]]] = set()
     command_history = _historical_verification_command_inventory(historical_verification_command_observations,
                                                                  directory, repo_root, set(registered.values()))
     command_history_by_key = {(row["original"]["path"], row["original"]["sha256"]): row for row in command_history}
@@ -717,6 +722,16 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
 
     def walk(value: Any, transcript: bool = False, key: str = "", *,
              origin_path: Path | None = None, edge: tuple[str | int, ...] = ()) -> None:
+        alias_row = inventory_alias_edges.get((str(origin_path), edge))
+        if alias_row is not None:
+            _require(not transcript and not contains_transcript(value) and refs[str(origin_path)]["kind"] == "review"
+                     and refs[str(origin_path)]["sha256"] == alias_row["parent"]["sha256"]
+                     and json.dumps(value, sort_keys=True, separators=(",", ":"))
+                     == json.dumps(alias_row["value"], sort_keys=True, separators=(",", ":")),
+                     "Inventory alias private context, parent or exact row changed")
+            protect_values(value)
+            inventory_alias_consumed.add((str(origin_path), edge))
+            return
         member = source_member_edges.get((str(origin_path), edge))
         if member is not None:
             _require(not transcript and not contains_transcript(value) and refs[str(origin_path)]["kind"] == "review"
@@ -874,8 +889,10 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
             return any(contains_registered(child) for child in value)
         return False
 
-    if fixture_observations:
-        replay = fixture_observations[0]["current_reproduction"]
+    if fixture_observations or inventory_alias_rows:
+        assert repo_root is not None
+        replay = (fixture_observations[0]["current_reproduction"] if fixture_observations
+                  else _verified_synthetic_replay(synthetic_replay, repo_root))
         _require(not Path(replay["bundle"]["path"]).is_relative_to(directory),
                  "Synthetic replay archive must be outside the task it inventories")
         for ref in [replay["bundle"], *replay["artifacts"], *replay["external_inputs"]]:
@@ -929,6 +946,15 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         add(old_path, "review", expected, parse_json=True)
         inspect_text(path, True, parse_json=True)
         inspect_text(old_path, True, parse_json=True)
+    for observation in inventory_alias_rows:
+        for parent_ref in (observation["parent"], observation["typed_origin"]["parent"]):
+            add(Path(parent_ref["path"]), "review", parent_ref["sha256"], parse_json=True)
+        alias_identity = observation["alias_identity"]
+        collect_candidate(Path(alias_identity["target"]["path"]), alias_identity["target"], alias_identity["target"])
+        for hop in alias_identity["hops"]:
+            unfollowed.append({"path": hop["path"], "sha256": hop["link_bytes_sha256"],
+                               "reference_type": "symlink_literal",
+                               "reason": "Explicit typed inventory row with verified current literal, chain and target"})
     for observation in failed_measurements:
         _require(not any(ref["sha256"] in digests for ref in observation["artifacts"].values()),
                  "Protected source identity cannot become failed CLI metadata")
@@ -976,6 +1002,13 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         # from the provenance of files it references. Only an explicit,
         # source-bound transcript marker propagates across artifact edges.
         walk(value, origin_path=path)
+    _require(inventory_alias_consumed == set(inventory_alias_edges),
+             "Inventory alias locator did not name a consumed exact metadata edge")
+    _require(inventory_alias_rows == _inventory_alias_row_inventory(inventory_alias_row_reobservations, directory,
+                                                                   repo_root, digests, synthetic_replay),
+             "Inventory alias origin, row, current literal, chain or target changed during inventory")
+    _require(not any(row["alias_identity"]["target"]["sha256"] in known for row in inventory_alias_rows),
+             "Known private source/transcript/review cannot become inventory alias target bytes")
     _require(failed_measurements == [_failed_cli_measurement(Path(row["artifacts"]["stdout.json"]["path"]), directory)
                                      for row in failed_measurements],
              "Failed CLI measurement bytes changed during inventory")
@@ -1027,6 +1060,7 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         "auxiliary_runtime_requests": auxiliary_runtime_observations,
         "native_runtime_request_observations": native_runtime_observations,
         "native_runtime_alias_reobservations": native_reobservations,
+        "inventory_alias_row_reobservations": inventory_alias_rows,
         "historical_verification_command_observations": command_history,
         "auxiliary_runtime_reobservations": list(runtime_reuses.values()),
         "auxiliary_source_trees": current_tree_observations,
@@ -1244,6 +1278,7 @@ def build_private_inventory(project_dir: str | Path, expected_source_hashes: dic
                             auxiliary_runtime_requests: list[dict[str, Any]] | None = None,
                              native_runtime_request_observations: list[dict[str, Any]] | None = None,
                              native_runtime_alias_reobservations: list[dict[str, Any]] | None = None,
+                             inventory_alias_row_reobservations: list[dict[str, Any]] | None = None,
                              historical_verification_command_observations: list[dict[str, Any]] | None = None,
                              auxiliary_source_trees: list[dict[str, Any]] | None = None,
                              auxiliary_source_tree_reobservations: list[dict[str, Any]] | None = None,
@@ -1265,6 +1300,7 @@ def build_private_inventory(project_dir: str | Path, expected_source_hashes: dic
                                           auxiliary_runtime_requests=auxiliary_runtime_requests,
                                           native_runtime_request_observations=native_runtime_request_observations,
                                           native_runtime_alias_reobservations=native_runtime_alias_reobservations,
+                                          inventory_alias_row_reobservations=inventory_alias_row_reobservations,
                                           historical_verification_command_observations=historical_verification_command_observations,
                                           auxiliary_source_trees=auxiliary_source_trees,
                                           auxiliary_source_tree_reobservations=auxiliary_source_tree_reobservations,
@@ -1392,6 +1428,7 @@ def _audited_private_inventory(raw: dict[str, Any], directory: Path | None,
                                       auxiliary_runtime_requests=raw.get("auxiliary_runtime_requests"),
                                       native_runtime_request_observations=raw.get("native_runtime_request_observations"),
                                       native_runtime_alias_reobservations=raw.get("native_runtime_alias_reobservations"),
+                                      inventory_alias_row_reobservations=raw.get("inventory_alias_row_reobservations"),
                                       historical_verification_command_observations=raw.get("historical_verification_command_observations"),
                                       auxiliary_source_trees=raw.get("auxiliary_source_trees"),
                                       auxiliary_source_tree_reobservations=raw.get("auxiliary_source_tree_reobservations"),
@@ -1522,6 +1559,7 @@ def verify_release_privacy(raw_ref: dict[str, Any], repo_root: str | Path, *, pr
                                                                       auxiliary_runtime_requests=raw.get("auxiliary_runtime_requests"),
                                       native_runtime_request_observations=raw.get("native_runtime_request_observations"),
                                       native_runtime_alias_reobservations=raw.get("native_runtime_alias_reobservations"),
+                                      inventory_alias_row_reobservations=raw.get("inventory_alias_row_reobservations"),
                                       historical_verification_command_observations=raw.get("historical_verification_command_observations"),
                                       auxiliary_source_trees=raw.get("auxiliary_source_trees"),
                                       auxiliary_source_tree_reobservations=raw.get("auxiliary_source_tree_reobservations"),
@@ -2914,6 +2952,161 @@ def _native_alias_parent_json(parent: Path, parent_ref: dict[str, Any], authorit
     _require(artifact_ref(parent) == parent_ref and artifact_ref(request_path) == authority["request"],
              "Native build alias parent or request changed during current-byte observation")
     return payload, "current_native_build_runtime_bytes"
+
+
+def _inventory_alias_row_inventory(locators: list[dict[str, Any]] | None,
+                                   directory: Path, repo: Path | None, registered: set[str],
+                                   replay_ref: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Observe explicit copied inventory rows using verified current tool bytes.
+
+    The historical parent remains private. Neither its execution nor its
+    classification claims become authoritative through current byte equality.
+    """
+    from .native_provenance import alias_snapshot
+
+    _require(locators is None or isinstance(locators, list), "Inventory alias rows require explicit locators")
+    _require(len(locators or []) <= 4096, "Inventory alias row observations exceed their finite bound")
+    if not locators:
+        return []
+    _require(repo is not None and replay_ref is not None, "Inventory alias rows need a current verified tool replay")
+    assert repo is not None
+    replay = _verified_synthetic_replay(replay_ref, repo)
+    tools = replay["external_tool_links"]
+    observations: list[dict[str, Any]] = []
+    seen: set[tuple[str, tuple[str | int, ...]]] = set()
+
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, child in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON keys")
+            value[key] = child
+        return value
+
+    def read(ref: Any) -> tuple[Path, dict[str, Any]]:
+        _require(isinstance(ref, dict) and set(ref) == {"path", "sha256"},
+                 "Inventory alias parent requires an exact artifact reference")
+        path = _file(ref)
+        _require(path == path.resolve() and path == Path(os.path.abspath(path))
+                 and path.is_relative_to(directory) and path.stat().st_size <= MAX_UNIT_BYTES
+                 and path.name not in {"project.json", "acceptance.local.json"}
+                 and not any(path.is_relative_to(directory / name) for name in ("sources", "renders", "reviews", "review", "transcripts"))
+                 and ref["sha256"] not in registered, "Inventory alias parent is protected, linked or outside its task")
+        try:
+            value = json.loads(path.read_bytes(), object_pairs_hook=unique)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Inventory alias parent is not bounded unique JSON") from exc
+        _require(isinstance(value, dict), "Inventory alias parent is not a JSON object")
+        assert isinstance(value, dict)
+        body = {key: child for key, child in value.items() if key != "schema_version"} if value.get("schema_version") == "private-task-inventory/v1" else value
+        _require(not _contains_formal_schema(body, repo, registered),
+                 "Formal or private source evidence cannot become inventory alias metadata")
+        _require(artifact_ref(path) == ref, "Inventory alias parent changed during observation")
+        return path, value
+
+    def select(value: dict[str, Any], expression: Any) -> tuple[Any, tuple[str | int, ...]]:
+        _require(isinstance(expression, str) and expression.startswith("/") and len(expression) <= 4096,
+                 "Inventory alias row needs an exact bounded JSON pointer")
+        tokens = expression[1:].split("/")
+        _require(all(token and re.search(r"~(?![01])", token) is None for token in tokens),
+                 "Inventory alias pointer is malformed")
+        item: Any = value
+        edge: list[str | int] = []
+        for encoded in tokens:
+            token = encoded.replace("~1", "/").replace("~0", "~")
+            if isinstance(item, dict):
+                _require(token in item, "Inventory alias pointer is missing")
+                item = item[token]
+                edge.append(token)
+            elif isinstance(item, list):
+                _require(re.fullmatch(r"0|[1-9][0-9]*", token) is not None and int(token) < len(item),
+                         "Inventory alias array pointer is invalid")
+                item = item[int(token)]
+                edge.append(int(token))
+            else:
+                raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Inventory alias pointer crosses a scalar")
+        return item, tuple(edge)
+
+    required_inventory = {"schema_version", "project", "scope", "dependencies", "entries", "entry_count",
+                          "mandatory_private_count", "unresolved", "known_graph", "classification_status",
+                          "preserved_private_inputs", "limits", "excluded_directories"}
+    def inventory_rows(origin: dict[str, Any]) -> list[dict[str, Any]]:
+        rows = origin.get("entries")
+        _require(set(origin) == required_inventory and origin.get("schema_version") == "private-task-inventory/v1"
+                 and origin.get("classification_status") == "UNVERIFIED" and origin.get("excluded_directories") == []
+                 and isinstance(rows, list) and type(origin.get("entry_count")) is int
+                 and 0 < len(rows) == origin["entry_count"] <= MAX_TASK_FILES
+                 and isinstance(origin.get("unresolved"), list) and isinstance(origin.get("known_graph"), dict),
+                 "Inventory alias origin is not a complete typed unclassified inventory")
+        assert isinstance(rows, list)
+        _require(all(isinstance(row, dict) and isinstance(row.get("path"), str) and Path(row["path"]).is_absolute()
+                     and isinstance(row.get("sha256"), str) and re.fullmatch(r"[a-f0-9]{64}", row["sha256"])
+                     and row.get("entry_type") in {"file", "symlink"}
+                     and row.get("classification") in {"UNCLASSIFIED", "media", "transcript", "review", "credentials"}
+                     for row in rows) and len({row["path"] for row in rows}) == len(rows)
+                 and type(origin.get("mandatory_private_count")) is int
+                 and origin["mandatory_private_count"] == sum(row["classification"] != "UNCLASSIFIED" for row in rows),
+                 "Inventory alias origin denominator or classifications are invalid")
+        return rows
+
+    for locator in locators:
+        _require(isinstance(locator, dict) and set(locator) == {"parent", "pointer", "typed_origin", "tool_alias_index"}
+                 and isinstance(locator["typed_origin"], dict) and set(locator["typed_origin"]) == {"parent", "pointer"},
+                 "Inventory alias row locator is malformed")
+        parent, payload = read(locator["parent"])
+        origin_path, origin = read(locator["typed_origin"]["parent"])
+        rows = inventory_rows(origin)
+        if payload.get("schema_version") == "private-task-inventory/v1":
+            inventory_rows(payload)
+        typed, origin_edge = select(origin, locator["typed_origin"]["pointer"])
+        _require(len(origin_edge) == 2 and origin_edge[0] == "entries" and type(origin_edge[1]) is int,
+                 "Inventory alias typed origin must name its exact inventory entry")
+        index = locator["tool_alias_index"]
+        _require(type(index) is int and 0 <= index < len(tools), "Inventory alias tool index is invalid")
+        authority = tools[index]
+        def target_stat(raw: str) -> list[int]:
+            value = os.stat(raw)
+            return [value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns]
+        target_identity = target_stat(authority["link_path"])
+        before = alias_snapshot(authority["link_path"])
+        _require({key: before["target"][key] for key in ("path", "sha256")} == authority["actual_target"] and before["hops"],
+                 "Inventory alias current tool target changed")
+        selected_hop = next((hop for hop in before["hops"] if hop["path"] == authority["link_path"]), None)
+        _require(selected_hop is not None and selected_hop["link_text"] == authority["link_target"]
+                 and selected_hop["link_bytes_sha256"] == authority["link_bytes_sha256"],
+                 "Inventory alias literal differs from verified replay authority")
+        by_path = {row["path"]: row for row in rows}
+        expected_rows = [{"path": hop["path"], "sha256": hop["link_bytes_sha256"], "entry_type": "symlink",
+                          "target": hop["link_text"], "classification": "UNCLASSIFIED"} for hop in before["hops"]]
+        _require(all(by_path.get(row["path"]) == row for row in expected_rows),
+                 "Inventory alias origin lacks the exact complete current link rows")
+        target_row = by_path.get(before["target"]["path"], {})
+        _require(target_row.get("entry_type") == "file" and target_row.get("classification") == "UNCLASSIFIED"
+                 and target_row.get("sha256") == before["target"]["sha256"],
+                 "Inventory alias origin lacks the exact current canonical target")
+        expected = next((row for row in expected_rows if row["path"] == authority["link_path"]), None)
+        _require(expected is not None and typed == expected, "Inventory alias typed row differs from the current tool alias")
+        selected, edge = select(payload, locator["pointer"])
+        if selected != typed:
+            _require(parent == origin_path and len(edge) == 3 and edge[:2] == ("known_graph", "unfollowed_refs")
+                     and type(edge[2]) is int and isinstance(selected, dict)
+                     and set(selected) == {"path", "sha256", "reason"} and isinstance(selected["reason"], str)
+                     and selected["path"] == typed["path"] and selected["sha256"] == typed["sha256"],
+                     "Bare inventory alias copy lacks its exact typed parent and edge")
+        key = (str(parent), edge)
+        _require(key not in seen, "Duplicate or conflicting inventory alias row observation")
+        seen.add(key)
+        _require(before == alias_snapshot(authority["link_path"]) and target_identity == target_stat(authority["link_path"])
+                 and artifact_ref(parent) == locator["parent"]
+                 and artifact_ref(origin_path) == locator["typed_origin"]["parent"],
+                 "Inventory alias parent, literal, chain or target changed during observation")
+        observations.append({"parent": locator["parent"], "pointer": locator["pointer"], "edge": list(edge),
+                             "value": selected, "typed_origin": locator["typed_origin"], "typed_row": typed,
+                             "authority_replay": replay["bundle"], "tool_alias_index": index, "alias_identity": before,
+                             "target_stat_identity": target_identity,
+                             "claim_status": "UNVERIFIED", "execution_status": "UNVERIFIED", "history_supported": False,
+                             "scope": "Explicit historical inventory row correspondence and current tool bytes only; entire parent private; no creation, execution, public classification or AV approval"})
+    return observations
 
 
 def _native_runtime_alias_inventory(locators: list[dict[str, Any]] | None,
