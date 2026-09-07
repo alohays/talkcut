@@ -690,7 +690,7 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
             if rank[kind] > rank.get(known.get(ref["sha256"], ""), -1):
                 known[ref["sha256"]] = kind
             if kind == "transcript" or parse_json:
-                inspect_text(path, kind == "transcript", parse_json)
+                inspect_text(path, kind in {"transcript", "review"}, parse_json)
             return
         _require(len(refs) < MAX_UNITS, "Known private graph exceeds inspection limits")
         _require(expected is None or ref["sha256"] == expected, "Known private artifact differs from its registered hash")
@@ -698,7 +698,7 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         if rank[kind] > rank.get(known.get(ref["sha256"], ""), -1):
             known[ref["sha256"]] = kind
         if kind == "transcript" or parse_json or path.suffix.lower() == ".json":
-            inspect_text(path, kind == "transcript", parse_json)
+            inspect_text(path, kind in {"transcript", "review"}, parse_json)
 
     def walk(value: Any, transcript: bool = False, key: str = "", *,
              origin_path: Path | None = None, edge: tuple[str | int, ...] = ()) -> None:
@@ -2640,6 +2640,51 @@ def _historical_verification_command_inventory(locators: list[dict[str, Any]] | 
     return results
 
 
+def _native_alias_parent_json(parent: Path, parent_ref: dict[str, Any], authority: dict[str, Any],
+                              repo: Path | None, registered: set[str]) -> tuple[dict[str, Any], str]:
+    """Inventory a current request's exact build library bytes, without approval.
+
+    Build records remain private and all other graph edges remain mandatory.
+    This narrow role neither authenticates the build nor accepts its status,
+    command, source-history, execution, capability or review claims.
+    """
+    request_path = _file(authority["request"])
+    request = _native_runtime_request_json(request_path, repo, registered)
+    linked = request.get("build_receipt")
+    if not (isinstance(linked, dict) and linked.get("path") == str(parent)
+            and linked.get("sha256") == parent_ref["sha256"]):
+        return _auxiliary_json(parent, repo, registered), "current_auxiliary_diagnostic_bytes"
+    _require(set(linked) in ({"path", "sha256"}, {"path", "sha256", "bytes"})
+             and parent.stat().st_size <= MAX_UNIT_BYTES
+             and ("bytes" not in linked or type(linked["bytes"]) is int and linked["bytes"] == parent.stat().st_size),
+             "Native build alias parent reference or byte bound differs")
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            _require(key not in result, "Native build alias parent has duplicate JSON keys")
+            result[key] = value
+        return result
+    try:
+        payload = json.loads(parent.read_bytes(), object_pairs_hook=unique)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Native build alias parent is not bounded JSON") from exc
+    _require(isinstance(payload, dict) and set(payload) == {"schema_version", "source_acquisition", "patch",
+             "patch_manifest", "runner", "source_before", "source_after", "source_unchanged_during_build",
+             "commands", "binary", "runtime_libraries", "status"}
+             and payload.get("schema_version") == "private-runtime-build/v1",
+             "Native alias parent is not the exact supported current build record role")
+    _require(not _contains_formal_schema({key: value for key, value in payload.items() if key != "schema_version"}, repo, registered),
+             "Nested formal claims cannot use current native build alias observation")
+    expected = [row["declared_reference"] for row in authority["libraries"]]
+    _require(json.dumps(payload.get("runtime_libraries"), sort_keys=True, separators=(",", ":"))
+             == json.dumps(request.get("runtime_libraries"), sort_keys=True, separators=(",", ":"))
+             == json.dumps(expected, sort_keys=True, separators=(",", ":")),
+             "Native build alias library list differs from the complete current request authority")
+    _require(artifact_ref(parent) == parent_ref and artifact_ref(request_path) == authority["request"],
+             "Native build alias parent or request changed during current-byte observation")
+    return payload, "current_native_build_runtime_bytes"
+
+
 def _native_runtime_alias_inventory(locators: list[dict[str, Any]] | None,
                                     native_observations: list[dict[str, Any]], directory: Path,
                                     repo: Path | None, registered: set[str]) -> list[dict[str, Any]]:
@@ -2662,15 +2707,18 @@ def _native_runtime_alias_inventory(locators: list[dict[str, Any]] | None,
                  and not any(parent.is_relative_to(directory / name) for name in ("sources", "renders", "reviews", "review", "transcripts"))
                  and locator["parent"]["sha256"] not in registered,
                  "Native repeated alias parent is noncanonical, outside task or protected")
-        payload = _auxiliary_json(parent, repo, registered)
         matches = [row for row in native_observations if row["request"] == locator["authority_request"]]
         _require(len(matches) == 1, "Native repeated alias has no exact current request authority")
         authority = matches[0]
+        payload, parent_role = _native_alias_parent_json(parent, locator["parent"], authority, repo, registered)
         index = locator["library_index"]
         _require(type(index) is int and 0 <= index < len(authority["libraries"]), "Native repeated alias library index is invalid")
         library = authority["libraries"][index]
         _require(bool(library["hops"]), "Native repeated alias authority does not name an actual alias")
         expression = locator["pointer"]
+        if parent_role == "current_native_build_runtime_bytes":
+            _require(expression == f"/runtime_libraries/{index}",
+                     "Native build alias pointer must name its exact runtime library row")
         _require(isinstance(expression, str) and expression.startswith("/") and len(expression) <= 4096,
                  "Native repeated alias requires an exact bounded JSON pointer")
         tokens = expression[1:].split("/")
@@ -2700,7 +2748,7 @@ def _native_runtime_alias_inventory(locators: list[dict[str, Any]] | None,
         _require(key not in seen, "Duplicate or conflicting native repeated alias pointer")
         seen.add(key)
         _require(artifact_ref(parent) == locator["parent"], "Native repeated alias parent bytes changed during observation")
-        observations.append({"parent": locator["parent"], "pointer": expression, "edge": edge,
+        observations.append({"parent_role": parent_role, "parent": locator["parent"], "pointer": expression, "edge": edge,
                              "authority_request": locator["authority_request"], "library_index": index,
                              "declared_reference": value, "library_identity": library,
                              "claim_status": "UNVERIFIED", "execution_status": "UNVERIFIED", "history_supported": False,
