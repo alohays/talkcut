@@ -137,7 +137,10 @@ def _partition(
     for child in children:
         boundaries.update(_span(child["input_interval"]))
         for item in child["segments"]:
-            boundaries.update((as_fraction(item["start"]), as_fraction(item["end"])))
+            start, end = _span(child["input_interval"])
+            left, right = max(start, as_fraction(item["start"])), min(end, as_fraction(item["end"]))
+            if left < right:
+                boundaries.update((left, right))
     result = []
     for left, right in pairwise(sorted(boundaries)):
         covering = [
@@ -356,11 +359,20 @@ def verify_context_collection(
         actual_inputs = union_intervals(
             [_span(item["interval"]) for item in request["inputs"]]
         )
-        _require(
-            len(actual_inputs) == 1 and actual_inputs[0] in grid,
-            "Child actual input differs from a complete required window",
-        )
-        window = actual_inputs[0]
+        _require(len(actual_inputs) == 1, "Child must contain one complete actual input")
+        observed_window = actual_inputs[0]
+        window = observed_window
+        if request.get("source_window") is not None:
+            from .source_window import verify_source_window
+
+            expansion = verify_source_window(request["source_window"],
+                source=request["inputs"][0]["parent_media"], domain=[str(x) for x in measured])
+            _require(expansion["source"]["sha256"] == source_sha256
+                     and _span(expansion["observed_interval"]) == observed_window,
+                     "Expanded actual source/window differs")
+            window = _span(expansion["requested_interval"])
+        _require(window in grid and observed_window[0] <= window[0] < window[1] <= observed_window[1],
+                 "Child requested input differs from a complete required window")
         _require(
             window not in consumed_windows,
             "Repeated source window cannot replace a missing window",
@@ -392,7 +404,7 @@ def verify_context_collection(
         for item in segments:
             span = _span([item["start"], item["end"]])
             _require(
-                window[0] <= span[0] < span[1] <= window[1]
+                observed_window[0] <= span[0] < span[1] <= observed_window[1]
                 and item.get("kind") in CONTEXT_KINDS
                 and isinstance(item.get("reason"), str)
                 and item["reason"].strip()
@@ -403,7 +415,7 @@ def verify_context_collection(
                 _artifact(evidence, binary=True)
             observed.append(span)
         _require(
-            not _uncovered(window, observed),
+            not _uncovered(observed_window, observed),
             "Child actual observations omit part of submitted audio/video",
         )
         proposer = {
@@ -422,7 +434,9 @@ def verify_context_collection(
             {
                 "context": ref,
                 "input_interval": [str(x) for x in window],
-                "observed_intervals": _strings(union_intervals(observed)),
+                "observed_intervals": _strings(union_intervals([(max(a, window[0]), min(b, window[1]))
+                    for a, b in observed if max(a, window[0]) < min(b, window[1])])),
+                "actual_observed_input_interval": [str(x) for x in observed_window],
                 "input_clips": context["input_clips"],
                 "proposer": proposer,
                 "execution_ids": sorted(actual_ids),

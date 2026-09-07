@@ -556,6 +556,21 @@ def validate_review_request(
         )
         decimal = lambda value: f"{float(value):.12f}"
         graph = f"[0:v:0]trim=start={decimal(native_video[0])}:end={decimal(native_video[1])},setpts=PTS-({decimal(native_video[0])})/TB[v];[{audio_index}]atrim=start={decimal(native_audio[0])}:end={decimal(native_audio[1])},asetpts=PTS-({decimal(native_audio[0])})/TB[a]"
+        source_window = extraction.get("source_window")
+        _require(
+            item.get("source_window") == source_window == request.get("source_window"),
+            "Source-window extraction/request binding differs",
+        )
+        if source_window is not None:
+            from .source_window import filtergraph, verify_source_window
+
+            _require(request.get("scope") == "analysis" and len(request["inputs"]) == 1
+                     and alternate_audio is None and shift == 0,
+                     "Source-window mode is restricted to one unshifted source-analysis input")
+            window_value = verify_source_window(source_window, source=parent)
+            _require(window_value["observed_interval"] == [str(x) for x in clip_interval],
+                     "Source-window observed interval differs from actual clip")
+            graph = filtergraph(window_value)
         command = extraction.get("command", [])
         _require(
             extraction.get("filtergraph") == graph
@@ -593,6 +608,7 @@ def validate_review_request(
                 Path(temporary) / "clip",
                 deps,
                 audio_source=alternate_audio,
+                source_window=source_window,
             )
             _require(
                 reconstructed["clip"]["sha256"] == item["clip"]["sha256"],
@@ -619,6 +635,7 @@ def _clip(
     *,
     audio_source: dict[str, Any] | None = None,
     timeout: float = 3600,
+    source_window: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     source_path = _artifact(source, binary=True)
     left, right = interval
@@ -634,8 +651,16 @@ def _clip(
         "Source review clock origin/offset is unverified",
     )
     video_left, video_right = left + video_shift, right + video_shift
-    clip_path = directory / "clip.mp4"
-    partial = directory / "clip.partial.mp4"
+    window_value = None
+    if source_window is not None:
+        from .source_window import verify_source_window
+
+        _require(video_shift == 0 and audio_source is None, "Source-window mode requires the unshifted original AV source")
+        window_value = verify_source_window(source_window, source=artifact_ref(source_path))
+        _require(window_value["observed_interval"] == [str(left), str(right)], "Actual source-window expansion interval differs")
+    suffix = "mov" if window_value is not None else "mp4"
+    clip_path = directory / f"clip.{suffix}"
+    partial = directory / f"clip.partial.{suffix}"
     log = directory / "ffmpeg.log"
     directory.mkdir(parents=True)
     command = [
@@ -675,6 +700,10 @@ def _clip(
     # the request preserves exact source/output times and clip durations.
     decimal = lambda value: f"{float(value):.12f}"
     graph = f"[0:v:0]trim=start={decimal(video_left)}:end={decimal(video_right)},setpts=PTS-({decimal(video_left)})/TB[v];[{audio_index}]atrim=start={decimal(audio_left)}:end={decimal(audio_right)},asetpts=PTS-({decimal(audio_left)})/TB[a]"
+    if window_value is not None:
+        from .source_window import filtergraph
+
+        graph = filtergraph(window_value)
     command += [
         "-filter_complex",
         graph,
@@ -693,9 +722,8 @@ def _clip(
         "-enc_time_base:v",
         "filter",
         "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
+        "pcm_s16le" if window_value is not None else "aac",
+        *( ["-ac", "1", "-ar", "16000"] if window_value is not None else ["-b:a", "192k"] ),
         # Keep packets until both streams are available. With sparse video,
         # the default timeout can interleave identical encoded packets in a
         # different order across runs, breaking exact clip reconstruction.
@@ -773,6 +801,7 @@ def _clip(
             "video_native_interval": [str(video_left), str(video_right)],
             "audio_native_interval": [str(audio_left), str(audio_right)],
             "filtergraph": graph,
+            **({"source_window": source_window} if source_window is not None else {}),
         }
         atomic_json(directory / "receipt.json", receipt)
         return {
@@ -783,6 +812,7 @@ def _clip(
             "input_modalities": ["audio", "video"],
             "streams": streams,
             "extraction_receipt": artifact_ref(directory / "receipt.json"),
+            **({"source_window": source_window} if source_window is not None else {}),
             "selected_audio_sha256": audio_source["sha256"]
             if audio_source
             else source["sha256"],
