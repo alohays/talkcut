@@ -13,6 +13,7 @@ import gzip
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -28,7 +29,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import quote
 
-from .contracts import code_identity
+from .contracts import code_identity, object_hash
 from .project import TalkCutError, artifact_ref, load_project, sha256
 from .verification import _terminate_group
 
@@ -567,6 +568,17 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
     digests = set(registered.values())
     media_suffixes = {".mp4", ".mov", ".webm", ".mkv", ".wav", ".mp3", ".aac", ".m4a", ".flac", ".png", ".jpg", ".jpeg"}
     rank = {"review": 0, "transcript": 1, "media": 2}
+    failed_measurements = []
+    for path in sorted((directory / "measurements").glob("measurement-*/stdout.json")):
+        _require(path.is_file() and not path.is_symlink() and path.stat().st_size <= MAX_UNIT_BYTES,
+                 "Measurement stdout is missing, linked or oversized")
+        try:
+            value = json.loads(path.read_bytes())
+        except (ValueError, UnicodeDecodeError):
+            continue  # Existing pending/malformed bookkeeping still has its own gate.
+        if isinstance(value, dict) and value.get("schema_version") == "talkcut-error/v1":
+            failed_measurements.append(_failed_cli_measurement(path, directory))
+    failed_run_paths = {row["artifacts"]["run.json"]["path"] for row in failed_measurements}
 
     def explicit_transcript(value: Any) -> bool:
         return (isinstance(value, dict) and value.get("schema_version") == "transcript/v1"
@@ -606,7 +618,10 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
                 phrases.update(line for line in body.splitlines() if len(line.strip()) >= 40)
         else:
             if protect or explicit_transcript(value):
-                protect_values(value)
+                # Only this closed run's exact public CLI boilerplate is
+                # excluded; its error stdout and all other strings stay private.
+                protect_values({key: child for key, child in value.items() if key != "reason"}
+                               if str(path) in failed_run_paths else value)
             if str(path) not in json_scheduled and (protect or parse_json or path.suffix.lower() == ".json"):
                 pending.append((path, refs[str(path)]["kind"]))
                 json_scheduled.add(str(path))
@@ -914,6 +929,11 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         add(old_path, "review", expected, parse_json=True)
         inspect_text(path, True, parse_json=True)
         inspect_text(old_path, True, parse_json=True)
+    for observation in failed_measurements:
+        _require(not any(ref["sha256"] in digests for ref in observation["artifacts"].values()),
+                 "Protected source identity cannot become failed CLI metadata")
+        for ref in observation["artifacts"].values():
+            add(Path(ref["path"]), "review", ref["sha256"], parse_json=True)
     for value in project["sources"].values():
         add(Path(value["path"]), "media", value["sha256"])
         add(Path(value["original_path"]), "media", value["sha256"])
@@ -956,6 +976,9 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         # from the provenance of files it references. Only an explicit,
         # source-bound transcript marker propagates across artifact edges.
         walk(value, origin_path=path)
+    _require(failed_measurements == [_failed_cli_measurement(Path(row["artifacts"]["stdout.json"]["path"]), directory)
+                                     for row in failed_measurements],
+             "Failed CLI measurement bytes changed during inventory")
     _require(current_tree_observations == _auxiliary_source_tree_inventory(auxiliary_source_trees, directory, repo_root, digests)
              and historical_tree_observations == _auxiliary_historical_source_tree_inventory(auxiliary_historical_source_trees, directory, repo_root, digests),
              "Auxiliary current/historical source tree origin, copies or bytes changed during inventory")
@@ -997,6 +1020,7 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
     return known, sorted(phrases), {"completeness": "UNVERIFIED", "project": str(directory), "source_hashes": registered,
         "known_refs": list(refs.values()), "known_ref_count": len(refs), "derived_phrase_count": len(phrases),
         "unfollowed_refs": unfollowed,
+        "failed_cli_measurement_observations": failed_measurements,
         "historical_refs": list(historical_refs.values()),
         "auxiliary_metadata_history": list(auxiliary_observations.values()),
         "auxiliary_execution_sources": auxiliary_source_current,
@@ -1042,6 +1066,116 @@ def _private_bookkeeping_payload(name: str, data: bytes, *, directory: Path | No
                  "Historical project is not a preserved revision of the current decision chain")
 
 
+def _failed_cli_measurement(path: Path, directory: Path) -> dict[str, Any]:
+    """Observe one closed failed worker record; this does not prove execution."""
+    folder = path.parent
+    _require(directory == directory.resolve() and folder.parent == directory / "measurements"
+             and re.fullmatch(r"measurement-[a-f0-9]{32}", folder.name)
+             and path.name in {"stdout.json", "stderr.log", "execution.json", "receipt.json", "run.json"},
+             "Failed CLI measurement has a different task/run scope")
+    names = ("stdout.json", "stderr.log", "execution.json", "receipt.json", "run.json")
+    identities: dict[str, tuple[int, ...]] = {}
+    refs: dict[str, dict[str, str]] = {}
+    bodies: dict[str, Any] = {}
+
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, child in pairs:
+            _require(key not in value, "Failed CLI measurement has duplicate JSON keys")
+            value[key] = child
+        return value
+
+    def nonfinite(value: str) -> Any:
+        raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Failed CLI measurement has nonfinite JSON")
+
+    for name in names:
+        selected = folder / name
+        _require(selected == selected.resolve() and selected.is_file() and not selected.is_symlink()
+                 and selected.stat().st_size <= MAX_UNIT_BYTES,
+                 "Failed CLI measurement artifact is missing, linked or oversized")
+        identities[name] = _source_file_identity(selected.stat())
+        data = selected.read_bytes()
+        refs[name] = {"path": str(selected), "sha256": hashlib.sha256(data).hexdigest()}
+        if name == "stderr.log":
+            data.decode("utf-8")
+        else:
+            bodies[name] = json.loads(data, object_pairs_hook=unique, parse_constant=nonfinite)
+            _require(isinstance(bodies[name], dict), "Failed CLI measurement requires JSON objects")
+    _require(not (folder / "evidence.json").exists() and not (folder / "evidence.json").is_symlink(),
+             "Failed CLI measurement cannot carry measurement evidence")
+    output, run, receipt, log = (bodies[name] for name in ("stdout.json", "run.json", "receipt.json", "execution.json"))
+    cancelled = output == {"schema_version": "talkcut-error/v1", "status": "FAIL", "code": "CANCELLED"}
+    _require(cancelled or (set(output) == {"schema_version", "status", "code", "message", "retryable", "manifest_path"}
+             and output["schema_version"] == "talkcut-error/v1" and output["status"] == "FAIL"
+             and isinstance(output["code"], str) and bool(output["code"])
+             and isinstance(output["message"], str) and output["retryable"] is False
+             and output["manifest_path"] is None), "Unsupported failed CLI error payload")
+    exit_code = 130 if cancelled else 2
+    _require(set(run) == {"schema_version", "status", "interrupted", "run_id", "receipt", "evidence", "measurements",
+                          "acceptance_status", "owner_acceptance", "reason"}
+             and run["schema_version"] == "measurement-run/v1" and run["status"] == "FAIL"
+             and run["interrupted"] is False and run["run_id"] == folder.name and run["receipt"] == refs["receipt.json"]
+             and run["evidence"] is None and run["measurements"] is None
+             and run["acceptance_status"] == "UNVERIFIED" and run["owner_acceptance"] == "pending"
+             and run["reason"] == "Run acceptance evaluate to verify the complete frozen contract; measurement execution is not readiness",
+             "Failed CLI run claims success or changes its exact private scope")
+    _require(set(receipt) == {"schema_version", "run_id", "operation", "executor", "tool_version", "command", "started_at",
+                              "finished_at", "completed", "exit_code", "log", "stdout", "stderr", "result",
+                              "input_artifacts", "dependencies", "owner_acceptance"}
+             and receipt["schema_version"] == "execution-receipt/v1" and receipt["run_id"] == folder.name
+             and receipt["completed"] is False and type(receipt["exit_code"]) is int and receipt["exit_code"] == exit_code
+             and receipt["dependencies"] == {} and receipt["owner_acceptance"] == "pending"
+             and receipt["log"] == refs["execution.json"] and receipt["stdout"] == receipt["result"] == refs["stdout.json"]
+             and receipt["stderr"] == refs["stderr.log"], "Failed CLI receipt is rebound or claims completed evidence")
+    command = receipt["command"]
+    _require(isinstance(command, list) and len(command) == 13 and all(isinstance(item, str) and item for item in command)
+             and command[1:6] == ["-m", "talkcut", "acceptance", "measure-worker", str(directory)]
+             and command[6] == "--check" and command[8] == "--input" and command[10] == "--contract" and command[12] == "--json"
+             and receipt["executor"] == command[0] and Path(command[0]).is_absolute()
+             and receipt["operation"] == "check:" + command[7]
+             and isinstance(receipt["tool_version"], str) and receipt["tool_version"].startswith("talkcut ")
+             and Path(command[9]).is_absolute() and str(Path(command[9]).resolve()) == command[9]
+             and Path(command[11]).is_absolute() and str(Path(command[11]).resolve()) == command[11],
+             "Failed CLI command is outside the exact measurement worker scope")
+    inputs = receipt["input_artifacts"]
+    _require(isinstance(inputs, list) and len(inputs) == 1 and isinstance(inputs[0], dict)
+             and set(inputs[0]) == {"path", "sha256"} and inputs[0]["path"] == command[9],
+             "Failed CLI input reference differs from its command")
+    input_path = _file(inputs[0])
+    _require(input_path == input_path.resolve() and input_path not in [folder / name for name in names],
+             "Failed CLI input aliases its bookkeeping")
+    input_identity = _source_file_identity(input_path.stat())
+    _require(set(log) == {"command", "cwd", "started_at", "finished_at", "wall_seconds", "exit_code", "failure",
+                          "before", "after", "stdout", "stderr"}
+             and log["command"] == command and isinstance(log["cwd"], str) and Path(log["cwd"]).is_absolute()
+             and str(Path(log["cwd"]).resolve()) == log["cwd"] and log["failure"] is None
+             and type(log["exit_code"]) is int and log["exit_code"] == exit_code
+             and log["stdout"] == refs["stdout.json"] and log["stderr"] == refs["stderr.log"]
+             and type(log["wall_seconds"]) in {int, float} and math.isfinite(log["wall_seconds"]) and log["wall_seconds"] >= 0
+             and all(isinstance(log[key], str) and bool(log[key]) and log[key] == receipt[key]
+                     for key in ("started_at", "finished_at")), "Failed CLI log changes its exact recorded scope")
+    for key in ("before", "after"):
+        identity = log[key]
+        _require(isinstance(identity, dict) and set(identity) == {"code_revision", "code_tree_hash", "files"}
+                 and (identity["code_revision"] is None or (isinstance(identity["code_revision"], str)
+                      and re.fullmatch(r"[a-f0-9]{40,64}", identity["code_revision"])))
+                 and isinstance(identity["files"], dict)
+                 and all(isinstance(name, str) and name and not Path(name).is_absolute() and ".." not in Path(name).parts
+                         and isinstance(digest, str) and re.fullmatch(r"[a-f0-9]{64}", digest)
+                         for name, digest in identity["files"].items())
+                 and identity["code_tree_hash"] == object_hash(identity["files"]),
+                 "Failed CLI recorded code identity is malformed")
+    for name in names:
+        selected = folder / name
+        _require(_source_file_identity(selected.stat()) == identities[name] and artifact_ref(selected) == refs[name],
+                 "Failed CLI measurement changed during observation")
+    _require(_source_file_identity(input_path.stat()) == input_identity and artifact_ref(input_path) == inputs[0],
+             "Failed CLI input changed during observation")
+    return {"kind": "review", "state": "private_failed_cli_measurement", "claim_status": "UNVERIFIED",
+            "scope": "Current failed worker bookkeeping bytes only; no execution, history, measurement or acceptance approval",
+            "reported_exit_code": exit_code, "artifacts": refs, "input_artifacts": inputs}
+
+
 def _bookkeeping(path: Path, directory: Path, *, referenced_input: bool = False) -> dict[str, Any] | None:
     """Recognize bounded private measurement/index bytes; never certify their claims."""
     try:
@@ -1080,6 +1214,8 @@ def _bookkeeping(path: Path, directory: Path, *, referenced_input: bool = False)
     if index:
         _private_bookkeeping_payload(relative.as_posix(), data, directory=directory)
         return {"kind": "review", "state": states[relative.as_posix()]}
+    if path.name == "stdout.json" and value.get("schema_version") == "talkcut-error/v1":
+        return _failed_cli_measurement(path, directory)
     schemas = {"stdout.json": "measurement-result/v1", "receipt.json": "execution-receipt/v1",
                "evidence.json": "measurement-check/v1", "run.json": "measurement-run/v1"}
     if path.name == "execution.json":
