@@ -74,6 +74,9 @@
     },
     "owner_acceptance": {
       "const": "pending"
+    },
+    "editorial": {
+      "$ref": "#/$defs/ref"
     }
   },
   "additionalProperties": false,

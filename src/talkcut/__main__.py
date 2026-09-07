@@ -135,6 +135,23 @@ def parser_for_cli() -> argparse.ArgumentParser:
         render.add_argument("--preset", default="medium")
         render.add_argument("--crf", type=int, default=18)
         render.add_argument("--json", action="store_true")
+    editorial = commands.add_parser(
+        "editorial",
+        help="Bind immutable original analysis and current reviewed edit decisions",
+    )
+    editorials = editorial.add_subparsers(dest="action", required=True)
+    prepare = editorials.add_parser("prepare")
+    prepare.add_argument("project", type=Path)
+    prepare.add_argument("--json", action="store_true")
+    for binding in (
+        editorials.add_parser("bind"),
+        commands.add_parser("editorial-worker"),
+    ):
+        binding.add_argument("project", type=Path)
+        binding.add_argument("--snapshot", type=Path, required=True)
+        binding.add_argument("--review-import", type=Path, action="append", default=[])
+        binding.add_argument("--no-safe-cuts-audit", type=Path)
+        binding.add_argument("--json", action="store_true")
     qc = commands.add_parser(
         "qc", help="Re-decode and compare output to the active timeline"
     )
@@ -347,6 +364,22 @@ def execute(args: argparse.Namespace) -> tuple[dict, int]:
         return render_project(
             args.project, args.profile, preset=args.preset, crf=args.crf
         ), 0
+    if args.command in {"editorial", "editorial-worker"}:
+        from .editorial_binding import prepare_editorial, verify_editorial_inputs
+        from .editorial_execution import run_editorial
+
+        if args.command == "editorial" and args.action == "prepare":
+            return prepare_editorial(args.project, Path.cwd()), 0
+        arguments = (
+            args.project,
+            artifact_ref(args.snapshot),
+            [artifact_ref(path) for path in args.review_import],
+            artifact_ref(args.no_safe_cuts_audit) if args.no_safe_cuts_audit else None,
+            Path.cwd(),
+        )
+        if args.command == "editorial-worker":
+            return verify_editorial_inputs(*arguments), 0
+        return run_editorial(*arguments)
     if args.command == "qc":
         if args.compare_source:
             from .workflow import compare_source

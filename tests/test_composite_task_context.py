@@ -1,6 +1,6 @@
 """Synthetic task-context/decision controls, never executed AI or AV approval.
 
-Only the explicit candidate-consumer cases isolate verify_imported_review;
+Only the explicit candidate-consumer cases isolate upstream provider gates;
 all context, exact-time and CLI metadata checks exercise production functions.
 """
 
@@ -502,6 +502,29 @@ def isolated_proof(tmp_path, monkeypatch):
         "protected_intervals": [],
         "candidates": [candidate],
     }
+    def synthetic_artifact(name, value):
+        path = tmp_path / name
+        path.write_text(json.dumps(value))
+        return artifact_ref(path)
+
+    # Real upstream proof is tested separately. These explicit synthetic gates
+    # let each case reach the intended downstream response/context predicate.
+    provider_request = synthetic_artifact("provider-request.json", {"test_only": True})
+    proposal_receipt = synthetic_artifact("proposal.json", {
+        "run_id": "synthetic-proposer", "test_only": True,
+        "request": provider_request, "response": provider_request,
+    })
+    review_receipt = synthetic_artifact("review.json", {
+        "run_id": "synthetic-review", "test_only": True, "prompt_sha256": "b" * 64,
+        "request": provider_request, "response": provider_request,
+    })
+    analysis = {
+        "candidates": [candidate], "proposer_run_id": "synthetic-proposer", "prompt_sha256": "a" * 64,
+        "context": {"receipt": proposal_receipt}, "test_only": True,
+    }
+    plan["analysis_ref"] = synthetic_artifact("analysis.json", analysis)
+    monkeypatch.setattr("talkcut.analysis.verify_analysis_report", lambda ref, current: analysis)
+    monkeypatch.setattr("talkcut.review._receipt", lambda ref: json.loads(Path(ref["path"]).read_text()))
     req["dependencies"] = {
         "source_hashes": plan["source_hashes"],
         "plan_hash": content_hash(plan),
@@ -512,10 +535,11 @@ def isolated_proof(tmp_path, monkeypatch):
         "import": {"artifact_ref": {"path": "synthetic", "sha256": "synthetic"}},
         "record": {
             "proposer_run_id": "synthetic-proposer",
-            "receipt": {"path": "synthetic", "sha256": "synthetic"},
+            "receipt": review_receipt,
+            "proposer_prompt_sha256": "a" * 64,
         },
         "request": req,
-        "receipt": {"run_id": "synthetic-review"},
+        "receipt": json.loads(Path(review_receipt["path"]).read_text()),
         "response": {
             "candidate_id": "candidate-independent",
             "candidate_decision": "approve_deletion",

@@ -273,6 +273,44 @@ def analyze_project(
             "source_analysis",
             {"analysis": ref},
         )
+        # Preserve the original proposal artifact. Final decisions live in the
+        # immutable active plan and require a new editorial command binding.
+        index_path = directory / "acceptance.local.json"
+        index = (
+            read_json(index_path)
+            if index_path.exists()
+            else {
+                "schema_version": "acceptance-index/v1",
+                "checks": {},
+                "reviews": [],
+                "capabilities": [],
+                "findings": [],
+                "owner_acceptance": "pending",
+            }
+        )
+        if (
+            index.get("schema_version") != "acceptance-index/v1"
+            or index.get("owner_acceptance", "pending") != "pending"
+        ):
+            raise TalkCutError("INDEX_INVALID", "Existing acceptance index is invalid")
+        index["owner_acceptance"] = "pending"
+        if index_path.exists():
+            previous = artifact_ref(index_path)
+            backup = (
+                directory / "evidence" / "index-history" / f"{previous['sha256']}.json"
+            )
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            if not backup.exists():
+                with backup.open("xb") as handle:
+                    handle.write(index_path.read_bytes())
+            if sha256(backup) != previous["sha256"]:
+                raise TalkCutError(
+                    "INDEX_CHANGED", "Previous acceptance index backup differs"
+                )
+        index["analysis"] = ref
+        index.pop("editorial", None)
+        index.pop("edit_disposition", None)
+        atomic_json(index_path, index)
         return {
             "schema_version": "analysis-operation/v1",
             "status": result["status"],

@@ -1470,140 +1470,48 @@ class Evaluator:
         return self.coverage
 
     def analysis_check(self) -> dict[str, Any]:
-        from .context_collection import proposer_ids, proposer_prompts
+        from .editorial_binding import verify_editorial_binding
 
         analysis = self.artifact(self.index.get("analysis"))
         self.analysis = analysis
-        collection = (
-            (analysis.get("context") or {}).get("schema_version")
-            == "lecture-context-collection/v1"
+        binding = self.artifact(self.index.get("editorial"))
+        verified = verify_editorial_binding(
+            self.index["editorial"], self.project, self.repo
         )
-        if collection:
-            from .analysis import verify_analysis_report
-            from .project import load_project
-
-            self.dependencies(
-                analysis, ["source_hashes", "code_tree_hash", "contract_hash"]
-            )
-            project = load_project(self.project)
-            plan = self.artifact(project.get("active_plan"))
-            self.require(
-                plan.get("analysis_ref") == self.index.get("analysis"),
-                "Current plan does not bind this original collection analysis",
-                "UNVERIFIED",
-            )
-            regenerated = verify_analysis_report(self.index["analysis"], plan)
-            self.require(
-                regenerated["status"] == "ANALYZED",
-                "Collection source context is incomplete",
-                "UNVERIFIED",
-            )
-            # The collection has no aggregate provider receipt. Every original
-            # child receipt/input/response was revalidated by the recomputation.
-            self.require(
-                not analysis.get("receipt"),
-                "Collection cannot claim an aggregate provider receipt",
-            )
-        else:
-            self.dependencies(analysis)
-            self.receipt(analysis.get("receipt"))
+        self.dependencies(verified)
+        # This is a captured local command receipt, not an aggregate provider.
+        # verify_editorial_binding replays the original single/collection child
+        # executions and every separate current candidate-specific AV review.
+        self.receipt(binding.get("receipt"))
         self.require(
-            analysis.get("schema_version") == "source-analysis/v1"
-            and analysis.get("source_kind") == "real",
-            "Actual full-source analysis unavailable",
+            verified["analysis"] == self.index["analysis"]
+            and verified["timeline"] == self.index.get("timeline")
+            and verified["output"] == self.render.get("output"),
+            "Editorial binding differs from the indexed analysis/timeline/output",
             "UNVERIFIED",
         )
         self.require(
-            proposer_ids(analysis) and proposer_prompts(analysis),
-            "Proposal provenance unavailable",
-            "UNVERIFIED",
+            verified["actual_deletions"] == serialized(self.deletions),
+            "Editorial effective cuts differ from the evaluated retained timeline",
         )
         self.require(
-            self.source_domain is not None, "Source domain unavailable", "UNVERIFIED"
-        )
-        assert self.source_domain is not None
-        spans = [
-            (rational(item["start"]), rational(item["end"]))
-            for item in analysis.get("segments", [])
-            if item.get("reason")
-            and item.get("action") in ("keep", "candidate", "protect")
-        ]
-        self.require(
-            not difference([self.source_domain], spans),
-            "Analysis omits source or lacks reasons",
+            all(
+                any(review["ref"] == ref for review in self.valid_reviews)
+                for ref in verified["review_records"]
+            ),
+            "Editorial binding cites audiovisual evidence missing from current valid reviews",
             "UNVERIFIED",
         )
-        protected = [
-            (rational(item["start"]), rational(item["end"]))
-            for item in analysis.get("protected", [])
-        ]
-        for left, right in self.deletions:
-            self.require(
-                all(right <= a or left >= b for a, b in protected),
-                "An actual deletion invades a protected learning activity",
-            )
-            decisions = [
-                item
-                for item in analysis.get("candidates", [])
-                if rational(item["start"]) <= left and rational(item["end"]) >= right
-            ]
-            self.require(
-                bool(decisions),
-                "Actual deleted source has no candidate evidence/decision",
-            )
-            for decision in decisions:
-                self.require(
-                    decision.get("decision") == "apply"
-                    and decision.get("actor_role") == "workflow_executor"
-                    and decision.get("reason"),
-                    "Actual cut has no authorized reasoned decision",
-                )
-                self.require(
-                    decision.get("kind") in ("preparation", "silence", "disfluency")
-                    and decision.get("ai_review_ref"),
-                    "Cut lacks required separate AI review",
-                    "UNVERIFIED",
-                )
-                self.require(
-                    any(
-                        review["ref"]["sha256"] == decision["ai_review_ref"]["sha256"]
-                        and review["scope"] == "deletion"
-                        for review in self.valid_reviews
-                    ),
-                    "Cut decision cites invalid/unexecuted review",
-                    "UNVERIFIED",
-                )
-        disposition = self.index.get("edit_disposition")
-        if self.deletions:
-            self.require(
-                disposition == "EDITED", "Edited output disposition is incorrect"
-            )
-        else:
-            self.require(
-                disposition == "NO_SAFE_CUTS_VERIFIED",
-                "Composition-only/analysis-unavailable is not verified editing",
-                "UNVERIFIED",
-            )
-            audit = self.artifact(analysis.get("no_safe_cuts_audit"))
-            self.dependencies(audit)
-            self.require(
-                audit.get("reviewer_run_id") not in proposer_ids(analysis)
-                and audit.get("reviewer_run_id"),
-                "No-safe-cuts requires a separate audit",
-                "UNVERIFIED",
-            )
-            self.receipt(audit.get("receipt"), provider=True)
-            self.require(
-                audit.get("all_candidates_reviewed") is True
-                and audit.get("no_safe_cuts_reason")
-                and audit.get("analysis_available") is True,
-                "No-safe-cuts exception is unsubstantiated",
-                "UNVERIFIED",
-            )
+        disposition = verified["edit_disposition"]
+        self.require(
+            self.index.get("edit_disposition") == disposition,
+            "Indexed edit disposition differs from the actual compiled cuts",
+            "UNVERIFIED",
+        )
         return {
-            "segments": len(spans),
-            "candidates": len(analysis.get("candidates", [])),
-            "protected": len(protected),
+            "segments": verified["segment_count"],
+            "candidates": verified["candidate_count"],
+            "protected": verified["protected_count"],
             "disposition": disposition,
         }
 
@@ -1630,7 +1538,14 @@ class Evaluator:
             self.artifact(ref, json_value=False)
         required_refs = [
             self.index.get(name)
-            for name in ("registration", "timeline", "render", "analysis", "handoff")
+            for name in (
+                "registration",
+                "timeline",
+                "render",
+                "analysis",
+                "editorial",
+                "handoff",
+            )
         ]
         required_refs += (
             list(self.index.get("checks", {}).values())

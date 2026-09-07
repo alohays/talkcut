@@ -1141,37 +1141,10 @@ def authorize_candidate_review(
     An old import's PASS is never trusted. Revalidation preserves a new receipt
     while the original provider request and response remain immutable.
     """
+    from .analysis import verify_analysis_report
     from .context_collection import _execution_evidence, proposer_ids, proposer_prompts
     from .contracts import code_identity
 
-    if "proposer_run_ids" in candidate:
-        from .analysis import verify_analysis_report
-
-        regenerated = verify_analysis_report(plan.get("analysis_ref", {}), plan)
-        original = next(
-            (
-                item
-                for item in regenerated["candidates"]
-                if item["id"] == candidate.get("id")
-            ),
-            None,
-        )
-        _require(
-            original is not None
-            and all(
-                original.get(key) == candidate.get(key)
-                for key in (
-                    "start",
-                    "end",
-                    "kind",
-                    "proposer_run_id",
-                    "proposer_run_ids",
-                    "proposer_prompt_sha256s",
-                    "proposers",
-                )
-            ),
-            "Candidate proposal contributors differ from actual collection",
-        )
     proof = verify_imported_review(import_ref)
     _require(
         not plan.get("test_only") and not candidate.get("test_only"),
@@ -1198,22 +1171,6 @@ def authorize_candidate_review(
         and execution["run_id"] not in proposer_ids(candidate),
         "Review is not separate from this candidate's actual proposal",
     )
-    if "proposer_run_ids" in candidate:
-        _require(
-            proposer_prompts(record) == proposer_prompts(candidate)
-            and execution["prompt_sha256"] not in proposer_prompts(candidate),
-            "Review prompt separation differs from original proposal instructions",
-        )
-        review_ids, _ = _execution_evidence(record["receipt"], execution)
-        proposal_ids = {
-            run_id
-            for proposer in candidate["proposers"]
-            for run_id in proposer["execution_ids"]
-        }
-        _require(
-            not (review_ids & proposal_ids),
-            "Review reuses a component of the original source proposal",
-        )
     deps = request.get("dependencies", {})
     _require(
         deps.get("source_hashes") == plan.get("source_hashes")
@@ -1234,6 +1191,63 @@ def authorize_candidate_review(
     _require(
         contract_hash and deps.get("contract_hash") == contract_hash,
         "Review contract differs from current frozen plan contract",
+    )
+    regenerated = verify_analysis_report(plan.get("analysis_ref", {}), plan)
+    original = next(
+        (
+            item
+            for item in regenerated["candidates"]
+            if item["id"] == candidate.get("id")
+        ),
+        None,
+    )
+    if original is None:
+        raise TalkCutError(
+            "REVIEW_UNVERIFIED", "Candidate is absent from original verified analysis"
+        )
+    _require(
+        all(
+            original.get(key) == candidate.get(key)
+            for key in (
+                "start",
+                "end",
+                "kind",
+                "proposer_run_id",
+                "proposer_run_ids",
+                "proposer_prompt_sha256s",
+                "proposers",
+            )
+        ),
+        "Candidate proposal contributors differ from original verified analysis",
+    )
+    if "proposer_run_ids" in candidate:
+        expected_prompts = proposer_prompts(original)
+        proposal_ids = {
+            run_id
+            for proposer in original["proposers"]
+            for run_id in proposer["execution_ids"]
+        }
+    else:
+        # Single-context candidates do not duplicate the proposal prompt. Bind
+        # it to the unchanged original analysis from that same sole execution.
+        _require(
+            len(proposer_ids(regenerated)) == 1
+            and proposer_ids(original) == proposer_ids(regenerated),
+            "Single candidate lacks one matching original proposal execution",
+        )
+        expected_prompts = proposer_prompts(regenerated)
+        proposal_ref = regenerated["context"]["receipt"]
+        proposal_ids, _ = _execution_evidence(proposal_ref, _receipt(proposal_ref))
+    _require(
+        expected_prompts
+        and proposer_prompts(record) == expected_prompts
+        and execution["prompt_sha256"] not in expected_prompts,
+        "Review prompt separation differs from original proposal instructions",
+    )
+    review_ids, _ = _execution_evidence(record["receipt"], execution)
+    _require(
+        not (review_ids & proposal_ids),
+        "Review reuses a component of the original source proposal",
     )
     inspected = _artifact(plan.get("inspection_refs", {}).get("screen"))
     _require(

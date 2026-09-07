@@ -272,6 +272,24 @@ def test_candidate_authorization_binds_exact_plan_span_and_source(
         "protected_intervals": [],
         "candidates": [candidate],
     }
+    # Explicit upstream provider gates isolate this boundary-binding unit.
+    # These authored receipts are synthetic and cannot certify real media.
+    provider_request = artifact_ref(write(tmp_path, "unit-provider-request.json", {"test_only": True}))
+    proposal_receipt = artifact_ref(write(tmp_path, "unit-proposal.json", {
+        "run_id": "proposal", "test_only": True,
+        "request": provider_request, "response": provider_request,
+    }))
+    review_receipt = artifact_ref(write(tmp_path, "unit-review.json", {
+        "run_id": "review", "test_only": True, "prompt_sha256": "b" * 64,
+        "request": provider_request, "response": provider_request,
+    }))
+    analysis = {
+        "candidates": [candidate], "proposer_run_id": "proposal", "prompt_sha256": "a" * 64,
+        "context": {"receipt": proposal_receipt}, "test_only": True,
+    }
+    plan["analysis_ref"] = artifact_ref(write(tmp_path, "unit-analysis.json", analysis))
+    monkeypatch.setattr("talkcut.analysis.verify_analysis_report", lambda ref, current: analysis)
+    monkeypatch.setattr("talkcut.review._receipt", lambda ref: json.loads(Path(ref["path"]).read_text()))
     request = {
         "scope": "deletion",
         "details": {
@@ -292,10 +310,11 @@ def test_candidate_authorization_binds_exact_plan_span_and_source(
         "import": {"artifact_ref": {"path": "unit-revalidated", "sha256": "unit"}},
         "record": {
             "proposer_run_id": "proposal",
-            "receipt": {"path": "unit", "sha256": "unit"},
+            "receipt": review_receipt,
+            "proposer_prompt_sha256": "a" * 64,
         },
         "request": request,
-        "receipt": {"run_id": "review"},
+        "receipt": json.loads(Path(review_receipt["path"]).read_text()),
         "response": {
             "candidate_id": "candidate-a",
             "candidate_decision": "approve_deletion",
