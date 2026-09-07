@@ -53,9 +53,9 @@ def _session(row: dict[str, Any]) -> None:
         "Registration session is not this host actual canonical Codex log",
     )
     if row.get("origin") == "exec":
-        from .codex_cli_transport import LIMIT, loads, raw
+        from .codex_cli_transport import INTAKE_LIMIT, loads, raw
 
-        require(path.stat().st_size <= LIMIT, "CLI canonical session exceeds bound")
+        require(path.stat().st_size <= INTAKE_LIMIT, "CLI canonical session exceeds bound")
     with path.open("rb") as stream:
         first = stream.readline(1024 * 1024)
     require(
@@ -83,13 +83,13 @@ def _session(row: dict[str, Any]) -> None:
             and capture.get("start_byte") == 0,
             "Registered CLI capture identity/range differs",
         )
-        session = raw(capture.get("session"))
+        session = raw(capture.get("session"), limit=INTAKE_LIMIT)
         require(
             capture.get("end_byte") == len(session)
-            and raw({**capture["session"], "path": str(path)}) == session,
+            and raw({**capture["session"], "path": str(path)}, limit=INTAKE_LIMIT) == session,
             "Registered CLI capture is not the whole current actual session",
         )
-        bootstrap = artifact(row.get("bootstrap_context"))
+        bootstrap = loads(raw(row.get("bootstrap_context")))
         records = [json.loads(line) for line in session.splitlines()]
         require(
             bootstrap
@@ -111,7 +111,7 @@ def _session(row: dict[str, Any]) -> None:
                 isinstance(row.get(key), dict),
                 "Registered CLI execution/preflight artifact missing",
             )
-            artifact(row[key])
+            loads(raw(row[key]))
         return
     spawn = (
         payload.get("source", {}).get("subagent", {}).get("thread_spawn", {})

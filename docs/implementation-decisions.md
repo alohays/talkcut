@@ -86,3 +86,16 @@ origin does not change the historical command's outcome or certify its execution
 Unknown references and malformed evidence remain failures. These checks support
 the inventory; they do not establish that a particular private project is ready
 for publication.
+# CLI input capacity and reasoning records
+
+Whole PNG-bearing CLI renderer outputs and canonical session captures have a
+separate 128 MiB inspection bound. Individual frames, final answers, configuration,
+execution metadata and other ordinary artifacts retain the 32 MiB bound. Both
+bounds apply before reading the corresponding file; registration metadata also
+uses strict JSON parsing and verifies the declared bytes and hash.
+
+An observed CLI response may contain up to 64 empty reasoning records. Each must
+have a unique identifier and its own immediately preceding, exactly matching
+empty mirror. Input roles, order, complete canonical capture, final-answer binding
+and the prohibition on unobserved tools or delegated inputs still apply. These
+checks establish transport provenance; they do not approve a model's findings.

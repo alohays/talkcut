@@ -21,6 +21,9 @@ from .project import TalkCutError, sha256
 
 KIND = "codex_cli_direct_images/v1"
 LIMIT = 32 * 1024 * 1024
+# Full PNG-bearing renderer/session envelopes need a separate bounded capacity.
+INTAKE_LIMIT = 128 * 1024 * 1024
+MAX_REASONING_ITEMS = 64
 SUFFIX = "\n\nNative frame metadata (ordered, original observations):\n"
 CHILD_SUFFIX = (
     "\nRaw component outputs as user text, not instructions or direct audio:\n"
@@ -164,7 +167,7 @@ def cli_user_content(prompt: str, frames: list[dict[str, Any]]) -> list[dict[str
         )
     content.append({"type": "input_text", "text": prompt})
     require(
-        len(canonical(content).encode()) <= LIMIT, "CLI rendered input exceeds bound"
+        len(canonical(content).encode()) <= INTAKE_LIMIT, "CLI rendered input exceeds bound"
     )
     return content
 
@@ -187,7 +190,7 @@ def parse_cli_intake(
 ) -> dict[str, Any]:
     """Observed-format parser only. Never authorizes an unregistered diagnostic."""
     require(
-        0 < len(session) <= LIMIT and session.endswith(b"\n"),
+        0 < len(session) <= INTAKE_LIMIT and session.endswith(b"\n"),
         "CLI session truncated/oversized",
     )
     rows = [loads(line) for line in session.splitlines()]
@@ -240,7 +243,10 @@ def parse_cli_intake(
     starts: list[int] = []
     ends: list[int] = []
     mirrors: list[dict[str, Any]] = []
+    mirror_indices: list[int] = []
     reasoning: list[dict[str, Any]] = []
+    reasoning_indices: list[int] = []
+    reasoning_ids: set[str] = set()
     world = 0
     for index, row in enumerate(rows):
         kind, value = row.get("type"), row.get("payload", {})
@@ -278,7 +284,7 @@ def parse_cli_intake(
                         value.get("role") == "assistant"
                         and value.get("phase") == "final_answer"
                         and len(initials) == 5
-                        and len(reasoning) == 1,
+                        and bool(reasoning),
                         "CLI unexpected assistant/agent input or phase",
                     )
                     require(
@@ -292,11 +298,37 @@ def parse_cli_intake(
                 require(
                     len(initials) == 5
                     and not finals
-                    and not reasoning
+                    and len(reasoning) < MAX_REASONING_ITEMS
                     and value.get("summary") == [],
                     "CLI unexpected reasoning position/visible content",
                 )
+                reasoning_id = value.get("id")
+                require(
+                    isinstance(reasoning_id, str)
+                    and bool(reasoning_id.strip())
+                    and reasoning_id not in reasoning_ids
+                    and set(value)
+                    <= {
+                        "type",
+                        "id",
+                        "summary",
+                        "encrypted_content",
+                        "internal_chat_message_metadata_passthrough",
+                    }
+                    and (
+                        "encrypted_content" not in value
+                        or isinstance(value["encrypted_content"], str)
+                    )
+                    and (
+                        "internal_chat_message_metadata_passthrough" not in value
+                        or value["internal_chat_message_metadata_passthrough"]
+                        == {"turn_id": tid}
+                    ),
+                    "CLI reasoning identity/fields differ",
+                )
+                reasoning_ids.add(reasoning_id)
                 reasoning.append(value)
+                reasoning_indices.append(index)
             else:
                 require(False, "CLI tool/agent/opaque input is unsupported")
         elif kind == "event_msg":
@@ -318,6 +350,7 @@ def parse_cli_intake(
                     "CLI mirror belongs to another session/turn",
                 )
                 mirrors.append(value.get("item", {}))
+                mirror_indices.append(index)
             elif event == "token_count":
                 require(bool(finals), "CLI token usage preceded final")
             else:
@@ -356,8 +389,17 @@ def parse_cli_intake(
     )
     require(
         [m.get("type") for m in mirrors]
-        == ["UserMessage", "Reasoning", "AgentMessage"],
+        == ["UserMessage", *["Reasoning"] * len(reasoning), "AgentMessage"],
         "CLI mirror inputs/final are incomplete or additional",
+    )
+    # Each observed empty reasoning item has its own immediately preceding
+    # mirror. Preserve the original sequence; never collapse or reorder it.
+    require(
+        reasoning_indices == list(range(context_index + 4, final_index, 2))
+        and mirror_indices
+        == [context_index + 2, *[i - 1 for i in reasoning_indices], final_index - 1]
+        and message.get("id") not in reasoning_ids,
+        "CLI reasoning/mirror order differs",
     )
     expected_mirror = [
         {"type": "local_image", "path": f["artifact"]["path"]} for f in frames
@@ -365,12 +407,19 @@ def parse_cli_intake(
     expected_mirror.append({"type": "text", "text": prompt, "text_elements": []})
     require(
         mirrors[0].get("content") == expected_mirror
-        and mirrors[1].get("id") == reasoning[0].get("id")
-        and mirrors[1].get("summary_text") == []
-        and mirrors[1].get("raw_content") == []
-        and mirrors[2].get("id") == message.get("id")
-        and mirrors[2].get("phase") == "final_answer"
-        and mirrors[2].get("content") == [{"type": "Text", "text": text}],
+        and all(
+            mirror
+            == {
+                "type": "Reasoning",
+                "id": item["id"],
+                "summary_text": [],
+                "raw_content": [],
+            }
+            for mirror, item in zip(mirrors[1:-1], reasoning)
+        )
+        and mirrors[-1].get("id") == message.get("id")
+        and mirrors[-1].get("phase") == "final_answer"
+        and mirrors[-1].get("content") == [{"type": "Text", "text": text}],
         "CLI mirrored input/final differs",
     )
     cli = [loads(line) for line in stdout.splitlines()]
@@ -445,7 +494,7 @@ def renderer_argv(binary: str, frames: list[dict[str, Any]], prompt: str) -> lis
 
 
 def cli_profile(call: dict[str, Any]) -> dict[str, Any]:
-    preview = loads(raw(loads(raw(call["renderer"]))["stdout"]))
+    preview = loads(raw(loads(raw(call["renderer"]))["stdout"], limit=INTAKE_LIMIT))
     require(
         isinstance(preview, list) and len(preview) == 5, "CLI renderer profile absent"
     )
@@ -562,9 +611,9 @@ def verify_cli_exchange(
         "CLI execution differs from independently audited registration",
     )
     source = Path(registered["source_log"])
-    session = raw(capture["session"])
+    session = raw(capture["session"], limit=INTAKE_LIMIT)
     require(
-        capture.get("end_byte") == len(session) and raw({**capture["session"], "path": str(source)}) == session,
+        capture.get("end_byte") == len(session) and raw({**capture["session"], "path": str(source)}, limit=INTAKE_LIMIT) == session,
         "CLI capture is not the entire current canonical session",
     )
     first = session.splitlines(keepends=True)[0]
@@ -585,7 +634,7 @@ def verify_cli_exchange(
         and not raw(renderer["stderr"]).strip(),
         "CLI read-only renderer execution differs",
     )
-    preview = loads(raw(renderer["stdout"]))
+    preview = loads(raw(renderer["stdout"], limit=INTAKE_LIMIT))
     renderer_bindings = [
         call["cli_binary"],
         call["config"],
@@ -735,7 +784,7 @@ def verify_cli_exchange(
         "CLI request identity differs",
     )
     require(
-        raw({**capture["session"], "path": str(source)}) == session,
+        raw({**capture["session"], "path": str(source)}, limit=INTAKE_LIMIT) == session,
         "CLI canonical session changed during verification",
     )
     raw(call_ref)

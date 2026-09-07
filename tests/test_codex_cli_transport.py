@@ -647,7 +647,7 @@ def test_exec_registration_bounds_before_full_session_read(tmp_path, monkeypatch
     f = fixture(tmp_path, monkeypatch)
     path = f["log"] if target == "canonical" else Path(f["session_ref"]["path"])
     with path.open("r+b") as stream:
-        stream.truncate(cli.LIMIT + 1)
+        stream.truncate(cli.INTAKE_LIMIT + 1)
     if target == "capture":
         capture = copy.deepcopy(f["capture"])
         capture["session"] = artifact_ref(path)
