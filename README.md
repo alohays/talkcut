@@ -177,6 +177,24 @@ the corresponding `*_checks.py` modules; unrelated success logs and hand-entered
 PASS labels cannot substitute for their source artifacts. `acceptance evaluate`
 recomputes those measurements before applying AC01–AC13.
 
+Provider failure controls require an unchanged, current audiovisual review import
+and its complete source, output, contract and timeline references:
+
+```sh
+uv run --locked python -m talkcut.provider_failure_checks --input PROVIDER_INPUT_JSON --repo . --output projects/provider-controls
+```
+
+The `provider-failure-input/v1` schema is defined in
+`src/talkcut/provider_failure_checks.py`. Its six fixed faults test completion,
+modality, timestamps, empty output and truncation through the production import
+gates, followed by an actual unchanged-positive recovery and byte-conservation
+checks. Timeout and budget cases inject normalized failure outcomes; they do not
+exhaust a provider or account. The controls execute no models, retain labelled
+counterfactuals with zero review coverage, and reject their later promotion.
+Attach the returned run reference as `provider_controls` in the existing
+`failure-input/v1` measurement input. Missing positive evidence leaves these
+controls unverified; synthetic test success cannot replace it.
+
 Native output-bound requests must capture the complete output hash before execution
 and verify its bytes and file identity again afterward. Legacy audio diagnostics
 cannot acquire that scope later. The `native_candidate` adapter can prepare an

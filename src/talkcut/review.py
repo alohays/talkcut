@@ -104,6 +104,16 @@ def _media_streams(
     return streams
 
 
+def validate_provider_completion(value: dict[str, Any]) -> None:
+    """Common import boundary: an unfinished provider result cannot be promoted."""
+    _require(
+        value.get("completed") is True
+        and type(value.get("exit_code")) is int
+        and value["exit_code"] == 0,
+        "Provider execution failed or did not finish",
+    )
+
+
 def _receipt(ref: Any) -> dict[str, Any]:
     value = _artifact(ref)
     if value.get("schema_version") == "composite-review-receipt/v1":
@@ -119,12 +129,7 @@ def _receipt(ref: Any) -> dict[str, Any]:
         value.get("schema_version") == "execution-receipt/v1",
         "Provider execution receipt missing",
     )
-    _require(
-        value.get("completed") is True
-        and type(value.get("exit_code")) is int
-        and value["exit_code"] == 0,
-        "Provider execution failed or did not finish",
-    )
+    validate_provider_completion(value)
     _require(
         not value.get("mock") and not value.get("test_only"),
         "Mock/test receipts cannot validate actual review",
@@ -976,11 +981,183 @@ def build_review_bundle(
     return {**bundle, "artifact_ref": artifact_ref(directory / "bundle.json")}
 
 
+def validate_review_actor(record: dict[str, Any], execution: dict[str, Any]) -> None:
+    """Existing review-ledger actor gate; provenance is verified separately."""
+    _require(
+        record.get("reviewer_role") == "adversarial_reviewer"
+        and record.get("owner_acceptance", "pending") == "pending",
+        "Separate AI reviewer cannot claim owner approval",
+    )
+    from .context_collection import proposer_ids, proposer_prompts
+
+    _require(
+        proposer_ids(record) and execution["run_id"] not in proposer_ids(record),
+        "Proposal and review executions must be separate",
+    )
+    _require(
+        proposer_prompts(record)
+        and execution["prompt_sha256"] not in proposer_prompts(record),
+        "Proposal and review instructions must differ",
+    )
+
+
+def validate_observation_content(
+    response: dict[str, Any], request: dict[str, Any], capability: dict[str, Any]
+) -> None:
+    """Existing post-intake content gate; provenance must be verified separately."""
+    if capability.get("precision_supported") is False:
+        _require(
+            isinstance(response.get("sampling_limitations"), str)
+            and len(response["sampling_limitations"].strip()) >= 30
+            and response.get("dense_motion_and_lip_verified") is False,
+            "Semantic-only response must preserve unknown dense motion/lip inspection and disclose sampling limits",
+        )
+    _require(
+        response.get("verdict") in ("PASS", "FAIL", "UNVERIFIED"),
+        "Empty, truncated or malformed review response",
+    )
+    _require(
+        {"audio", "video"}.issubset(response.get("observed_modalities", []))
+        and response.get("continuous_video_observed") is True,
+        "Actual audiovisual observation missing",
+    )
+    _require(
+        isinstance(response.get("reason"), str)
+        and len(response["reason"].strip()) >= 30
+        and isinstance(response.get("findings"), list)
+        and isinstance(response.get("needs_source_comparison"), bool),
+        "Review lacks substantive timed observations/findings",
+    )
+    expected = [(as_fraction(a), as_fraction(b)) for a, b in request["intervals"]]
+    observed = [
+        (as_fraction(a), as_fraction(b))
+        for a, b in response.get("observed_intervals", [])
+    ]
+    _require(
+        bool(observed) and all(a < b for a, b in observed),
+        "No valid observed intervals",
+    )
+    for span in observed:
+        _require(
+            not _uncovered(span, expected),
+            "Observed timestamp outside actual clip input",
+        )
+    for span in expected:
+        _require(
+            not _uncovered(span, observed),
+            "Provider response leaves requested media unreviewed",
+        )
+    _require(
+        response.get("needs_source_comparison") is False,
+        "Requested source comparison is still unresolved",
+    )
+    _require(
+        not any(
+            item.get("severity") in ("P0", "P1")
+            and item.get("resolved") is not True
+            for item in response["findings"]
+        ),
+        "Unresolved P0/P1 review finding",
+    )
+
+
+def review_observation_outcome(
+    response_ref: dict[str, Any], request: dict[str, Any], capability: dict[str, Any]
+) -> dict[str, Any]:
+    """Capture the real parser/content failure path with no approval or coverage."""
+    try:
+        response = _artifact(response_ref)
+        validate_observation_content(response, request, capability)
+        return {"content_valid": True, "status": response["verdict"],
+                "coverage": response["observed_intervals"] if response["verdict"] == "PASS" else [],
+                "reason": response["reason"], "response": response}
+    except (TalkCutError, ValueError, KeyError, TypeError, OSError) as exc:
+        return {"content_valid": False, "status": "UNVERIFIED", "coverage": [],
+                "reason": str(exc), "error_type": type(exc).__name__,
+                "error_code": getattr(exc, "code", None)}
+
+
+PROVIDER_CONTROL_FAULTS = (
+    "provider_timeout", "modality_missing", "invalid_review_timestamp",
+    "empty_review", "truncated_review", "budget_exhaustion",
+)
+PROVIDER_CONTROL_REASONS = {
+    "provider_timeout": "Provider execution failed or did not finish",
+    "budget_exhaustion": "Provider execution failed or did not finish",
+    "modality_missing": "Actual audiovisual observation missing",
+    "invalid_review_timestamp": "Observed timestamp outside actual clip input",
+}
+
+
+def provider_control_outcome(
+    kind: str, execution: dict[str, Any], request: dict[str, Any],
+    capability: dict[str, Any], directory: Path,
+) -> dict[str, Any]:
+    """Fixed, explicitly counterfactual production-boundary injection.
+
+    Caller must first validate the complete unchanged actual positive. This
+    function alone grants no execution or positive-control evidence. Timeout
+    and budget cases simulate normalized completion outcomes, not real account
+    exhaustion, provider behavior, or resource-policy enforcement.
+    """
+    _require(type(kind) is str and kind in PROVIDER_CONTROL_FAULTS,
+             "Unknown provider control fault")
+    transport = kind in {"provider_timeout", "budget_exhaustion"}
+    outcome: dict[str, Any] = {
+        "boundary_reached": True, "test_only": True, "counterfactual": True,
+        "actual_provider_outcome": False, "kind": kind,
+        "boundary": "normalized_provider_completion" if transport else "review_response_content",
+        "original_response": execution["response"],
+    }
+    if transport:
+        injected = {"completed": False,
+                    "exit_code": 124 if kind == "provider_timeout" else 75}
+        path = directory / "counterfactual-transport.json"
+        atomic_json(path, {"schema_version": "provider-control-transport/v1",
+                           "test_only": True, "counterfactual": True,
+                           "kind": kind, "injected_fields": injected})
+        outcome["injected_artifact"] = artifact_ref(path)
+        try:
+            validate_provider_completion({**execution, **injected})
+            checked = {"content_valid": True, "reason": "Intended gate unexpectedly accepted"}
+        except TalkCutError as exc:
+            checked = {"content_valid": False, "reason": str(exc), "error_code": exc.code}
+    else:
+        original = _artifact(execution["response"], binary=True).read_bytes()
+        if kind == "empty_review":
+            data = b""
+        elif kind == "truncated_review":
+            _require(original.rstrip().endswith(b"}"), "Positive JSON object terminator missing")
+            data = original.rstrip()[:-1]
+        else:
+            response = _artifact(execution["response"])
+            if kind == "modality_missing":
+                response["observed_modalities"] = [item for item in response["observed_modalities"]
+                                                    if item != "audio"]
+            else:
+                end = max(as_fraction(b) for _, b in request["intervals"])
+                response["observed_intervals"] = [[str(end + 1), str(end + 2)]]
+            data = json.dumps(response, sort_keys=True, allow_nan=False).encode()
+        path = directory / "counterfactual-response.raw"
+        path.write_bytes(data)
+        outcome["injected_artifact"] = artifact_ref(path)
+        checked = review_observation_outcome(outcome["injected_artifact"], request, capability)
+    intended = (checked.get("error_code") == "INVALID_ARTIFACT"
+                if kind in {"empty_review", "truncated_review"}
+                else checked.get("reason") == PROVIDER_CONTROL_REASONS[kind])
+    outcome.update(intended_rejection=checked["content_valid"] is False and intended,
+                   reason=checked["reason"], error_code=checked.get("error_code"),
+                   gate_content_valid=checked["content_valid"])
+    return outcome
+
+
 def import_review(
     response_path: str | Path,
     request_path: str | Path,
     capability_path: str | Path,
     output_dir: str | Path,
+    *,
+    control_fault: str | None = None,
 ) -> dict[str, Any]:
     """Preserve raw imports; validate traceability before counting any coverage.
 
@@ -988,6 +1165,9 @@ def import_review(
     execution receipt. Its raw provider response is read through that receipt.
     Failed imports are retained with UNVERIFIED/FAIL, never normalized to PASS.
     """
+    if control_fault is not None:
+        _require(type(control_fault) is str and control_fault in PROVIDER_CONTROL_FAULTS,
+                 "Unknown provider control fault")
     directory = Path(output_dir) / f"import-{uuid4().hex}"
     directory.mkdir(parents=True)
     refs = {}
@@ -1007,6 +1187,10 @@ def import_review(
         "coverage": [],
         "owner_acceptance": "pending",
     }
+    if control_fault is not None:
+        result["control"] = {"kind": control_fault, "test_only": True,
+                             "counterfactual": True, "actual_provider_outcome": False,
+                             "intended_rejection": False, "boundary_reached": False}
     try:
         record, request, capability_record = (
             _artifact(refs[name]) for name in ("record", "request", "capability")
@@ -1028,17 +1212,7 @@ def import_review(
             execution["model_revision"] == capability["model_revision"],
             "Actual review model capability is unavailable",
         )
-        from .context_collection import proposer_ids, proposer_prompts
-
-        _require(
-            proposer_ids(record) and execution["run_id"] not in proposer_ids(record),
-            "Proposal and review executions must be separate",
-        )
-        _require(
-            proposer_prompts(record)
-            and execution["prompt_sha256"] not in proposer_prompts(record),
-            "Proposal and review instructions must differ",
-        )
+        validate_review_actor(record, execution)
         executed_request = _artifact(execution["request"])
         _require(
             executed_request.get("input_clip_hashes")
@@ -1055,61 +1229,9 @@ def import_review(
         for item in request.get("inputs", []):
             _artifact(item["clip"], binary=True)
             _artifact(item["extraction_receipt"])
-        response = _artifact(execution["response"])
-        if capability.get("precision_supported") is False:
-            _require(
-                isinstance(response.get("sampling_limitations"), str)
-                and len(response["sampling_limitations"].strip()) >= 30
-                and response.get("dense_motion_and_lip_verified") is False,
-                "Semantic-only response must preserve unknown dense motion/lip inspection and disclose sampling limits",
-            )
-        _require(
-            response.get("verdict") in ("PASS", "FAIL", "UNVERIFIED"),
-            "Empty, truncated or malformed review response",
-        )
-        _require(
-            {"audio", "video"}.issubset(response.get("observed_modalities", []))
-            and response.get("continuous_video_observed") is True,
-            "Actual audiovisual observation missing",
-        )
-        _require(
-            isinstance(response.get("reason"), str)
-            and len(response["reason"].strip()) >= 30
-            and isinstance(response.get("findings"), list)
-            and isinstance(response.get("needs_source_comparison"), bool),
-            "Review lacks substantive timed observations/findings",
-        )
-        expected = [(as_fraction(a), as_fraction(b)) for a, b in request["intervals"]]
-        observed = [
-            (as_fraction(a), as_fraction(b))
-            for a, b in response.get("observed_intervals", [])
-        ]
-        _require(
-            bool(observed) and all(a < b for a, b in observed),
-            "No valid observed intervals",
-        )
-        for span in observed:
-            _require(
-                not _uncovered(span, expected),
-                "Observed timestamp outside actual clip input",
-            )
-        for span in expected:
-            _require(
-                not _uncovered(span, observed),
-                "Provider response leaves requested media unreviewed",
-            )
-        _require(
-            response.get("needs_source_comparison") is False,
-            "Requested source comparison is still unresolved",
-        )
-        _require(
-            not any(
-                item.get("severity") in ("P0", "P1")
-                and item.get("resolved") is not True
-                for item in response["findings"]
-            ),
-            "Unresolved P0/P1 review finding",
-        )
+        observation = review_observation_outcome(execution["response"], request, capability)
+        _require(observation["content_valid"], observation["reason"])
+        response = observation["response"]
         _require(
             {
                 "source_hashes",
@@ -1140,16 +1262,22 @@ def import_review(
                 "Clip extraction does not bind observed bytes to the claimed parent",
             )
         validate_review_request(record, execution)
-        result.update(
-            {
-                "status": response["verdict"],
-                "coverage": response["observed_intervals"]
-                if response["verdict"] == "PASS"
-                else [],
-                "provider_execution": record["receipt"],
-                "reason": response["reason"],
-            }
-        )
+        if control_fault is not None:
+            _require(response["verdict"] == "PASS", "Control requires unchanged positive review")
+            result["control"].update(provider_control_outcome(
+                control_fault, execution, request, capability, directory))
+            result["reason"] = result["control"]["reason"]
+        else:
+            result.update(
+                {
+                    "status": response["verdict"],
+                    "coverage": response["observed_intervals"]
+                    if response["verdict"] == "PASS"
+                    else [],
+                    "provider_execution": record["receipt"],
+                    "reason": response["reason"],
+                }
+            )
     except (
         TalkCutError,
         ValueError,
@@ -1159,6 +1287,10 @@ def import_review(
         subprocess.SubprocessError,
     ) as exc:
         result["reason"] = str(exc)
+    if control_fault is not None:
+        # Even a regression that lets the intended gate accept cannot promote
+        # an injected observation. The control verifier then rejects the case.
+        result.update(status="UNVERIFIED", coverage=[], owner_acceptance="pending")
     atomic_json(directory / "import.json", result)
     return {**result, "artifact_ref": artifact_ref(directory / "import.json")}
 
@@ -1336,6 +1468,8 @@ def verify_imported_review(import_ref: dict[str, str]) -> dict[str, Any]:
         imported.get("schema_version") == "review-import/v1",
         "A preserved validated review import is required",
     )
+    _require("control" not in imported and not imported.get("test_only"),
+             "Counterfactual/test-only import cannot authorize an actual review")
     refs = imported.get("artifact_refs", {})
     for name in ("record", "request", "capability"):
         _artifact(refs.get(name))

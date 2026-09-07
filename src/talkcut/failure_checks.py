@@ -1,6 +1,9 @@
 """Execute the fixed, observable filesystem/render failure controls.
 
-``failure-input/v1`` contains ``run`` (a failure-run/v1 artifact reference).
+``failure-input/v1`` contains ``run`` (a failure-run/v1 artifact reference)
+and optionally ``provider_controls`` (a provider-failure-run/v1 reference).
+The optional run requires unchanged actual positive provenance, six explicitly
+counterfactual production faults and genuine unchanged-positive recovery.
 The actual FFmpeg controls include interruption, timeout, invalid encoder argv,
 and injected ENOSPC at atomic promotion after successful full output validation.
 The ENOSPC control is a syscall fault injection, not a claim to fill a disk.
@@ -133,7 +136,8 @@ def run_failure_checks(repo_root: Path, output_dir: Path) -> dict[str, Any]:
     return {**receipt, "artifact_ref": artifact_ref(path)}
 
 
-def verify_failure_checks(raw: dict[str, Any], repo_root: Path, output_dir: Path) -> dict[str, Any]:
+def verify_failure_checks(raw: dict[str, Any], repo_root: Path, output_dir: Path,
+                          *, dependencies: dict[str, Any] | None = None) -> dict[str, Any]:
     _require(raw.get("schema_version") == "failure-input/v1", "Typed failure inputs missing")
     run = _json(raw.get("run"))
     _require(run.get("schema_version") == "failure-run/v1", "Actual failure control run missing")
@@ -152,4 +156,12 @@ def verify_failure_checks(raw: dict[str, Any], repo_root: Path, output_dir: Path
     repeated = run_failure_checks(repo_root, output_dir)
     _require(repeated["technical_controls_executed"] is True and repeated["measurements"] == measured,
              "Actual failure control replay disagrees with claimed behavior")
+    if raw.get("provider_controls") is not None:
+        from .provider_failure_checks import verify_provider_failure_controls
+
+        _require(dependencies is not None, "Current provider control dependencies required")
+        assert dependencies is not None
+        measured.update(verify_provider_failure_controls(raw["provider_controls"],
+                        dependencies=dependencies, repo_root=repo_root,
+                        output_dir=output_dir / "provider-rechecks"))
     return measured

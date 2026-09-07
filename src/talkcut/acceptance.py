@@ -441,7 +441,8 @@ class Evaluator:
             from .failure_checks import verify_failure_checks
 
             return verify_failure_checks(
-                raw, self.repo, self.project / "evidence" / "failure-rechecks"
+                raw, self.repo, self.project / "evidence" / "failure-rechecks",
+                dependencies=self.deps
             )
         if check_id == "editorial_fixture":
             from .editorial_checks import verify_editorial_fixtures
