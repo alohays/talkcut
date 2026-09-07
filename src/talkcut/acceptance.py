@@ -1308,6 +1308,11 @@ class Evaluator:
     def verify_finding_change(self, finding: dict[str, Any], change: str) -> bool:
         """Severity/repair decisions need an actual separately bound review."""
         try:
+            finding_id = finding.get("id")
+            self.require(
+                isinstance(finding_id, str) and bool(finding_id.strip()),
+                "Finding change requires a nonempty string finding identity",
+            )
             evidence = self.artifact(
                 finding.get("independent_review_ref")
                 if change == "severity"
@@ -1327,7 +1332,7 @@ class Evaluator:
             self.require(
                 request.get("scope") == f"finding_{change}"
                 and request.get("finding_id")
-                == finding.get("id")
+                == finding_id
                 == response.get("finding_id"),
                 "Actual finding review concerns a different issue",
             )
