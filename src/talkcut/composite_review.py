@@ -1028,6 +1028,183 @@ def _verify_audio_recipe(execution: dict[str, Any], profile: dict[str, Any]) -> 
     )
 
 
+def validate_task_context(request: dict[str, Any], recipe: dict[str, Any]) -> None:
+    """Bind optional semantic task metadata to the actual clip and fixed role."""
+    context = request.get("review_context")
+    policy = recipe.get("review_context_policy")
+    frames = request.get("frames", [])
+    frame_contexts = [
+        index for index, row in enumerate(frames) if "review_context" in row
+    ]
+    if (
+        "review_context" not in request
+        and "review_context_policy" not in recipe
+        and not frame_contexts
+    ):
+        return  # Legacy registered recipes have no per-call task metadata.
+    require(
+        isinstance(policy, dict)
+        and set(policy) == {"schema_version", "role"}
+        and policy["schema_version"] == "terminal-review-context-policy/v1"
+        and policy["role"] in {"proposer", "adversarial"},
+        "Semantic task metadata needs an explicit fixed recipe policy",
+    )
+    assert isinstance(policy, dict)
+    require(
+        isinstance(context, dict)
+        and set(context)
+        == {
+            "schema_version",
+            "task",
+            "role",
+            "scope",
+            "intervals",
+            "clip_to_parent_offset",
+            "input_clip_hashes",
+            "source_kind",
+            "precision_required",
+            "details",
+        }
+        and context["schema_version"] == "terminal-review-context/v1"
+        and context["role"] == policy["role"]
+        and type(context["precision_required"]) is bool
+        and type(request.get("precision_required")) is bool
+        and context["precision_required"] == request["precision_required"],
+        "Semantic task context schema or fixed role differs",
+    )
+    assert isinstance(context, dict)
+    require(
+        frame_contexts == [0]
+        and canonical(frames[0]["review_context"]) == canonical(context),
+        "Terminal did not receive the exact single task context",
+    )
+    require(
+        context["input_clip_hashes"] == request.get("input_clip_hashes")
+        and context["input_clip_hashes"]
+        == [request.get("media_clip", {}).get("sha256")],
+        "Task metadata identifies different media",
+    )
+    require(
+        isinstance(context["details"], dict)
+        and canonical(context["details"]) == canonical(request.get("details", {})),
+        "Task metadata changes the actual scoped details",
+    )
+    audio_domain = interval(request.get("audio_interval"))
+    task = context["task"]
+    if task == "calibration":
+        require(
+            context["scope"] == "generated_calibration"
+            and context["source_kind"] == "generated_calibration"
+            and canonical(context["intervals"]) == canonical([request["audio_interval"]])
+            and context["details"] == {}
+            and isinstance(context["clip_to_parent_offset"], str)
+            and as_fraction(context["clip_to_parent_offset"]) == 0
+            and not any(key in request for key in ("scope", "inputs", "source_sha256")),
+            "Calibration task was relabeled as a real review",
+        )
+        return
+    require(
+        (
+            task == "analysis"
+            and policy["role"] == "proposer"
+            and context["scope"] == "analysis"
+        )
+        or (
+            task == "adversarial_review"
+            and policy["role"] == "adversarial"
+            and context["scope"]
+            in {
+                "analysis",
+                "deletion",
+                "output",
+                "seam",
+                "layout",
+                "lip_sync",
+                "source_sync",
+            }
+        ),
+        "Semantic task is not supported by the calibrated role",
+    )
+    require(
+        context["source_kind"] == "real"
+        and context["scope"] == request.get("scope")
+        and canonical(context["intervals"]) == canonical(request.get("intervals")),
+        "Task metadata changes the actual requested scope or intervals",
+    )
+    inputs = request.get("inputs")
+    require(
+        isinstance(inputs, list)
+        and len(inputs) == 1
+        and isinstance(inputs[0], dict)
+        and inputs[0].get("clip") == request.get("media_clip"),
+        "Task context requires the one actual extraction input",
+    )
+    assert isinstance(inputs, list)
+    clip_domain = interval(inputs[0].get("interval"))
+    require(
+        isinstance(context["clip_to_parent_offset"], str)
+        and as_fraction(context["clip_to_parent_offset"])
+        == clip_domain[0] - audio_domain[0]
+        and isinstance(context["intervals"], list)
+        and len(context["intervals"]) == 1
+        and isinstance(context["intervals"][0], list)
+        and len(context["intervals"][0]) == 2
+        and all(isinstance(value, str) for value in context["intervals"][0])
+        and interval(context["intervals"][0]) == clip_domain,
+        "Task metadata changes the actual clip-to-parent clock",
+    )
+    if context["scope"] == "deletion":
+        details = context["details"]
+        require(
+            {"candidate_id", "requested_interval", "source_domain"} <= set(details)
+            <= {"candidate_id", "requested_interval", "source_domain",
+                "deleted_interval", "complete_sentence_context"}
+            and details.get("complete_sentence_context", "UNVERIFIED") == "UNVERIFIED"
+            and isinstance(details.get("candidate_id"), str)
+            and bool(details["candidate_id"].strip())
+            and all(
+                isinstance(details.get(key), list)
+                and len(details[key]) == 2
+                and all(isinstance(value, str) for value in details[key])
+                for key in ("requested_interval", "source_domain")
+            ),
+            "Deletion task lacks an exact candidate and source interval",
+        )
+        requested = interval(details["requested_interval"])
+        source_domain = interval(details["source_domain"])
+        require(
+            source_domain[0] <= clip_domain[0] <= requested[0]
+            < requested[1] <= clip_domain[1] <= source_domain[1]
+            and clip_domain[0] <= max(source_domain[0], requested[0] - 5)
+            and clip_domain[1] >= min(source_domain[1], requested[1] + 5),
+            "Deletion task omits the exact candidate or its bounded context",
+        )
+        if "deleted_interval" in details:
+            deleted = details["deleted_interval"]
+            require(
+                isinstance(deleted, list) and len(deleted) == 2
+                and all(isinstance(value, str) for value in deleted),
+                "Deletion metadata has an invalid applied interval",
+            )
+            applied = interval(deleted)
+            require(
+                clip_domain[0] <= applied[0] < applied[1] <= clip_domain[1]
+                and applied[0] < requested[1] and applied[1] > requested[0],
+                "Deletion metadata applied interval is outside the actual candidate context",
+            )
+    elif context["scope"] == "seam":
+        details = context["details"]
+        require(
+            set(details) == {"seam_time"}
+            and isinstance(details["seam_time"], str)
+            and clip_domain[0] <= as_fraction(details["seam_time"]) <= clip_domain[1],
+            "Seam task requires only its exact observed seam time",
+        )
+    else:
+        require(context["details"] == {}, "This task does not accept auxiliary claims")
+
+
+
 def verify_composite_receipt(
     ref: dict[str, Any],
     *,
@@ -1122,6 +1299,7 @@ def _verify_composite_receipt(
         recipe.get("schema_version") == "composite-review-recipe/v1",
         "Frozen composite recipe missing",
     )
+    validate_task_context(request, recipe)
     require(
         value.get("model_revision") == "composite/" + value["recipe"]["sha256"],
         "Composite revision does not bind recipe",
