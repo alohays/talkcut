@@ -177,6 +177,7 @@ def analyze_source(
     *,
     source_kind: str = "real",
     transcript: dict[str, Any] | None = None,
+    expected_dependencies: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a complete keep/protection/candidate ledger without applying cuts.
 
@@ -218,23 +219,49 @@ def analyze_source(
     context_error = "No executed audiovisual context analysis was supplied"
     context_valid = False
     observations: list[dict[str, Any]] = []
+    collection_proof: dict[str, Any] | None = None
+    is_collection = bool(
+        context and context.get("schema_version") == "lecture-context-collection/v1"
+    )
     if context:
-        if (
-            context.get("schema_version") != "lecture-context/v1"
-            or context.get("source_sha256") != source["sha256"]
-        ):
+        if context.get("source_sha256") != source["sha256"]:
             raise TalkCutError(
                 "INVALID_CONTEXT", "Context schema/source identity differs"
             )
-        if source_kind == "fixture" and context.get("test_only") is True:
-            context_valid = True
+        if is_collection:
+            from .context_collection import verify_context_collection
+
+            if expected_dependencies is None:
+                raise TalkCutError(
+                    "INVALID_CONTEXT",
+                    "Collection requires current project/plan dependencies",
+                )
+            try:
+                collection_proof = verify_context_collection(
+                    context,
+                    source_sha256=source["sha256"],
+                    domain=[start, end],
+                    expected_dependencies=expected_dependencies,
+                )
+                observations = collection_proof["segments"]
+                context_valid = True
+            except (TalkCutError, ValueError, KeyError, TypeError, OSError) as error:
+                context_error = "Source context collection unavailable: " + str(error)
         else:
-            result = verify_context_execution(context)
-            context_valid = result["status"] == "PASS"
-            context_error = result.get(
-                "reason", "Audiovisual context execution unavailable"
-            )
-        for item in context.get("segments", []):
+            if context.get("schema_version") != "lecture-context/v1":
+                raise TalkCutError(
+                    "INVALID_CONTEXT", "Context schema/source identity differs"
+                )
+            if source_kind == "fixture" and context.get("test_only") is True:
+                context_valid = True
+            else:
+                result = verify_context_execution(context)
+                context_valid = result["status"] == "PASS"
+                context_error = result.get(
+                    "reason", "Audiovisual context execution unavailable"
+                )
+            observations = context.get("segments", [])
+        for item in observations:
             a, b = _span(item)
             if (
                 not start <= a < b <= end
@@ -245,12 +272,12 @@ def analyze_source(
                     "INVALID_CONTEXT",
                     "Context contains invalid time, kind, or empty reason",
                 )
-            observations.append(item)
         if subtract_intervals(
             (start, end), [(item["start"], item["end"]) for item in observations]
         ):
             context_valid = False
-            context_error = "Context observations do not cover the whole source"
+            if not is_collection:
+                context_error = "Context observations do not cover the whole source"
     if transcript:
         if (
             transcript.get("schema_version") != "transcript/v1"
@@ -274,21 +301,46 @@ def analyze_source(
             "evidence_refs": item.get("evidence_refs", []),
         }
         for item in observations
-        if item["kind"] in PROTECTED_KINDS
+        if item["kind"] in PROTECTED_KINDS or item.get("conservative_keep") is True
     ]
     candidates: list[dict[str, Any]] = []
     proposer = context.get("proposer_run_id") if context else acoustic.get("run_id")
+    if collection_proof:
+        proposer = (
+            collection_proof["proposer_run_ids"][0]
+            if len(collection_proof["proposer_run_ids"]) == 1
+            else None
+        )
     acoustic_spans = [_span(item) for item in acoustic.get("intervals", [])]
     suggestions = [(a, b, "silence") for a, b in acoustic_spans]
-    suggestions += [
-        (*_span(item), "preparation" if item["kind"] == "preparation" else "disfluency")
-        for item in observations
-        if item["kind"] in ("preparation", "disfluency")
-    ]
+    # Keep original proposal boundaries even where overlap partitioning marks
+    # disagreement. Selecting only favorable partitions would silently discard
+    # the original candidate's uncertain/protected edge evidence.
+    proposal_observations = (
+        [
+            row["segment"]
+            for item in observations
+            for row in item["original_observations"]
+        ]
+        if collection_proof
+        else observations
+    )
+    for activity in ("preparation", "disfluency"):
+        suggestions += [
+            (a, b, activity)
+            for a, b in union_intervals(
+                [
+                    _span(item)
+                    for item in proposal_observations
+                    if item["kind"] == activity
+                ]
+            )
+        ]
+    suggestions = sorted(set(suggestions))
     for a, b, kind in suggestions:
         action, reason = "keep", context_error
         matched = [
-            item for item in observations if _span(item)[0] <= a and _span(item)[1] >= b
+            item for item in observations if _span(item)[0] < b and _span(item)[1] > a
         ]
         intersects_protection = any(
             a < _span(item)[1] and b > _span(item)[0] for item in protected
@@ -296,44 +348,69 @@ def analyze_source(
         refs = ([acoustic_ref] if acoustic_ref else []) + [
             ref for item in matched for ref in item.get("evidence_refs", [])
         ]
-        if context_valid and context and source_kind == "real":
+        if context_valid and context and source_kind == "real" and not is_collection:
             refs += [context["receipt"], context["capability"]]
         if intersects_protection:
             reason = "Preserved: candidate overlaps a demonstrated learning activity or meaningful statement"
         elif context_valid and acoustic_valid and matched:
-            observation = matched[0]
-            evidence = observation.get("positive_evidence", {})
-            if (
-                kind == "preparation"
-                and a == start
-                and observation["kind"] == "preparation"
-                and evidence.get("before_first_substantive_content") is True
-                and evidence.get("contains_introduction_or_instruction") is False
-            ):
-                action, reason = (
-                    "auto_apply",
-                    "Audiovisual context confirms preparation before the first substantive content",
-                )
-            elif (
-                kind == "silence"
-                and observation["kind"] == "disposable_pause"
-                and evidence.get("no_speech") is True
-                and evidence.get("no_learning_activity") is True
-                and evidence.get("complete_context_checked") is True
-            ):
-                action, reason = (
-                    "auto_apply",
-                    "Acoustic non-speech and audiovisual context jointly establish a disposable pause",
-                )
-            elif kind == "disfluency" and observation["kind"] == "disfluency":
-                action, reason = (
-                    "requires_review",
-                    "Speech disfluency requires a separate executed reviewer before application",
-                )
+            covered = not subtract_intervals(
+                (a, b),
+                [(max(a, _span(item)[0]), min(b, _span(item)[1])) for item in matched],
+            )
+
+            def supports(
+                item: dict[str, Any], kind: str = kind, a: Fraction = a
+            ) -> bool:
+                evidence = item.get("positive_evidence", {})
+                if item.get("conservative_keep") or item.get("uncertain") is True:
+                    return False
+                if kind == "preparation":
+                    return (
+                        a == start
+                        and item["kind"] == "preparation"
+                        and evidence.get("before_first_substantive_content") is True
+                        and evidence.get("contains_introduction_or_instruction")
+                        is False
+                    )
+                if kind == "silence":
+                    return (
+                        item["kind"] == "disposable_pause"
+                        and evidence.get("no_speech") is True
+                        and evidence.get("no_learning_activity") is True
+                        and evidence.get("complete_context_checked") is True
+                    )
+                return kind == "disfluency" and item["kind"] == "disfluency"
+
+            if covered and all(supports(item) for item in matched):
+                if kind == "disfluency":
+                    action, reason = (
+                        "requires_review",
+                        "Speech disfluency requires a separate executed reviewer before application",
+                    )
+                elif kind == "preparation":
+                    action, reason = (
+                        "auto_apply",
+                        "Every covering audiovisual observation confirms preparation before substantive content",
+                    )
+                else:
+                    action, reason = (
+                        "auto_apply",
+                        "Acoustic non-speech and every covering audiovisual observation establish a disposable pause",
+                    )
             else:
-                reason = "Preserved: duration or label alone does not establish a safe deletion"
+                reason = "Preserved: every covering observation must substantiate this deletion; labels or a favorable first match are insufficient"
         elif context_valid and not acoustic_valid:
             reason = "Preserved: the full acoustic execution is incomplete"
+        candidate_proposers = {
+            row["run_id"]: row for item in matched for row in item.get("proposers", [])
+        }
+        candidate_proposer = proposer
+        if candidate_proposers:
+            candidate_proposer = (
+                next(iter(candidate_proposers))
+                if len(candidate_proposers) == 1
+                else None
+            )
         candidates.append(
             {
                 "id": "candidate-" + content_hash([str(a), str(b), kind])[:16],
@@ -343,7 +420,24 @@ def analyze_source(
                 "policy_action": action,
                 "reason": reason,
                 "evidence_refs": refs,
-                "proposer_run_id": proposer,
+                "proposer_run_id": candidate_proposer,
+                **(
+                    {
+                        "proposer_run_ids": sorted(candidate_proposers),
+                        "proposer_prompt_sha256s": sorted(
+                            {
+                                row["prompt_sha256"]
+                                for row in candidate_proposers.values()
+                            }
+                        ),
+                        "proposers": [
+                            candidate_proposers[key]
+                            for key in sorted(candidate_proposers)
+                        ],
+                    }
+                    if candidate_proposers
+                    else {}
+                ),
                 "test_only": source_kind == "fixture",
             }
         )
@@ -388,6 +482,16 @@ def analyze_source(
         },
         "proposer_run_id": proposer,
         "prompt_sha256": context.get("prompt_sha256") if context else None,
+        **(
+            {
+                "proposer_run_ids": collection_proof["proposer_run_ids"],
+                "proposer_prompt_sha256s": collection_proof["proposer_prompt_sha256s"],
+                "context_verification": collection_proof,
+                "dependencies": collection_proof["dependencies"],
+            }
+            if collection_proof
+            else {}
+        ),
         "segments": sorted(segments, key=lambda item: as_fraction(item["start"])),
         "protected_intervals": protected,
         "protected": protected,
@@ -434,16 +538,24 @@ def verify_analysis_report(
     acoustic = verified_json(recorded.get("acoustic_ref", {}))
     acoustic["artifact_ref"] = recorded["acoustic_ref"]
     source = {"path": acoustic["source_path"], "sha256": acoustic["source_sha256"]}
-    if source["sha256"] not in plan["source_hashes"].values():
+    if source["sha256"] != plan["source_hashes"].get("screen"):
         raise TalkCutError(
             "SOURCE_CHANGED", "Acoustic source is not in the current plan"
         )
+    from .contracts import code_identity
+
+    expected = {
+        "source_hashes": plan["source_hashes"],
+        "code_tree_hash": code_identity(Path.cwd())["code_tree_hash"],
+        "contract_hash": plan.get("contract_hash"),
+    }
     regenerated = analyze_source(
         source,
         recorded["domain"],
         acoustic,
         recorded.get("context"),
         transcript=recorded.get("transcript"),
+        expected_dependencies=expected,
     )
     if regenerated["status"] != "ANALYZED":
         raise TalkCutError(
@@ -462,6 +574,9 @@ def verify_analysis_report(
         "protected_intervals",
         "candidates",
         "proposer_run_id",
+        "proposer_run_ids",
+        "proposer_prompt_sha256s",
+        "context_verification",
     ):
         if recorded.get(key) != regenerated.get(key):
             raise TalkCutError(
@@ -495,7 +610,15 @@ def authorize_automatic_candidate(
         )
     if any(
         current.get(key) != candidate.get(key)
-        for key in ("id", "kind", "proposer_run_id", "policy_action")
+        for key in (
+            "id",
+            "kind",
+            "proposer_run_id",
+            "proposer_run_ids",
+            "proposer_prompt_sha256s",
+            "proposers",
+            "policy_action",
+        )
     ) or _span(current) != _span(candidate):
         raise TalkCutError(
             "STALE_ANALYSIS", "Current candidate differs from recomputed source policy"

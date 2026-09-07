@@ -277,7 +277,9 @@ def verify_context_execution(context: dict[str, Any]) -> dict[str, Any]:
     """Validate executed audiovisual source context, preserving honest failure."""
     try:
         _require(
-            not context.get("test_only"), "Fixture context cannot certify real source"
+            context.get("schema_version") == "lecture-context/v1"
+            and not context.get("test_only"),
+            "Fixture or unsupported context cannot certify real source",
         )
         capability = _capability(
             _artifact(context.get("capability")), precision_required=False
@@ -357,7 +359,13 @@ def verify_context_execution(context: dict[str, Any]) -> dict[str, Any]:
                 span[0] < span[1] and not _uncovered(span, submitted),
                 "Context claims source time that the provider did not receive",
             )
-        return {"status": "PASS", "capability": capability}
+        return {
+            "status": "PASS",
+            "capability": capability,
+            "execution": execution,
+            "request": request,
+            "response": response,
+        }
     except (
         TalkCutError,
         ValueError,
@@ -985,14 +993,15 @@ def import_review(
             execution["model_revision"] == capability["model_revision"],
             "Actual review model capability is unavailable",
         )
+        from .context_collection import proposer_ids, proposer_prompts
+
         _require(
-            record.get("proposer_run_id")
-            and record["proposer_run_id"] != execution["run_id"],
+            proposer_ids(record) and execution["run_id"] not in proposer_ids(record),
             "Proposal and review executions must be separate",
         )
         _require(
-            record.get("proposer_prompt_sha256")
-            and record["proposer_prompt_sha256"] != execution["prompt_sha256"],
+            proposer_prompts(record)
+            and execution["prompt_sha256"] not in proposer_prompts(record),
             "Proposal and review instructions must differ",
         )
         executed_request = _artifact(execution["request"])
@@ -1127,8 +1136,37 @@ def authorize_candidate_review(
     An old import's PASS is never trusted. Revalidation preserves a new receipt
     while the original provider request and response remain immutable.
     """
+    from .context_collection import _execution_evidence, proposer_ids, proposer_prompts
     from .contracts import code_identity
 
+    if "proposer_run_ids" in candidate:
+        from .analysis import verify_analysis_report
+
+        regenerated = verify_analysis_report(plan.get("analysis_ref", {}), plan)
+        original = next(
+            (
+                item
+                for item in regenerated["candidates"]
+                if item["id"] == candidate.get("id")
+            ),
+            None,
+        )
+        _require(
+            original is not None
+            and all(
+                original.get(key) == candidate.get(key)
+                for key in (
+                    "start",
+                    "end",
+                    "kind",
+                    "proposer_run_id",
+                    "proposer_run_ids",
+                    "proposer_prompt_sha256s",
+                    "proposers",
+                )
+            ),
+            "Candidate proposal contributors differ from actual collection",
+        )
     proof = verify_imported_review(import_ref)
     _require(
         not plan.get("test_only") and not candidate.get("test_only"),
@@ -1150,10 +1188,27 @@ def authorize_candidate_review(
         "Review request targets a different candidate or boundary",
     )
     _require(
-        record.get("proposer_run_id") == candidate.get("proposer_run_id")
-        and execution["run_id"] != candidate.get("proposer_run_id"),
+        proposer_ids(record) == proposer_ids(candidate)
+        and bool(proposer_ids(candidate))
+        and execution["run_id"] not in proposer_ids(candidate),
         "Review is not separate from this candidate's actual proposal",
     )
+    if "proposer_run_ids" in candidate:
+        _require(
+            proposer_prompts(record) == proposer_prompts(candidate)
+            and execution["prompt_sha256"] not in proposer_prompts(candidate),
+            "Review prompt separation differs from original proposal instructions",
+        )
+        review_ids, _ = _execution_evidence(record["receipt"], execution)
+        proposal_ids = {
+            run_id
+            for proposer in candidate["proposers"]
+            for run_id in proposer["execution_ids"]
+        }
+        _require(
+            not (review_ids & proposal_ids),
+            "Review reuses a component of the original source proposal",
+        )
     deps = request.get("dependencies", {})
     _require(
         deps.get("source_hashes") == plan.get("source_hashes")

@@ -1052,6 +1052,7 @@ class Evaluator:
         }
 
     def load_review(self, ref: dict[str, Any]) -> dict[str, Any]:
+        from .context_collection import proposer_ids, proposer_prompts
         from .review import precision_review_required, validate_review_request
 
         record = self.artifact(ref)
@@ -1072,13 +1073,12 @@ class Evaluator:
         self.dependencies(record)
         receipt = self.receipt(record.get("receipt"), provider=True)
         self.require(
-            receipt.get("run_id") != record.get("proposer_run_id")
-            and record.get("proposer_run_id"),
+            proposer_ids(record) and receipt.get("run_id") not in proposer_ids(record),
             "Proposal and review must be separate identified executions",
         )
         self.require(
-            record.get("prompt_sha256") != record.get("proposer_prompt_sha256")
-            and record.get("proposer_prompt_sha256"),
+            proposer_prompts(record)
+            and record.get("prompt_sha256") not in proposer_prompts(record),
             "Proposal/review must use separate instructions",
         )
         self.require(
@@ -1262,6 +1262,7 @@ class Evaluator:
             "receipt": receipt,
             "ref": ref,
             "run_id": receipt["run_id"],
+            "proposer_run_ids": proposer_ids(record),
             "temporal_resolution_ms": capability["temporal_resolution_ms"],
             "precision_supported": capability.get("precision_supported", False),
             "max_actual_frame_gap_ms": capability.get("max_actual_frame_gap_ms"),
@@ -1469,10 +1470,43 @@ class Evaluator:
         return self.coverage
 
     def analysis_check(self) -> dict[str, Any]:
+        from .context_collection import proposer_ids, proposer_prompts
+
         analysis = self.artifact(self.index.get("analysis"))
         self.analysis = analysis
-        self.dependencies(analysis)
-        self.receipt(analysis.get("receipt"))
+        collection = (
+            (analysis.get("context") or {}).get("schema_version")
+            == "lecture-context-collection/v1"
+        )
+        if collection:
+            from .analysis import verify_analysis_report
+            from .project import load_project
+
+            self.dependencies(
+                analysis, ["source_hashes", "code_tree_hash", "contract_hash"]
+            )
+            project = load_project(self.project)
+            plan = self.artifact(project.get("active_plan"))
+            self.require(
+                plan.get("analysis_ref") == self.index.get("analysis"),
+                "Current plan does not bind this original collection analysis",
+                "UNVERIFIED",
+            )
+            regenerated = verify_analysis_report(self.index["analysis"], plan)
+            self.require(
+                regenerated["status"] == "ANALYZED",
+                "Collection source context is incomplete",
+                "UNVERIFIED",
+            )
+            # The collection has no aggregate provider receipt. Every original
+            # child receipt/input/response was revalidated by the recomputation.
+            self.require(
+                not analysis.get("receipt"),
+                "Collection cannot claim an aggregate provider receipt",
+            )
+        else:
+            self.dependencies(analysis)
+            self.receipt(analysis.get("receipt"))
         self.require(
             analysis.get("schema_version") == "source-analysis/v1"
             and analysis.get("source_kind") == "real",
@@ -1480,7 +1514,7 @@ class Evaluator:
             "UNVERIFIED",
         )
         self.require(
-            analysis.get("proposer_run_id") and analysis.get("prompt_sha256"),
+            proposer_ids(analysis) and proposer_prompts(analysis),
             "Proposal provenance unavailable",
             "UNVERIFIED",
         )
@@ -1553,7 +1587,7 @@ class Evaluator:
             audit = self.artifact(analysis.get("no_safe_cuts_audit"))
             self.dependencies(audit)
             self.require(
-                audit.get("reviewer_run_id") != analysis["proposer_run_id"]
+                audit.get("reviewer_run_id") not in proposer_ids(analysis)
                 and audit.get("reviewer_run_id"),
                 "No-safe-cuts requires a separate audit",
                 "UNVERIFIED",
@@ -1651,7 +1685,9 @@ class Evaluator:
             "Separate auditor identity missing",
             "UNVERIFIED",
         )
-        prohibited_runs = {self.analysis.get("proposer_run_id")} | set(
+        from .context_collection import proposer_ids
+
+        prohibited_runs = set(proposer_ids(self.analysis)) | set(
             snapshot.get("implementation_run_ids", [])
         )
         self.require(

@@ -69,7 +69,8 @@ def parser_for_cli() -> argparse.ArgumentParser:
     freeze.add_argument("--json", action="store_true")
     for action in ("measure", "measure-worker"):
         measure = actions.add_parser(
-            action, help="Execute a typed raw measurement; zero exit means execution, not acceptance"
+            action,
+            help="Execute a typed raw measurement; zero exit means execution, not acceptance",
         )
         measure.add_argument("project", type=Path)
         measure.add_argument("--check", required=True)
@@ -121,7 +122,9 @@ def parser_for_cli() -> argparse.ArgumentParser:
         render = commands.add_parser(action, help="Render the active measured timeline")
         render.add_argument("project", type=Path)
         render.add_argument(
-            "--profile", choices=("diagnostic", "review", "master"), default="diagnostic"
+            "--profile",
+            choices=("diagnostic", "review", "master"),
+            default="diagnostic",
         )
         render.add_argument("--preset", default="medium")
         render.add_argument("--crf", type=int, default=18)
@@ -150,6 +153,19 @@ def parser_for_cli() -> argparse.ArgumentParser:
     analyze.add_argument("--transcript", type=Path)
     analyze.add_argument("--profile", choices=("lecture",), default="lecture")
     analyze.add_argument("--json", action="store_true")
+    context = commands.add_parser(
+        "context", help="Collect original executed source context windows"
+    )
+    contexts = context.add_subparsers(dest="action", required=True)
+    collect = contexts.add_parser(
+        "collect", help="Validate every original child before constructing a collection"
+    )
+    collect.add_argument("project", type=Path)
+    collect.add_argument("--child", type=Path, action="append", required=True)
+    collect.add_argument("--contract", type=Path, required=True)
+    collect.add_argument("--capability", type=Path, required=True)
+    collect.add_argument("--output", type=Path, required=True)
+    collect.add_argument("--json", action="store_true")
     review = commands.add_parser(
         "review",
         help="Materialize actual media clips and verify separate provider executions",
@@ -253,10 +269,19 @@ def execute(args: argparse.Namespace) -> tuple[dict, int]:
 
             try:
                 if args.action == "measure-worker":
-                    return compute(args.project.resolve(), args.check, args.input.resolve(),
-                                   args.contract.resolve(), Path.cwd()), 0
-                result = run_measurement(args.project, args.check, args.input, args.contract, Path.cwd())
-                return result, 130 if result["interrupted"] else (0 if result["status"] == "MEASURED" else 1)
+                    return compute(
+                        args.project.resolve(),
+                        args.check,
+                        args.input.resolve(),
+                        args.contract.resolve(),
+                        Path.cwd(),
+                    ), 0
+                result = run_measurement(
+                    args.project, args.check, args.input, args.contract, Path.cwd()
+                )
+                return result, 130 if result["interrupted"] else (
+                    0 if result["status"] == "MEASURED" else 1
+                )
             except EvidenceError as exc:
                 raise TalkCutError("MEASUREMENT_UNVERIFIED", str(exc)) from exc
         from .acceptance import evaluate, exit_code
@@ -299,7 +324,13 @@ def execute(args: argparse.Namespace) -> tuple[dict, int]:
     if args.command == "render":
         from .render_execution import run_render
 
-        return run_render(args.project, args.profile, preset=args.preset, crf=args.crf, repo_root=Path.cwd())
+        return run_render(
+            args.project,
+            args.profile,
+            preset=args.preset,
+            crf=args.crf,
+            repo_root=Path.cwd(),
+        )
     if args.command == "render-worker":
         from .workflow import render_project
 
@@ -323,6 +354,12 @@ def execute(args: argparse.Namespace) -> tuple[dict, int]:
 
         result = analyze_project(args.project, args.context, args.transcript)
         return result, 0 if result["status"] == "ANALYZED" else 1
+    if args.command == "context":
+        from .workflow import collect_contexts
+
+        return collect_contexts(
+            args.project, args.child, args.contract, args.capability, args.output
+        ), 0
     if args.command == "review":
         if args.action == "build":
             from .workflow import build_reviews

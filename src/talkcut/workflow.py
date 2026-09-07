@@ -214,6 +214,7 @@ def analyze_project(
     directory: str | Path, context: Path | None = None, transcript: Path | None = None
 ) -> dict[str, Any]:
     from .analysis import analyze_source, detect_silence
+    from .contracts import code_identity
     from .project import read_json
 
     directory = Path(directory)
@@ -231,6 +232,17 @@ def analyze_project(
             acoustic,
             read_json(context) if context else None,
             transcript=read_json(transcript) if transcript else None,
+            expected_dependencies={
+                "source_hashes": {
+                    k: v["sha256"] for k, v in project["sources"].items()
+                },
+                "code_tree_hash": code_identity(Path.cwd())["code_tree_hash"],
+                "contract_hash": artifact_ref(directory / "frozen-contract.local.json")[
+                    "sha256"
+                ]
+                if (directory / "frozen-contract.local.json").exists()
+                else None,
+            },
         )
         result["source_hashes"] = {
             k: v["sha256"] for k, v in project["sources"].items()
@@ -253,6 +265,64 @@ def analyze_project(
             "coverage": result["coverage"],
             "project_revision": project["revision"],
         }
+
+
+def collect_contexts(
+    directory: Path,
+    children: list[Path],
+    contract: Path,
+    capability: Path,
+    output: Path,
+) -> dict[str, Any]:
+    """Read a current project and construct verified child context references."""
+    from .context_collection import build_context_collection
+    from .contracts import code_identity
+
+    project = load_project(directory)
+    inspected = verified_json(project["inspections"]["screen"])
+    if inspected.get("sha256") != project["sources"]["screen"]["sha256"]:
+        raise TalkCutError(
+            "STALE_CONTEXT", "Context source inspection differs from registered source"
+        )
+    if not children:
+        raise TalkCutError(
+            "CONTEXT_MISSING", "Original child context paths are required"
+        )
+    refs = [artifact_ref(path) for path in children]
+    first = verified_json(refs[0])
+    dependencies = first.get("dependencies", {})
+    expected = {
+        "source_hashes": {k: v["sha256"] for k, v in project["sources"].items()},
+        "code_tree_hash": code_identity(Path.cwd())["code_tree_hash"],
+        "contract_hash": artifact_ref(contract)["sha256"],
+    }
+    if any(dependencies.get(key) != value for key, value in expected.items()):
+        raise TalkCutError(
+            "STALE_CONTEXT", "Child source/code/contract differs from current project"
+        )
+    if "output_hash" in dependencies:
+        rendered = verified_json(project.get("active_render", {}))
+        if rendered.get("output", {}).get("sha256") != dependencies["output_hash"]:
+            raise TalkCutError(
+                "STALE_CONTEXT", "Context references a different current render"
+            )
+    if (
+        "timeline_hash" in dependencies
+        and project.get("active_timeline", {}).get("sha256")
+        != dependencies["timeline_hash"]
+    ):
+        raise TalkCutError(
+            "STALE_CONTEXT", "Context references a different current timeline"
+        )
+    return build_context_collection(
+        refs,
+        source_sha256=project["sources"]["screen"]["sha256"],
+        domain=inspected["video"]["coverage"],
+        dependencies=dependencies,
+        contract=artifact_ref(contract),
+        capability=artifact_ref(capability),
+        output=output,
+    )
 
 
 def build_reviews(directory: str | Path) -> dict[str, Any]:
