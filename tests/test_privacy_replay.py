@@ -295,10 +295,15 @@ def test_replay_media_exception_cannot_override_execution_log_role(actual_replay
     ledger = privacy._json(fixture['executions'])
     originals = {path: path.read_bytes() for path in (Path(actual_replay['path']), fixture_path, ledger_path)}
     media = artifact_ref(archive / 'generated/synthetic.mp4')
-    # A smaller injected resource limit exercises the same branch using the
-    # complete real generated media, avoiding an unrelated larger fixture.
-    monkeypatch.setattr(privacy, 'MAX_UNIT_BYTES', 128 * 1024)
-    assert Path(media['path']).stat().st_size > privacy.MAX_UNIT_BYTES
+    # Keep the injected limit below the real media and above its metadata.
+    # The bundle grows with checkout/basetemp paths, so a fixed small limit
+    # can reject unrelated metadata before exercising the media/log roles.
+    media_size = Path(media['path']).stat().st_size
+    limit = media_size - 1
+    assert 0 < limit < privacy.MAX_UNIT_BYTES
+    assert Path(actual_replay['path']).stat().st_size <= limit
+    monkeypatch.setattr(privacy, 'MAX_UNIT_BYTES', limit)
+    assert media_size > privacy.MAX_UNIT_BYTES
     try:
         if borrow_as_stdout:
             ledger[0]['stdout'] = media
