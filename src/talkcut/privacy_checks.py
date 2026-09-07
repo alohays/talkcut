@@ -1870,17 +1870,37 @@ def _validate_source_tree_command_roots(commands: Any, source: Path) -> None:
 
 
 def _validate_source_tree_producer(syntax: ast.Module, producer: Path,
-                                   build_path: Path, build: dict[str, Any]) -> None:
-    """Accept one closed recorder grammar, never arbitrary Python dataflow.
+                                   build_path: Path, build: dict[str, Any]) -> tuple[Path, str]:
+    """Accept two closed recorder grammars, never arbitrary Python dataflow.
 
     This checks the current source program and its referenced byte inventory.
     It does not attest that this program ran, or that its imports/environment
     were trusted during an earlier process execution.
     """
     base = producer.parent
-    source, build_directory = base / "source", base / "build"
+    def literal_directory(name: str) -> str:
+        nodes = [node for node in syntax.body if isinstance(node, ast.Assign)
+                 and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                 and node.targets[0].id == name]
+        _require(len(nodes) == 1 and isinstance(nodes[0].value, ast.BinOp)
+                 and isinstance(nodes[0].value.op, ast.Div)
+                 and isinstance(nodes[0].value.left, ast.Name) and nodes[0].value.left.id == "base"
+                 and isinstance(nodes[0].value.right, ast.Constant) and isinstance(nodes[0].value.right.value, str),
+                 "Auxiliary source/build roots must be single bounded literal children of producer base")
+        node = nodes[0].value
+        assert isinstance(node, ast.BinOp) and isinstance(node.right, ast.Constant)
+        name_value = node.right.value
+        _require(isinstance(name_value, str)
+                 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", name_value) is not None,
+                 "Auxiliary source/build root literal is not one bounded canonical directory component")
+        assert isinstance(name_value, str)
+        return name_value
+
+    source_name, build_name = literal_directory("source"), literal_directory("build")
+    _require(source_name != build_name, "Auxiliary source and build roots collide")
+    source, build_directory = base / source_name, base / build_name
     run = build_path.parent
-    _require(run.parent == base and run.name not in {"source", "build"}
+    _require(run.parent == base and run.name not in {source_name, build_name}
              and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", run.name) is not None
              and build_path == run / "result.local.json",
              "Auxiliary source producer result has no supported source construction directory")
@@ -1965,6 +1985,11 @@ def _validate_source_tree_producer(syntax: ast.Module, producer: Path,
 
         def visit_Assign(self, node: ast.Assign) -> ast.AST:
             if (len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id in {"source", "build"}):
+                assert isinstance(node.value, ast.BinOp)
+                node.value.right = ast.Constant(source_name if node.targets[0].id == "source" else build_name)
+                return node
+            if (len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
                     and node.targets[0].id == "commands"):
                 # Only the previously validated literal array is inserted. All
                 # surrounding names, imports, calls, functions and order stay fixed.
@@ -1973,8 +1998,24 @@ def _validate_source_tree_producer(syntax: ast.Module, producer: Path,
             return self.generic_visit(node)
 
     expected = BindSlots().visit(ast.parse(_SOURCE_TREE_PRODUCER_TEMPLATE))
-    _require(ast.dump(syntax, include_attributes=False) == ast.dump(expected, include_attributes=False),
-             "Auxiliary source producer does not match the closed supported source construction grammar")
+    actual_syntax = ast.dump(syntax, include_attributes=False)
+    if actual_syntax == ast.dump(expected, include_attributes=False):
+        return source, "explicit_runtime_alias_rows/v1"
+    # This second fixed row grammar records direct ref(p) values, including
+    # historical alias spelling. It grants no runtime-link or execution trust.
+    legacy = ast.parse("[ref(p) for p in sorted((build / 'bin').glob('*.dylib')) if p.is_file()]", mode="eval").body
+    reports = [node for node in expected.body if isinstance(node, ast.Assign)
+               and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+               and node.targets[0].id == "report" and isinstance(node.value, ast.Dict)]
+    assert len(reports) == 1 and isinstance(reports[0].value, ast.Dict)
+    report = reports[0].value
+    slots_index = [index for index, key in enumerate(report.keys)
+                   if isinstance(key, ast.Constant) and key.value == "runtime_libraries"]
+    assert len(slots_index) == 1
+    report.values[slots_index[0]] = legacy
+    _require(actual_syntax == ast.dump(expected, include_attributes=False),
+             "Auxiliary source producer does not match either closed supported source construction grammar")
+    return source, "legacy_direct_runtime_refs/v1"
 
 
 def _auxiliary_source_tree_inventory(locators: list[dict[str, Any]] | None, directory: Path,
@@ -2064,8 +2105,11 @@ def _source_tree_inventory(locators: list[dict[str, Any]] | None, directory: Pat
                      "Historical source tree requires an explicit original locator and complete snapshot")
             snapshot_ref = locator["snapshot"]
             locator = locator["origin"]
-        _require(isinstance(locator, dict) and set(locator) <= {"build", "manifest", "copies"}
+        _require(isinstance(locator, dict) and set(locator) <= {"build", "manifest", "copies", "origin_scope"}
                  and {"build", "manifest"} <= set(locator), "Unsupported auxiliary source tree locator")
+        current_only = "origin_scope" in locator
+        _require(not current_only or (not historical and locator["origin_scope"] == "current_native_source_bytes/v1"),
+                 "Only current native source bytes may use the explicit nonhistorical origin scope")
         build_ref, selected_ref = locator["build"], locator["manifest"]
         build_path, build = read(build_ref)
         _require(str(build_path) not in seen_builds, "Auxiliary source tree build locator is duplicated")
@@ -2090,12 +2134,29 @@ def _source_tree_inventory(locators: list[dict[str, Any]] | None, directory: Pat
             syntax = ast.parse(producer.read_text())
         except (ValueError, SyntaxError, UnicodeDecodeError) as exc:
             raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Auxiliary tree producer is not inspectable Python") from exc
-        _validate_source_tree_producer(syntax, producer, build_path, build)
-        source = producer.parent / "source"
+        source, producer_grammar = _validate_source_tree_producer(syntax, producer, build_path, build)
         canonical(source)
         _require(source.is_dir() and source != directory, "Auxiliary tree origin is not a canonical task source directory")
         acquisition_path, acquisition = read(build["source_acquisition"])
-        _require(acquisition.get("copied_source") == str(source), "Auxiliary tree acquisition identifies another source root")
+        if current_only:
+            # The actual acquisition names an upstream extraction, not a proved
+            # later copy. Preserve that distinction; only current root bytes and
+            # unchanged original full manifests are inventoried in this role.
+            _require(set(acquisition) == {"source_url", "upstream_commit", "archive", "extracted_source",
+                     "elapsed_seconds", "finished_at", "original_runtime_unchanged"}
+                     and isinstance(acquisition.get("extracted_source"), str)
+                     and "copied_source" not in acquisition,
+                     "Current native source observation needs the exact upstream-extraction acquisition role")
+            extracted = Path(acquisition["extracted_source"])
+            canonical(extracted)
+            _require(extracted.parent == producer.parent and extracted.is_dir() and extracted != source,
+                     "Upstream acquisition extraction must remain a distinct canonical sibling")
+            archive = _file(acquisition.get("archive"))
+            canonical(archive)
+            _require(archive.parent == producer.parent and archive.is_file(),
+                     "Upstream acquisition archive is not its preserved canonical sibling artifact")
+        else:
+            _require(acquisition.get("copied_source") == str(source), "Auxiliary tree acquisition identifies another source root")
         _validate_source_tree_command_roots(build.get("commands"), source)
         _require(set(value) == {"files", "sha256"} and isinstance(value["files"], list)
                  and 0 < len(value["files"]) <= MAX_TASK_FILES, "Auxiliary source tree list is missing or exceeds its bound")
@@ -2220,6 +2281,11 @@ def _source_tree_inventory(locators: list[dict[str, Any]] | None, directory: Pat
                        "manifest_value": value, "parents": parents, "bindings": bindings, "files": files,
                        "row_count": len(rows), "total_bytes": total_bytes, "claim_status": "UNVERIFIED",
                        "scope": "Root-bound auxiliary source bytes only; no build, execution, AI, public classification or publication approval"}
+        if current_only:
+            observation.update({"origin_scope": "current_native_source_bytes/v1", "producer_grammar": producer_grammar,
+                                "acquisition_observation": build["source_acquisition"], "copy_history_status": "UNVERIFIED",
+                                "build_status": "UNVERIFIED", "runtime_status": "UNVERIFIED", "av_status": "UNVERIFIED",
+                                "scope": "Current complete native source bytes derived from a closed literal producer only; upstream acquisition is preserved, not approval of a later copy/build/runtime/execution/AI/publication"})
         if historical:
             observation.update({"physical_snapshot_directory": str(physical_source), "snapshot": snapshot_ref,
                                 "current_files": current_files, "current_total_bytes": current_bytes,
