@@ -187,6 +187,77 @@ def _supervisor(
     return value
 
 
+def _verify_launch_output(actual_launch, binding, call, dependencies) -> None:
+    """Check the output dependency from the original pre-execution launch bytes.
+
+    Legacy audio diagnostics have no output scope and cannot acquire one here.
+    Output-bound launches hash the complete actual output using streaming I/O.
+    """
+    artifact, require = _helpers()
+    version = actual_launch.get("schema_version")
+    output_bound = version == "private-native-audio-launch/v2"
+    require(
+        version in {"private-native-audio-launch/v1", "private-native-audio-launch/v2"}
+        and set(actual_launch)
+        == {
+            "schema_version",
+            "audio",
+            "dependencies",
+            "purpose",
+            "source_artifacts",
+            "contract",
+        }
+        | ({"output"} if output_bound else set()),
+        "Actual native launch schema/fields differ",
+    )
+    require(
+        set(dependencies)
+        == {"source_hashes", "contract_hash", "code_tree_hash"}
+        | ({"output_hash"} if output_bound else set()),
+        "Native launch dependency fields differ",
+    )
+    if output_bound:
+        output = actual_launch["output"]
+        require(
+            isinstance(output, dict) and isinstance(output.get("path"), str),
+            "Native actual output reference is missing",
+        )
+        path = Path(output["path"])
+        require(
+            path.is_absolute() and path == path.resolve() and not path.is_symlink(),
+            "Native actual output path acquired an alias",
+        )
+        before = path.stat()
+        require(stat.S_ISREG(before.st_mode), "Native actual output is not regular")
+        artifact(output, verify_only=True)
+        after = path.stat()
+        identity = lambda value: (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_nlink,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        require(
+            identity(before) == identity(after)
+            and path == path.resolve()
+            and not path.is_symlink(),
+            "Native actual output changed while hashing",
+        )
+        require(
+            output == binding.get("output") == call.get("output")
+            and output["sha256"] == dependencies["output_hash"],
+            "Native actual output dependency differs",
+        )
+    else:
+        require(
+            "output" not in binding and "output" not in call,
+            "Legacy native launch cannot acquire an output scope",
+        )
+
+
 def verify_native_bundle(
     case_ref: Any,
     run_ref: Any,
@@ -246,7 +317,8 @@ def verify_native_bundle(
     )
     actual_launch = artifact(launch["launch"])
     require(
-        actual_launch.get("schema_version") == "private-native-audio-launch/v1"
+        actual_launch.get("schema_version")
+        in {"private-native-audio-launch/v1", "private-native-audio-launch/v2"}
         and actual_launch.get("audio") == launch["audio"]
         and actual_launch.get("dependencies") == dependencies
         and actual_launch.get("source_artifacts") == launch["source_artifacts"]
@@ -254,6 +326,7 @@ def verify_native_bundle(
         and actual_launch.get("purpose") == launch["purpose"],
         "Actual launch file differs from executed request",
     )
+    _verify_launch_output(actual_launch, launch, call, dependencies)
     for ref in [
         launch["audio"],
         launch["contract"],

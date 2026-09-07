@@ -158,6 +158,13 @@ the corresponding `*_checks.py` modules; unrelated success logs and hand-entered
 PASS labels cannot substitute for their source artifacts. `acceptance evaluate`
 recomputes those measurements before applying AC01–AC13.
 
+Native output-bound requests must capture the complete output hash before execution
+and verify its bytes and file identity again afterward. Legacy audio diagnostics
+cannot acquire that scope later. The `native_candidate` adapter can prepare an
+explicitly unregistered intake leaf from an original bounded process and complete
+PCM trace; independent registration and final composite validation must still
+recheck the original evidence after the terminal review runs.
+
 `READY_FOR_OWNER` is distinct from `OWNER_ACCEPTED`. Code release additionally
 requires independent audit, reproducibility, passing CI, reviewed merge and an
 alpha release. Private recordings, transcripts, review evidence and credentials
