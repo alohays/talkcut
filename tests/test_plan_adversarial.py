@@ -116,14 +116,16 @@ def test_cache_rejects_valid_hash_from_wrong_render(planned_project, inspected_f
     monkeypatch.setattr(media_module, "doctor", lambda: toolchain)
     settings = {
         "plan": project["active_plan"], "timeline": project["active_timeline"], "layout": plan["layout"],
+        "audio_processing": plan["audio_processing"],
         "implementation": {name: sha256(Path(workflow_module.__file__).with_name(name))
-                           for name in ("render.py", "timeline.py")},
+                           for name in ("render.py", "timeline.py", "audio_processing.py")},
         "toolchain": toolchain, "profile": "diagnostic", "preset": "medium", "crf": 18,
     }
     key = content_hash(settings)
     output = {**artifact_ref(source), "bytes": source.stat().st_size}
     native = store_artifact(planned_project, "adversarial", {
-        "complete": True, "status": "succeeded", "output": output,
+        "complete": True, "status": "succeeded", "output": output, "exit_code": 0,
+        "audio_processing": plan["audio_processing"],
         "timeline_hash": "foreign-timeline" if corruption == "foreign_timeline" else timeline["timeline_hash"],
     })
     success = {

@@ -399,6 +399,9 @@ def verify_quality(
         "stream_index": audio_inputs[0]["index"],
         "sample_rate": int(audio_inputs[0]["sample_rate"]),
     }
+    from .audio_processing import verify_audio_processing_binding
+
+    audio_profile = verify_audio_processing_binding(plan, timeline, workflow["settings"], native)
     recipe = build_render_command(
         timeline,
         source_parameters,
@@ -411,7 +414,8 @@ def verify_quality(
     _require(
         recipe["command"] == command
         and recipe["filtergraph"] == native["filtergraph"]
-        and recipe["layout"] == native["layout"],
+        and recipe["layout"] == native["layout"]
+        and recipe["audio_processing"] == audio_profile,
         "Actual render recipe changes full-frame composition or audio",
     )
     streams = probe(str(_file(workflow["output"])))["streams"]

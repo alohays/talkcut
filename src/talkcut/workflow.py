@@ -17,7 +17,7 @@ from .project import (
     store_artifact,
     verified_json,
 )
-from .render import render, validate_render
+from .render import build_render_command, render, validate_render
 
 
 def render_project(
@@ -31,7 +31,14 @@ def render_project(
     with project_lock(directory):
         project = load_project(directory)
         plan = verified_json(project["active_plan"])
+        from .audio_processing import audio_processing_for
+
+        audio_profile = audio_processing_for(plan)
+        if audio_profile != audio_processing_for(project):
+            raise TalkCutError("STALE_AUDIO_PROFILE", "Active plan and current project audio profiles differ")
         timeline = verified_json(project["active_timeline"])
+        if ("audio_processing" in plan and "audio_processing" not in timeline) or audio_processing_for(timeline) != audio_profile:
+            raise TalkCutError("STALE_AUDIO_PROFILE", "Active timeline audio profile differs from its immutable plan")
         if timeline["plan_hash"] != content_hash(plan):
             raise TalkCutError(
                 "STALE_TIMELINE", "Resolved timeline depends on a different plan"
@@ -69,7 +76,7 @@ def render_project(
         # successful artifact remains on disk when the renderer changes.
         implementation = {
             name: sha256(Path(__file__).with_name(name))
-            for name in ("render.py", "timeline.py")
+            for name in ("render.py", "timeline.py", "audio_processing.py")
         }
         from .media import doctor
 
@@ -78,6 +85,7 @@ def render_project(
             "plan": project["active_plan"],
             "timeline": project["active_timeline"],
             "layout": plan["layout"],
+            "audio_processing": audio_profile,
             "implementation": implementation,
             "toolchain": toolchain,
             "profile": profile,
@@ -96,6 +104,7 @@ def render_project(
                 success.get("render_id") != key
                 or success.get("settings") != settings
                 or native.get("timeline_hash") != timeline["timeline_hash"]
+                or native.get("audio_processing") != audio_profile
                 or success.get("profile") != profile
                 or success.get("test_only") != plan["test_only"]
                 or success.get("output") != native.get("output")
@@ -116,6 +125,10 @@ def render_project(
                     raise TalkCutError(
                         "STALE_RENDER", "Cached render used different source inputs"
                     )
+            recipe = build_render_command(timeline, sources, native["command"][-1], plan["layout"],
+                                          ffmpeg=native["command"][0], preset=preset, crf=crf)
+            if any(recipe[key] != native.get(key) for key in ("command", "filtergraph", "layout", "audio_processing")):
+                raise TalkCutError("STALE_RENDER", "Cached command differs from the exact plan-bound audio/render recipe")
             output = native["output"]
             if sha256(output["path"]) != output["sha256"] or not native.get("complete"):
                 raise TalkCutError(
@@ -177,6 +190,10 @@ def qc_project(directory: str | Path) -> dict[str, Any]:
     if sha256(output["path"]) != output["sha256"]:
         raise TalkCutError("STALE_RENDER", "Output hash changed")
     timeline = verified_json(project["active_timeline"])
+    plan = verified_json(project["active_plan"])
+    from .audio_processing import verify_audio_processing_binding
+
+    verify_audio_processing_binding(plan, timeline, success["settings"], native)
     if native["timeline_hash"] != timeline["timeline_hash"]:
         raise TalkCutError(
             "STALE_TIMELINE", "Current plan is different from rendered plan"

@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .audio_processing import audio_processing_for, validate_audio_processing
 from .project import (
     TalkCutError,
     artifact_ref,
@@ -44,7 +45,7 @@ def compile_plan(project: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any
         for candidate in plan["candidates"]
         if candidate["decision"] == "accepted"
     ]
-    return compile_timeline(
+    timeline = compile_timeline(
         screen["video"]["frames"],
         screen["video"]["time_base"],
         settings["screen_origin"],
@@ -70,6 +71,14 @@ def compile_plan(project: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any
         },
         plan_hash=content_hash(plan),
     )
+    if "audio_processing" in plan:
+        import hashlib
+        import json
+
+        timeline["audio_processing"] = validate_audio_processing(plan["audio_processing"])
+        timeline.pop("timeline_hash")
+        timeline["timeline_hash"] = hashlib.sha256(json.dumps(timeline, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return timeline
 
 
 def persist_plan(
@@ -168,6 +177,8 @@ def build_plan(
             "analysis_ref": analysis_ref,
             "timing": settings,
             "layout": project["layout"],
+            "audio_processing": audio_processing_for(project),
+            "audio_processing_reason": project.get("audio_processing_reason", "Original audio; no level processing"),
             "test_only": diagnostic,
             "protected_intervals": protected,
             "candidates": candidates,
@@ -276,3 +287,27 @@ def decide(
         }
         plan["parent"] = project["active_plan"]
         return persist_plan(directory, project, plan, f"candidate_{decision}")
+
+
+def set_audio_profile(directory: str | Path, gain_db: str, reason: str, expected_revision: int) -> dict[str, Any]:
+    """Revise the plan, preserving prior outputs and invalidating derived review."""
+    profile = validate_audio_processing({"schema_version": "audio-processing/v1", "gain_db": gain_db})
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 4000:
+        raise TalkCutError("INVALID_REASON", "A nonempty audio-profile reason is required (maximum 4000 characters)")
+    directory = Path(directory)
+    with project_lock(directory):
+        project = load_project(directory)
+        if type(expected_revision) is not int or project["revision"] != expected_revision:
+            raise TalkCutError("REVISION_CONFLICT", "Audio profile would overwrite a newer project revision")
+        if not project.get("active_plan"):
+            raise TalkCutError("PLAN_REQUIRED", "Build a plan before setting its audio profile")
+        plan = verified_json(project["active_plan"])
+        previous = audio_processing_for(plan)
+        plan["parent"] = project["active_plan"]
+        plan["audio_processing"] = profile
+        plan["audio_processing_reason"] = reason.strip()
+        plan["audio_processing_change"] = {"previous": previous, "at": now(), "reason": reason.strip()}
+        project["audio_processing"] = profile
+        project["audio_processing_reason"] = reason.strip()
+        result = persist_plan(directory, project, plan, "audio_profile_changed")
+        return {**result, "audio_processing": profile, "reason": reason.strip()}

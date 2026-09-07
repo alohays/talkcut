@@ -176,6 +176,7 @@ def init_project(
             "inspections": {},
             "sync": None,
             "audio_source": None,
+            "audio_processing": {"schema_version": "audio-processing/v1", "gain_db": "0"},
             "layout": {
                 "width_fraction": "1/8",
                 "margin_fraction": "1/100",
@@ -201,6 +202,9 @@ def load_project(directory: str | Path, verify_sources: bool = True) -> dict[str
             "Only talkcut-project/v1 is supported; draft-0 is not a project",
         )
     validate_project(project)
+    from .audio_processing import audio_processing_for
+
+    audio_processing_for(project)
     events = project["events"]
     if len(events) != project["revision"]:
         raise TalkCutError(

@@ -272,6 +272,27 @@ def verify_render(value: dict[str, Any], project: dict[str, Any]) -> dict[str, A
     _require(
         Path(native.get("log_path", "")).is_file(), "Native execution log is missing"
     )
+    from .audio_processing import verify_audio_processing_binding
+    from .render import build_render_command
+
+    audio_profile = verify_audio_processing_binding(plan, timeline, settings, native)
+    inspections = {role: _json(project["inspections"][role]) for role in ("screen", "speaker")}
+    inputs = {
+        role: {
+            **native["sources"][role],
+            "stream_index": inspections[role]["video"]["index"],
+            "width": inspections[role]["video"]["width"],
+            "height": inspections[role]["video"]["height"],
+            "sar": inspections[role]["video"]["sample_aspect_ratio"],
+        }
+        for role in ("screen", "speaker")
+    }
+    inputs["audio"] = {**native["sources"]["audio"], "stream_index": inspections[audio_role]["audio"]["index"], "sample_rate": timeline["sample_rate"]}
+    recipe = build_render_command(timeline, inputs, command[-1], plan["layout"],
+                                  ffmpeg=command[0], preset=settings["preset"], crf=settings["crf"])
+    _require(recipe["command"] == command and recipe["filtergraph"] == native["filtergraph"]
+             and recipe["layout"] == native["layout"] and recipe["audio_processing"] == audio_profile,
+             "Native command does not match the exact plan-bound rendering/audio recipe")
     output = _file(stored["output"])
     validation = validate_render(output, timeline, native["layout"], timeout=14400)
     _require(

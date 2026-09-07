@@ -101,6 +101,12 @@ def parser_for_cli() -> argparse.ArgumentParser:
     build.add_argument("--diagnostic", action="store_true")
     build.add_argument("--analysis", type=Path)
     build.add_argument("--json", action="store_true")
+    audio_profile = plans.add_parser("set-audio-profile", help="Revise the shared plan audio attenuation and invalidate renders/reviews")
+    audio_profile.add_argument("project", type=Path)
+    audio_profile.add_argument("--gain-db", required=True)
+    audio_profile.add_argument("--reason", required=True)
+    audio_profile.add_argument("--expected-revision", type=int, required=True)
+    audio_profile.add_argument("--json", action="store_true")
     test = plans.add_parser("add-test-cut")
     test.add_argument("project", type=Path)
     test.add_argument("--start", required=True)
@@ -302,6 +308,10 @@ def execute(args: argparse.Namespace) -> tuple[dict, int]:
 
         return analyze_sync_project(args.project), 1
     if args.command == "plan":
+        if args.action == "set-audio-profile":
+            from .plan import set_audio_profile
+
+            return set_audio_profile(args.project, args.gain_db, args.reason, args.expected_revision), 0
         from .plan import add_test_cut, build_plan, decide
 
         if args.action == "build":

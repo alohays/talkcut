@@ -145,6 +145,13 @@ def build_render_command(
         raise RenderError("CRF must be an integer between 0 and 51")
     if preset not in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}:
         raise RenderError("Unknown libx264 preset")
+    from .audio_processing import audio_filter_suffix, audio_processing_for
+
+    try:
+        audio_profile = audio_processing_for(dict(timeline))
+        audio_suffix = audio_filter_suffix(audio_profile)
+    except ValueError as error:
+        raise RenderError(str(error)) from error
     geometry = resolve_layout(sources["screen"], sources["speaker"], layout)
     inputs: list[str] = []
     labels = {}
@@ -217,9 +224,9 @@ def build_render_command(
             f"end_sample={span['audio_source_sample_end']},asetpts=N/SR/TB[a{i}]"
         )
     if len(spans) > 1:
-        graph.append("".join(f"[a{i}]" for i in range(len(spans))) + f"concat=n={len(spans)}:v=0:a=1,asetpts=N/SR/TB[aout]")
+        graph.append("".join(f"[a{i}]" for i in range(len(spans))) + f"concat=n={len(spans)}:v=0:a=1,asetpts=N/SR/TB{audio_suffix}[aout]")
     else:
-        graph.append("[a0]anull[aout]")
+        graph.append(f"[a0]anull{audio_suffix}[aout]")
     filtergraph = ";\n".join(graph)
     command = [ffmpeg, "-nostdin", "-hide_banner", "-v", "warning", "-n", "-copyts"]
     for path in inputs:
@@ -234,7 +241,7 @@ def build_render_command(
         "-ar", str(rate), "-movflags", "+faststart", "-f", "mp4", str(output_path),
     ])
     return {"command": command, "filtergraph": filtergraph, "layout": geometry,
-            "timeline_hash": declared_hash, "output": str(output_path)}
+            "timeline_hash": declared_hash, "output": str(output_path), "audio_processing": audio_profile}
 
 
 def _run_json(command: list[str], timeout: float | None) -> dict[str, Any]:
@@ -352,6 +359,7 @@ def render(
         "schema_version": "render/v1", "run_id": run_id, "status": "running", "complete": False,
         "timeline_hash": timeline["timeline_hash"], "sources": fingerprints,
         "command": spec["command"], "filtergraph": spec["filtergraph"], "layout": spec["layout"],
+        "audio_processing": spec["audio_processing"],
         "partial_path": str(partial), "log_path": str(log_path), "manifest_path": str(manifest_path),
         "requested_output": str(output), "owner_acceptance": "pending", "ai_review": "UNVERIFIED",
     }
