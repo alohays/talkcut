@@ -395,6 +395,7 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
                              historical_verification_command_observations: list[dict[str, Any]] | None = None,
                              auxiliary_source_trees: list[dict[str, Any]] | None = None,
                              auxiliary_source_tree_reobservations: list[dict[str, Any]] | None = None,
+                             source_tree_member_reobservations: list[dict[str, Any]] | None = None,
                              auxiliary_historical_source_trees: list[dict[str, Any]] | None = None) -> tuple[dict[str, str], list[str], dict[str, Any]]:
     """Derive mandatory exclusions from the evaluator's registered task.
 
@@ -442,6 +443,16 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         binding_key = (copied_tree["parent"]["path"], tuple(copied_tree["edge"]))
         _require(binding_key not in source_tree_bindings, "Source tree reobservation conflicts with an existing current/historical binding")
         source_tree_bindings[binding_key] = next(row for row in current_tree_observations if row["build"] == copied_tree["authority_build"])
+    source_members = _source_tree_member_reobservation_inventory(source_tree_member_reobservations,
+                                                                 source_tree_observations, directory, repo_root, set(registered.values()))
+    source_member_edges: dict[tuple[str, tuple[str | int, ...]], dict[str, Any]] = {}
+    source_member_consumed: set[tuple[str, tuple[str | int, ...]]] = set()
+    for member in source_members:
+        name, edge = member["parent"]["path"], tuple(member["edge"])
+        for other_name, other_edge in [*source_tree_bindings, *native_reobservation_edges, *source_member_edges]:
+            _require(name != other_name or (edge[:len(other_edge)] != other_edge and other_edge[:len(edge)] != edge),
+                     "Source member conflicts with another bound observation subtree")
+        source_member_edges[(name, edge)] = member
     runtime_edges = {(observation["request"]["path"], library["declared_reference"]["path"], library["declared_reference"]["sha256"]): library
                      for observation in runtime_observations for library in observation["libraries"]}
     # A diagnostic may repeat an already observed alias identity. This map is
@@ -691,6 +702,16 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
 
     def walk(value: Any, transcript: bool = False, key: str = "", *,
              origin_path: Path | None = None, edge: tuple[str | int, ...] = ()) -> None:
+        member = source_member_edges.get((str(origin_path), edge))
+        if member is not None:
+            _require(not transcript and not contains_transcript(value) and refs[str(origin_path)]["kind"] == "review"
+                     and refs[str(origin_path)]["sha256"] == member["parent"]["sha256"]
+                     and json.dumps(value, sort_keys=True, separators=(",", ":"))
+                     == json.dumps(member["value"], sort_keys=True, separators=(",", ":")),
+                     "Source member private context, parent or exact typed row changed")
+            protect_values(value)
+            source_member_consumed.add((str(origin_path), edge))
+            return
         tree = source_tree_bindings.get((str(origin_path), edge))
         if tree is not None:
             _require(not transcript and not contains_transcript(value)
@@ -870,7 +891,7 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         parent_ref = observation["parent"]
         add(Path(parent_ref["path"]), "review", parent_ref["sha256"], parse_json=True)
         inspect_text(Path(parent_ref["path"]), True, parse_json=True)
-    for copied_tree in source_tree_reobservations:
+    for copied_tree in [*source_tree_reobservations, *source_members]:
         parent_ref = copied_tree["parent"]
         add(Path(parent_ref["path"]), "review", parent_ref["sha256"], parse_json=True)
         inspect_text(Path(parent_ref["path"]), True, parse_json=True)
@@ -943,6 +964,12 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
              "Source tree reobservation parent, recorder or authority changed during inventory")
     _require(not any(known.get(row["parent"]["sha256"]) in {"media", "transcript"} for row in source_tree_reobservations),
              "Protected source/transcript identity cannot become source tree reobservation metadata")
+    _require(source_member_consumed == set(source_member_edges), "Source member locator did not name a consumed exact private edge")
+    _require(source_members == _source_tree_member_reobservation_inventory(source_tree_member_reobservations,
+                                                                           source_tree_observations, directory, repo_root, digests),
+             "Source member parent, origin, authority or bytes changed during inventory")
+    _require(not any(known.get(row["parent"]["sha256"]) in {"media", "transcript"} for row in source_members),
+             "Protected source/transcript identity cannot become source member metadata")
     for reuse in runtime_reuses.values():
         _file(reuse["parent"])
     _require(auxiliary_runtime_observations == _auxiliary_runtime_inventory(auxiliary_runtime_requests, directory, repo_root, digests)
@@ -980,6 +1007,7 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         "auxiliary_runtime_reobservations": list(runtime_reuses.values()),
         "auxiliary_source_trees": current_tree_observations,
         "auxiliary_source_tree_reobservations": source_tree_reobservations,
+        "source_tree_member_reobservations": source_members,
         "auxiliary_historical_source_trees": historical_tree_observations,
         "synthetic_failure_fixtures": fixture_observations,
         "historical_unresolved": [row for row in historical_refs.values() if row["status"] != "RESOLVED"],
@@ -1083,6 +1111,7 @@ def build_private_inventory(project_dir: str | Path, expected_source_hashes: dic
                              historical_verification_command_observations: list[dict[str, Any]] | None = None,
                              auxiliary_source_trees: list[dict[str, Any]] | None = None,
                              auxiliary_source_tree_reobservations: list[dict[str, Any]] | None = None,
+                             source_tree_member_reobservations: list[dict[str, Any]] | None = None,
                              auxiliary_historical_source_trees: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Collect the finite task denominator for a separate privacy auditor.
 
@@ -1103,6 +1132,7 @@ def build_private_inventory(project_dir: str | Path, expected_source_hashes: dic
                                           historical_verification_command_observations=historical_verification_command_observations,
                                           auxiliary_source_trees=auxiliary_source_trees,
                                           auxiliary_source_tree_reobservations=auxiliary_source_tree_reobservations,
+                                          source_tree_member_reobservations=source_tree_member_reobservations,
                                           auxiliary_historical_source_trees=auxiliary_historical_source_trees)
     entries = {ref["path"]: {**ref, "entry_type": "file", "classification": ref["kind"]}
                for ref in known["known_refs"]}
@@ -1200,6 +1230,7 @@ def _audited_private_inventory(raw: dict[str, Any], directory: Path | None,
                                       historical_verification_command_observations=raw.get("historical_verification_command_observations"),
                                       auxiliary_source_trees=raw.get("auxiliary_source_trees"),
                                       auxiliary_source_tree_reobservations=raw.get("auxiliary_source_tree_reobservations"),
+                                      source_tree_member_reobservations=raw.get("source_tree_member_reobservations"),
                                       auxiliary_historical_source_trees=raw.get("auxiliary_historical_source_trees"))
     _require(snapshot.get("schema_version") == "private-task-inventory/v1" and snapshot.get("project") == current["project"]
              and snapshot.get("scope") == current["scope"] and snapshot.get("dependencies") == current["dependencies"]
@@ -1329,6 +1360,7 @@ def verify_release_privacy(raw_ref: dict[str, Any], repo_root: str | Path, *, pr
                                       historical_verification_command_observations=raw.get("historical_verification_command_observations"),
                                       auxiliary_source_trees=raw.get("auxiliary_source_trees"),
                                       auxiliary_source_tree_reobservations=raw.get("auxiliary_source_tree_reobservations"),
+                                      source_tree_member_reobservations=raw.get("source_tree_member_reobservations"),
                                       auxiliary_historical_source_trees=raw.get("auxiliary_historical_source_trees"))
     private_inventory["missing_from_submitted_corpus"] = sorted(set(known) - submitted)
     private.update(known)
@@ -2328,6 +2360,146 @@ def _source_tree_reobservation_inventory(locators: list[dict[str, Any]] | None,
                                                  for role, path, identity, _ in identities},
                              "claim_status": "UNVERIFIED", "execution_status": "UNVERIFIED", "classification_status": "UNVERIFIED",
                              "scope": "Exact current private source copy and original recorder only; no root assertion, build/runtime/history, public or AV approval"})
+    return observations
+
+
+def _source_tree_member_reobservation_inventory(locators: list[dict[str, Any]] | None,
+                                               authorities: list[dict[str, Any]], directory: Path,
+                                               repo: Path | None, registered: set[str]) -> list[dict[str, Any]]:
+    """Bind an exact copied row to a fully observed current or historical tree.
+
+    The caller supplies full producer-validated authorities and revalidates them
+    after traversal. Neither this locator nor its copied row supplies a root or
+    a historical relocation, and the original execution claim stays unverified.
+    """
+    _require(locators is None or isinstance(locators, list), "Source member observations require explicit locators")
+    _require(len(locators or []) <= 512, "Source member observation count exceeds its finite bound")
+    observations: list[dict[str, Any]] = []
+    occupied: set[tuple[str, tuple[str | int, ...]]] = set()
+
+    def read(ref: Any, *, limit: int = MAX_UNIT_BYTES) -> tuple[Path, os.stat_result]:
+        _require(isinstance(ref, dict) and {"path", "sha256"} <= set(ref) <= {"path", "sha256", "bytes"}
+                 and isinstance(ref.get("path"), str) and isinstance(ref.get("sha256"), str)
+                 and re.fullmatch(r"[a-f0-9]{64}", ref["sha256"]) is not None,
+                 "Source member artifact ref is malformed")
+        try:
+            identity = Path(ref["path"]).lstat()
+        except OSError as error:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Source member artifact is unavailable") from error
+        path = _file(ref)
+        _require(str(path) == ref["path"] and path == path.resolve() and path.is_relative_to(directory)
+                 and not any(path.is_relative_to(directory / name) for name in ("sources", "renders", "reviews", "review", "transcripts"))
+                 and path.name not in {"project.json", "acceptance.local.json"} and ref["sha256"] not in registered,
+                 "Source member artifact is outside its canonical auxiliary scope")
+        _require(stat.S_ISREG(identity.st_mode) and identity.st_nlink == 1 and identity.st_size <= limit
+                 and _source_file_identity(path.stat()) == _source_file_identity(identity)
+                 and ("bytes" not in ref or type(ref["bytes"]) is int and ref["bytes"] == identity.st_size),
+                 "Source member artifact identity, bytes, links or bound changed")
+        return path, identity
+
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        parsed: dict[str, Any] = {}
+        for name, value in pairs:
+            _require(name not in parsed, "Source member JSON has duplicate keys")
+            parsed[name] = value
+        return parsed
+
+    def body(path: Path) -> Any:
+        try:
+            return json.loads(path.read_bytes(), object_pairs_hook=unique)
+        except TalkCutError:
+            raise
+        except (ValueError, UnicodeDecodeError) as error:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Source member metadata is not bounded JSON") from error
+
+    def resolve(value: Any, expression: Any) -> tuple[Any, tuple[str | int, ...]]:
+        _require(isinstance(expression, str) and expression.startswith("/") and len(expression) <= 2048,
+                 "Source member requires bounded exact JSON pointers")
+        tokens = expression[1:].split("/")
+        _require(all(token and re.search(r"~(?![01])", token) is None for token in tokens), "Source member pointer is malformed")
+        edge: list[str | int] = []
+        for encoded in tokens:
+            token = encoded.replace("~1", "/").replace("~0", "~")
+            if isinstance(value, dict):
+                _require(token in value, "Source member pointer is absent")
+                value = value[token]
+                edge.append(token)
+            elif isinstance(value, list):
+                _require(re.fullmatch(r"0|[1-9][0-9]*", token) is not None and int(token) < len(value),
+                         "Source member array pointer is invalid")
+                value = value[int(token)]
+                edge.append(int(token))
+            else:
+                raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Source member pointer crosses a scalar")
+        return value, tuple(edge)
+
+    for locator in locators or []:
+        _require(isinstance(locator, dict) and set(locator) == {
+            "parent", "pointer", "authority_build", "authority_manifest", "manifest_row_index", "origin_pointer"},
+            "Source member locator has unsupported fields")
+        parent, parent_identity = read(locator["parent"])
+        build_path, build_identity = read(locator["authority_build"])
+        manifest_path, manifest_identity = read(locator["authority_manifest"])
+        matches = [row for row in authorities if all(
+            row[key].get("path") == locator[field]["path"] and row[key].get("sha256") == locator[field]["sha256"]
+            for key, field in (("build", "authority_build"), ("selected_manifest", "authority_manifest")))]
+        _require(len(matches) == 1, "Source member lacks one exact fully observed build and selected manifest authority")
+        authority = matches[0]
+        _require(authority["claim_status"] == "UNVERIFIED", "Source member cannot inherit an execution approval")
+        manifest = body(manifest_path)
+        _require(json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+                 == json.dumps(authority["manifest_value"], sort_keys=True, separators=(",", ":")),
+                 "Source member manifest differs from the full typed authority")
+        index = locator["manifest_row_index"]
+        _require(type(index) is int and 0 <= index < authority["row_count"], "Source member manifest row index is invalid")
+        full_row = manifest["files"][index]
+        parent_body = body(parent)
+        _auxiliary_json(parent, repo, registered)
+        value, edge = resolve(parent_body, locator["pointer"])
+        origin, origin_edge = resolve(parent_body, locator["origin_pointer"])
+        owner: Any = parent_body
+        for token in edge[:-1]:
+            owner = owner[token]
+        _require(isinstance(owner, dict) and edge != origin_edge and edge[:-1] == origin_edge[:-1]
+                 and isinstance(origin, str) and origin == str(manifest_path),
+                 "Source member origin is outside its exact selected observation object or manifest")
+        _require(isinstance(value, dict) and set(value) in ({"path", "sha256"}, {"path", "sha256", "bytes"})
+                 and json.dumps(value, sort_keys=True, separators=(",", ":"))
+                 == json.dumps({key: full_row[key] for key in value}, sort_keys=True, separators=(",", ":")),
+                 "Source member differs from the exact typed row or closed path/hash projection")
+        member = authority["files"][index]
+        _require(member["original_relative_path"] == full_row["path"] and member["actual"]["sha256"] == full_row["sha256"]
+                 and type(member["bytes"]) is int and member["bytes"] == full_row["bytes"],
+                 "Source member physical authority differs from its indexed full manifest row")
+        member_path, member_identity = read(member["actual"], limit=MAX_TOTAL_BYTES)
+        _require(member_identity.st_size == full_row["bytes"], "Source member physical bytes differ from the full row")
+        identities = [(parent, parent_identity, locator["parent"]), (build_path, build_identity, locator["authority_build"]),
+                      (manifest_path, manifest_identity, locator["authority_manifest"]), (member_path, member_identity, member["actual"])]
+        authority_paths = set()
+        for ref in authority["parents"]:
+            path, identity = read(ref)
+            authority_paths.add(path)
+            if path.suffix.lower() == ".json":
+                body(path)
+            identities.append((path, identity, ref))
+        _require(parent not in authority_paths and len({parent, build_path, manifest_path, member_path}) == 4,
+                 "Source member parent must be separate from its authority and physical member")
+        key = (str(parent), edge)
+        _require(key not in occupied, "Duplicate/conflicting source member edge")
+        occupied.add(key)
+        for path, identity, ref in identities:
+            _require(_source_file_identity(path.stat()) == _source_file_identity(identity)
+                     and artifact_ref(path)["sha256"] == ref["sha256"], "Source member bytes changed during observation")
+        observations.append({"parent": artifact_ref(parent), "pointer": locator["pointer"], "edge": list(edge),
+                             "origin_pointer": locator["origin_pointer"], "origin_edge": list(origin_edge),
+                             "authority_build": authority["build"], "authority_manifest": authority["selected_manifest"],
+                             "authority_kind": "historical" if "physical_snapshot_directory" in authority else "current",
+                             "manifest_row_index": index, "full_row": full_row, "value": value, "member": member,
+                             "row_count": authority["row_count"], "total_bytes": authority["total_bytes"],
+                             "current_row_count": len(authority.get("current_files", [])),
+                             "file_identities": {str(path): list(_source_file_identity(identity)) for path, identity, _ in identities},
+                             "claim_status": "UNVERIFIED", "execution_status": "UNVERIFIED", "classification_status": "UNVERIFIED",
+                             "scope": "Exact private copied source member and full authority bytes only; no original execution, current runtime, publication or AV approval"})
     return observations
 
 
