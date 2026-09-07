@@ -696,6 +696,11 @@ def _clip(
         "aac",
         "-b:a",
         "192k",
+        # Keep packets until both streams are available. With sparse video,
+        # the default timeout can interleave identical encoded packets in a
+        # different order across runs, breaking exact clip reconstruction.
+        "-max_interleave_delta",
+        "0",
         "-movflags",
         "+faststart",
         "-progress",
