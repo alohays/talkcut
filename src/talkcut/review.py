@@ -106,6 +106,15 @@ def _media_streams(
 
 def _receipt(ref: Any) -> dict[str, Any]:
     value = _artifact(ref)
+    if value.get("schema_version") == "composite-review-receipt/v1":
+        from .composite_review import verify_composite_receipt
+
+        return verify_composite_receipt(ref)
+    _require(
+        not str(value.get("model_revision", "")).startswith("composite/")
+        and "composite_graph" not in value,
+        "Composite cannot bypass its typed execution graph",
+    )
     _require(
         value.get("schema_version") == "execution-receipt/v1",
         "Provider execution receipt missing",
@@ -158,6 +167,14 @@ def _capability(
         "Executed capability record missing",
     )
     execution = _receipt(value.get("receipt"))
+    if execution.get("_composite_verified"):
+        from .composite_review import verify_composite_receipt
+
+        execution = verify_composite_receipt(
+            value["receipt"],
+            precision_required=precision_required,
+            forbidden_artifacts=[value["challenge"]],
+        )
     _require(
         value.get("model_revision") == execution["model_revision"],
         "Capability model differs from execution",
@@ -247,7 +264,8 @@ def _capability(
         "model_revision": execution["model_revision"],
         "max_actual_frame_gap_ms": float(gap * 1000),
         "audio_continuous": True,
-        "precision_supported": gap <= Fraction(40, 1000),
+        "precision_supported": gap <= Fraction(40, 1000)
+        and execution.get("_composite_precision_verified", True),
         "sampling_limitations": observation.get(
             "sampling_limitations",
             "Known timestamped frame sequence; no claim about unobserved events between samples",
@@ -302,7 +320,7 @@ def verify_context_execution(context: dict[str, Any]) -> dict[str, Any]:
         )
         _require(
             request.get("scope") == "analysis"
-            and request.get("schema_version") == "review-request/v1",
+            and _executed_request_schema(request, execution),
             "Source analysis must identify the actual bounded AV request",
         )
         _require(
@@ -372,13 +390,30 @@ def windows(
     return result
 
 
+def _executed_request_schema(
+    request: dict[str, Any], execution: dict[str, Any]
+) -> bool:
+    if request.get("schema_version") == "review-request/v1":
+        return True
+    if request.get("schema_version") != "composite-review-request/v1":
+        return False
+    # Never trust a manually copied internal marker on an arbitrary receipt.
+    from .composite_review import verify_composite_receipt
+
+    ref = execution.get("_composite_receipt")
+    _require(isinstance(ref, dict), "Composite receipt reference missing")
+    assert isinstance(ref, dict)
+    verified = verify_composite_receipt(ref)
+    return verified == execution and _artifact(verified["request"]) == request
+
+
 def validate_review_request(
     record: dict[str, Any], execution: dict[str, Any]
 ) -> dict[str, Any]:
     """Bind a ledger entry to the executed scope, intervals and current media."""
     request = _artifact(execution["request"])
     _require(
-        request.get("schema_version") == "review-request/v1",
+        _executed_request_schema(request, execution),
         "Executed request schema is missing",
     )
     _require(

@@ -241,6 +241,18 @@ class Evaluator:
         provider: bool = False,
     ) -> dict[str, Any]:
         value = self.artifact(ref)
+        if provider and value.get("schema_version") == "composite-review-receipt/v1":
+            from .review import _receipt
+
+            verified = _receipt(ref)
+            self.dependencies(verified, dependency_names)
+            return verified
+        self.require(
+            not str(value.get("model_revision", "")).startswith("composite/")
+            and "composite_graph" not in value,
+            "Composite provider must validate its actual execution graph",
+            "UNVERIFIED",
+        )
         self.require(
             value.get("schema_version") == "execution-receipt/v1",
             "Execution receipt schema is missing",

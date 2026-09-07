@@ -113,6 +113,13 @@ modalities, observation coverage and demonstrated capability. Cloud analysis is
 disabled by default. No cloud SDK, paid API or automatic provider fallback is
 configured. Local ASR also does not substitute for audiovisual review.
 
+Composite review receipts bind the actual audio model execution, PCM analysis,
+timestamped images and a separate final reviewer to one request and calibrated
+recipe. The CLI image route also verifies its original session, raw child results,
+input hashes and process completion. An independent registration audit is required;
+diagnostic results cannot be promoted retroactively. Composite semantic review
+does not yet support dense-motion or lip-sync precision approval.
+
 `qc --compare-source` streams every retained full-resolution frame outside the
 speaker rectangle and every valid PCM sample against the measured source mapping.
 It records pixel/waveform differences and potential new black, freeze, silence,
