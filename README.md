@@ -120,6 +120,25 @@ input hashes and process completion. An independent registration audit is requir
 diagnostic results cannot be promoted retroactively. Composite semantic review
 does not yet support dense-motion or lip-sync precision approval.
 
+After rendering the final master and importing its separate candidate reviews,
+`editorial prepare` captures the current analysis, plan, timeline and output.
+Use the returned snapshot path when binding those reviews:
+
+```sh
+uv run --locked talkcut editorial prepare projects/my-lecture --json
+uv run --locked talkcut editorial bind projects/my-lecture --snapshot SNAPSHOT_JSON --review-import REVIEW_IMPORT_JSON --json
+```
+
+Repeat `--review-import` for each applicable imported review. Binding revalidates
+the original proposals, distinct reviewer executions and prompts, current cut
+boundaries, and source/output hashes. It captures the local verification command
+and indexes its result. Every applied cut needs current audiovisual evidence,
+including cuts selected by the automatic preparation/silence policy. With no
+applied cuts, supply `--no-safe-cuts-audit AUDIT_JSON` and the full-source review
+imports; the audit must independently cover every original candidate and explain
+why no safe deletion remains. Diagnostic output and analysis-free keep-all plans
+cannot bind. Changed code, media or decisions require a fresh binding.
+
 `qc --compare-source` streams every retained full-resolution frame outside the
 speaker rectangle and every valid PCM sample against the measured source mapping.
 It records pixel/waveform differences and potential new black, freeze, silence,
