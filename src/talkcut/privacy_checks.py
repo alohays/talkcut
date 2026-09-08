@@ -37,6 +37,7 @@ from jsonschema.exceptions import SchemaError
 
 from . import (
     privacy_acceptance_origins,
+    privacy_contract_origins,
     privacy_machine_origins,
     privacy_oversized_origins,
     privacy_retention_origins,
@@ -957,6 +958,8 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
             family = selected.get("family")
             if family == "acceptance_cli_report":
                 machine = privacy_acceptance_origins.verify(selected, root, read, document)
+            elif family == "contract_template":
+                machine = privacy_contract_origins.verify(selected, root, read, document)
             elif family == "independent_privacy_inventory":
                 machine = privacy_machine_origins.verify_independent_inventory(selected, root, read, document)
             elif family == "oversized_stdout_inventory":
@@ -1109,10 +1112,13 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
                      "Machine review text kind differs from its bound authority family")
             parent_path, _ = read(locator["parent"])
             acceptance = bound["machine_family"] == "acceptance_cli_report"
+            template = bound["machine_family"] == "contract_template"
             origin_path = parent_path
             if acceptance:
                 _require(bound["machine"]["project"] == directory, "Acceptance original command names another project")
                 origin_path = Path(privacy_acceptance_origins.original_parent(bound["machine"], locator["parent"])["path"])
+            elif template:
+                origin_path = Path(privacy_contract_origins.original_parent(bound["machine"], locator["parent"])["path"])
             _require(origin_path.is_relative_to(directory) and locator["parent"]["sha256"] not in registered
                      and not any(path.is_relative_to(directory / name) for path in (parent_path, origin_path) for name in
                                  ("sources", "transcripts", "renders", "reviews", "review", "analysis")),
@@ -1124,6 +1130,7 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
             _require(retention or not speech(parent), "Machine review parent contains a transcript context")
             machine = bound["machine"]
             project_field = (privacy_acceptance_origins.project_field if acceptance
+                             else privacy_contract_origins.project_field if template
                              else privacy_retention_origins.retention_field if retention
                              else privacy_machine_origins.fixed_inventory_field)
             if bound["machine_family"] == "oversized_stdout_inventory":
@@ -1164,9 +1171,10 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
                            "source_snapshot": source_ref, "selected_value": selected_leaf,
                            "associated_row": projection["row"], "extractions": projection["extractions"],
                            "authority": locator["authority"], "authority_refs": bound["refs"], "commands": [],
-                           **({"source_dependencies": source_dependencies} if acceptance else {}),
+                           **({"source_dependencies": source_dependencies} if acceptance or template else {}),
                            "classification": "review", "claim_status": "UNVERIFIED",
-                           "scope": "Exact original machine-written leaf only; full parent remains private and original execution is not approved"})
+                           "scope": ("Exact original source-data construction leaf only; full parent remains private and contract validity, invocation and physical copying are not approved"
+                                     if template else "Exact original machine-written leaf only; full parent remains private and original execution is not approved")})
             continue
         _require(isinstance(locator, dict) and locator.get("kind") in {"python_inspection", "document_paragraph", "document_complete", "junit_test_name", "wheel_member_name", "locked_download_url", "json_schema_dialect"},
                  "Unsupported review text origin kind")
