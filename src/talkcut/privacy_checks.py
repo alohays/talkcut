@@ -23,16 +23,21 @@ import subprocess
 import tarfile
 import tempfile
 import threading
+import tomllib
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from importlib.resources import files as package_files
 from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
+
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
 
 from .contracts import code_identity, object_hash
 from .project import TalkCutError, artifact_ref, load_project, sha256
-from .verification import _terminate_group
+from .verification import _junit, _terminate_group
 
 MAX_UNIT_BYTES = 16 * 1024 * 1024
 MAX_TOTAL_BYTES = 256 * 1024 * 1024
@@ -679,12 +684,169 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
         _require(isinstance(value, dict), "Review text authority must be an object")
         return value
 
+    def verification_authority(selected: dict[str, Any]) -> dict[str, Any]:
+        _require(set(selected) == {"schema_version", "report", "receipt", "producer", "copies"}
+                 and selected["schema_version"] == "review-verification-source-authority/v1",
+                 "Review verification authority has unsupported fields")
+        report = document(selected["report"])
+        schema = report.get("schema_version")
+        _require(schema in {"oss-verification/v1", "public-integration-validation/v1"},
+                 "Review verification origin has an unsupported report schema")
+        _require(isinstance(report.get("before"), dict) and report["before"] == report.get("after"),
+                 "Review verification origin has changed original source maps")
+        identity = report["before"].get("code_identity", report["before"])
+        _require(isinstance(identity, dict) and set(identity) == {"code_revision", "code_tree_hash", "files"}
+                 and isinstance(identity["files"], dict) and identity["files"]
+                 and identity["code_tree_hash"] == object_hash(identity["files"])
+                 and isinstance(identity["code_revision"], str) and re.fullmatch(r"[a-f0-9]{40}", identity["code_revision"])
+                 and all(isinstance(k, str) and isinstance(v, str) and re.fullmatch(r"[a-f0-9]{64}", v)
+                         for k, v in identity["files"].items()), "Review verification origin source identity is incomplete")
+        _, producer_bytes = read(selected["producer"])
+        producer_relative = "src/talkcut/verification.py"
+        _require(selected["producer"]["sha256"] == identity["files"].get(producer_relative),
+                 "Review verification producer differs from the original source map")
+        commands: list[dict[str, Any]] = []
+        original_producer = _command(["git", "--no-replace-objects", "show", identity["code_revision"] + ":" + producer_relative], root, commands)
+        _require(original_producer == producer_bytes, "Review verification producer differs from its original Git source")
+        try:
+            syntax = ast.parse(producer_bytes.decode())
+            current = ast.parse(Path(__file__).with_name("verification.py").read_bytes())
+        except (ValueError, UnicodeDecodeError, SyntaxError) as exc:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Review verification producer is not Python") from exc
+        old_parsers = [n for n in syntax.body if isinstance(n, ast.FunctionDef) and n.name == "_junit"]
+        current_parsers = [n for n in current.body if isinstance(n, ast.FunctionDef) and n.name == "_junit"]
+        _require(len(old_parsers) == len(current_parsers) == 1 and ast.dump(old_parsers[0]) == ast.dump(current_parsers[0]),
+                 "Review verification original JUnit parser differs from the fixed parser")
+        refs = [selected["report"], selected["producer"]]
+        if schema == "oss-verification/v1":
+            _require(report.get("repo_root") == str(root)
+                     and report.get("producer") == {"path": producer_relative, "sha256": selected["producer"]["sha256"]},
+                     "Review verification report names another repository or producer")
+            receipt = document(selected["receipt"])
+            _require(receipt.get("schema_version") == "execution-receipt/v1"
+                     and receipt.get("operation") == "verification:run" and receipt.get("result") == selected["report"]
+                     and receipt.get("run_id") == report.get("run_id")
+                     and receipt.get("dependencies") == {"code_tree_hash": identity["code_tree_hash"],
+                         "documentation_example_hash": report["before"].get("documentation_example_hash")},
+                     "Review verification receipt does not bind the original result and source maps")
+            _, execution_bytes = read(receipt.get("commands"))
+            try:
+                executions = json.loads(execution_bytes, object_pairs_hook=object_pairs)
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Review verification executions are not JSON") from exc
+            _require(executions == report.get("executions"), "Review verification original execution rows differ")
+            refs.extend([selected["receipt"], receipt["commands"]])
+            observed = report.get("validations", {}).get("junit")
+            prefix = ["validations", "junit", "nodes"]
+        else:
+            _require(selected["receipt"] is None, "Review integration origin cannot invent an in-process receipt")
+            executions = report.get("commands")
+            observed = report.get("junit")
+            prefix = ["junit", "nodes"]
+        _require(isinstance(observed, dict) and set(observed) == {"status", "counts", "nodes", "raw"}
+                 and isinstance(observed["nodes"], list) and 0 < len(observed["nodes"]) <= MAX_UNITS,
+                 "Review verification JUnit table is incomplete or oversized")
+        xml_path, xml_bytes = read(observed["raw"])
+        _require(b"<!DOCTYPE" not in xml_bytes and b"<!ENTITY" not in xml_bytes,
+                 "Review verification JUnit cannot contain document or entity declarations")
+        try:
+            parsed = _junit(xml_path)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Review verification JUnit is malformed") from exc
+        _require(json.dumps(parsed, sort_keys=True) == json.dumps(observed, sort_keys=True),
+                 "Review verification JUnit differs from its complete original XML extraction")
+        _require(isinstance(executions, list) and len(executions) <= MAX_UNITS
+                 and all(isinstance(row, dict) and isinstance(row.get("argv"), list) for row in executions),
+                 "Review verification command table is incomplete")
+        selected_commands = [row for row in executions if str(xml_path) in row["argv"] or "--junitxml=" + str(xml_path) in row["argv"]]
+        _require(len(selected_commands) == 1, "Review verification JUnit lacks one exact original pytest command")
+        command = selected_commands[0]
+        command_fields = {"argv", "cwd", "error", "exit_code", "finished_at", "interrupted", "name", "receipt", "schema_version",
+                          "started_at", "status", "stderr", "stdout", "timed_out", "timeout_seconds", "wall_seconds"}
+        _require(set(command) == command_fields and command.get("schema_version") == "verification-command/v1"
+                 and command.get("cwd") == str(root) and command.get("interrupted") is False and command.get("timed_out") is False
+                 and command.get("error") is None and type(command.get("exit_code")) is int and command["exit_code"] in {0, 1}
+                 and all(isinstance(value, str) for value in command["argv"]), "Review verification pytest command is not a completed typed observation")
+        argv = command["argv"]
+        uv_form = (schema == "oss-verification/v1" and len(argv) == 10 and Path(argv[0]).is_absolute()
+                   and argv[1:8] == ["run", "--locked", "pytest", "-q", "tests", "--junitxml", str(xml_path)]
+                   and argv[8:] == ["--basetemp", str(Path(report["directory"]) / "pytest-basetemp")])
+        integration_form = (schema == "public-integration-validation/v1" and len(argv) >= 7 and Path(argv[0]).is_absolute()
+                            and argv[1:4] == ["-m", "pytest", "-q"] and argv[-1] == "--junitxml=" + str(xml_path)
+                            and argv[-2].startswith("--basetemp=") and Path(argv[-2].split("=", 1)[1]).is_absolute()
+                            and all(name.startswith("tests/") and name.endswith(".py") and name in identity["files"] for name in argv[4:-2]))
+        _require(uv_form or integration_form, "Review verification pytest argv differs from its closed original form")
+        _require(document(command["receipt"]) == {k: v for k, v in command.items() if k != "receipt"},
+                 "Review verification pytest receipt differs from its original command")
+        for name in ("stdout", "stderr"):
+            read(command[name])
+        refs.extend([observed["raw"], command["receipt"], command["stdout"], command["stderr"]])
+        parents = {selected["report"]["path"]: {"ref": selected["report"], "prefix": prefix}}
+        _require(isinstance(selected["copies"], list) and len(selected["copies"]) <= MAX_UNITS,
+                 "Review verification copies must be bounded exact references")
+        for copy_ref in selected["copies"]:
+            copy = document(copy_ref)
+            _require(copy_ref["path"] not in parents, "Review verification parent is duplicated")
+            if schema == "oss-verification/v1":
+                _require(set(copy) == set(report) | {"artifact_ref", "receipt"}
+                         and copy.get("artifact_ref") == selected["report"] and copy.get("receipt") == selected["receipt"]
+                         and json.dumps({k: v for k, v in copy.items() if k not in {"artifact_ref", "receipt"}}, sort_keys=True)
+                         == json.dumps(report, sort_keys=True), "Review verification copy differs from its complete original report")
+                copy_prefix = prefix
+            else:
+                _require(set(copy) == {"affected_junit", "after", "before", "change", "commands", "initial_197_junit", "initial_result", "schema_version", "unchanged"}
+                         and copy.get("schema_version") == "public-integration-recheck/v1"
+                         and copy.get("initial_result") == selected["report"]
+                         and json.dumps(copy.get("initial_197_junit"), sort_keys=True) == json.dumps(observed, sort_keys=True),
+                         "Review integration copy differs from its original JUnit observation")
+                copy_prefix = ["initial_197_junit", "nodes"]
+            parents[copy_ref["path"]] = {"ref": copy_ref, "prefix": copy_prefix}
+            refs.append(copy_ref)
+        return {"refs": refs, "source_files": identity["files"], "code_identity": identity,
+                "request_inputs": [{"path": str(root / name), "sha256": digest} for name, digest in identity["files"].items()],
+                "junit_parents": parents, "report": report, "commands": commands, "junit": observed, "producer_source": producer_bytes.decode(),
+                "selected_test_paths": ["tests"] if uv_form else argv[4:-2],
+                "scope": "Exact original XML/parser/source field derivation only; original statuses are not approved"}
+
     def authority(ref: Any) -> dict[str, Any]:
         _require(ref in approved, "Review text observation has no separately bound authority root")
         read(ref)
         if ref["sha256"] in authority_cache:
             return authority_cache[ref["sha256"]]
         selected = document(ref)
+        if selected.get("schema_version") == "review-json-schema-dialect-authority/v1":
+            _require(set(selected) == {"schema_version", "parent"}, "Review dialect authority has unsupported fields")
+            schema = document(selected["parent"])
+            resource_root = Path(str(package_files("jsonschema_specifications") / "schemas" / "draft202012")).resolve()
+            metaschema_ref = artifact_ref(resource_root / "metaschema.json")
+            metaschema = document(metaschema_ref)
+            _require(json.dumps(metaschema, sort_keys=True) == json.dumps(Draft202012Validator.META_SCHEMA, sort_keys=True),
+                     "Review dialect metadata differs from the fixed validator metaschema")
+            identifier = metaschema.get("$id")
+            _require(isinstance(identifier, str) and schema.get("$schema") == identifier,
+                     "Review dialect field is not the exact supported metaschema identifier")
+            try:
+                Draft202012Validator.check_schema(schema)
+            except SchemaError as exc:
+                raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Review dialect parent is not a valid schema") from exc
+            meta_refs = []
+            for path in sorted(resource_root.rglob("*")):
+                if path.is_file():
+                    _require(not path.is_symlink() and path.resolve() == path, "Review dialect dependency is aliased")
+                    resource_ref = artifact_ref(path)
+                    document(resource_ref)
+                    meta_refs.append(resource_ref)
+            _require(0 < len(meta_refs) <= MAX_UNITS and metaschema_ref in meta_refs,
+                     "Review dialect fixed vocabulary resources are incomplete")
+            verified = {"refs": [ref, selected["parent"], *meta_refs], "dialect_parent": selected["parent"],
+                        "dialect_identifier": identifier, "metaschema": metaschema_ref}
+            authority_cache[ref["sha256"]] = verified
+            return verified
+        if selected.get("schema_version") == "review-verification-source-authority/v1":
+            verified = verification_authority(selected)
+            verified["refs"] = [ref, *verified["refs"]]
+            authority_cache[ref["sha256"]] = verified
+            return verified
         names = {"inspection", "request", "snapshot", "verification", "execution", "producer", "response"}
         _require(set(selected) == {"schema_version", *names}
                  and selected["schema_version"] == "review-text-source-authority/v1",
@@ -777,21 +939,30 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
                  "Review text inspection log does not bind the exact original result")
         observed = {"root": ref, "refs": [ref, *[selected[name] for name in sorted(names)], execution["stdout"], execution["stderr"]],
                     "source_files": maps, "code_identity": identity, "inspection": selected["inspection"],
-                    "response": selected["response"], "request_inputs": request["input_artifacts"]}
+                    "response": selected["response"], "request_inputs": request["input_artifacts"], "report": report}
         authority_cache[ref["sha256"]] = observed
         return observed
 
 
     for locator in locators:
-        _require(isinstance(locator, dict) and locator.get("kind") in {"python_inspection", "document_paragraph", "document_complete"},
+        _require(isinstance(locator, dict) and locator.get("kind") in {"python_inspection", "document_paragraph", "document_complete", "junit_test_name", "wheel_member_name", "locked_download_url", "json_schema_dialect"},
                  "Unsupported review text origin kind")
-        paragraph = locator["kind"] != "python_inspection"
+        dialect_field = locator["kind"] == "json_schema_dialect"
+        download_url = locator["kind"] == "locked_download_url"
+        wheel_name = locator["kind"] == "wheel_member_name"
+        junit_name = locator["kind"] == "junit_test_name"
+        paragraph = locator["kind"] in {"document_paragraph", "document_complete"}
         complete_document = locator["kind"] == "document_complete"
-        _require(set(locator) == {"schema_version", "kind", "parent", "selector", "source", "authority"}
+        _require(set(locator) == {"schema_version", "kind", "parent", "selector", "authority"}
+                 | (set() if dialect_field else {"archive" if wheel_name else "source"})
                  | ({"paragraph_index"} if paragraph and not complete_document else set())
                  and locator["schema_version"] == "review-text-origin/v1", "Unsupported review text origin fields")
         bound = authority(locator["authority"])
-        _require(locator["parent"] == bound["response" if paragraph else "inspection"],
+        junit_parent = bound.get("junit_parents", {}).get(locator["parent"].get("path")) if isinstance(locator["parent"], dict) else None
+        _require((dialect_field and locator["parent"] == bound.get("dialect_parent"))
+                 or (junit_name and junit_parent is not None and locator["parent"] == junit_parent["ref"])
+                 or (download_url and "producer_source" in bound and locator["parent"] == bound.get("report", {}).get("validations", {}).get("runtime_wheels", {}).get("downloads"))
+                 or (not junit_name and not download_url and not dialect_field and locator["parent"] == bound.get("response" if paragraph else "inspection")),
                  "Review text parent differs from the separately frozen authority root")
         parent_path, data = read(locator["parent"])
         _require(parent_path.is_relative_to(directory)
@@ -802,11 +973,20 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
             parent = json.loads(data, object_pairs_hook=object_pairs)
         except (ValueError, UnicodeDecodeError) as exc:
             raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Review text parent is not bounded JSON") from exc
-        _require(isinstance(parent, dict) and not speech(parent)
-                 and parent.get("schema_version") == ("artifact-audit-response/v1" if paragraph else "independent-oss-inspection/v1"),
+        _require(not speech(parent) and ((download_url and isinstance(parent, list))
+                 or (isinstance(parent, dict) and (junit_name or dialect_field or parent.get("schema_version") == ("artifact-audit-response/v1" if paragraph else "independent-oss-inspection/v1")))),
                  "Review text parent has a different schema or transcript context")
         selector = locator["selector"]
         pattern = ["documentation_reviews", int, "claims", int, "quote"] if paragraph else ["public_files", int]
+        if dialect_field:
+            pattern = ["$schema"]
+        if download_url:
+            pattern = [int, "url"]
+        if wheel_name:
+            pattern = ["archives", "wheel", "members", int, "name"]
+        if junit_name:
+            assert junit_parent is not None
+            pattern = [*junit_parent["prefix"], int, "name"]
         _require(isinstance(selector, list) and len(selector) == len(pattern)
                  and all((type(part) is int and 0 <= part < MAX_UNITS) if expected is int else
                          (type(part) is str and part == expected) for part, expected in zip(selector, pattern, strict=True)),
@@ -820,6 +1000,68 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
                 selected = selected[part]
         except (KeyError, IndexError, TypeError) as exc:
             raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Review text selector does not exist") from exc
+        if dialect_field:
+            _require(selected == bound["dialect_identifier"], "Review selected dialect differs from the exact supported field")
+            metaschema_ref = bound["metaschema"]
+            _require(metaschema_ref["sha256"] not in registered, "Registered private media cannot supply a dialect source")
+            result.append({"parent": locator["parent"], "selector": selector, "kind": locator["kind"],
+                           "source": {"original_path": metaschema_ref["path"], "snapshot": metaschema_ref}, "source_snapshot": metaschema_ref,
+                           "selected_value": selected, "extractions": [{"edge": selector, "value": selected}],
+                           "authority": locator["authority"], "authority_refs": bound["refs"], "commands": [], "classification": "review",
+                           "claim_status": "UNVERIFIED", "scope": "Supported JSON-Schema dialect field only; no producer execution or review approval"})
+            continue
+        if wheel_name:
+            archive_ref = locator["archive"]
+            _require(archive_ref == bound.get("report", {}).get("validations", {}).get("wheel", {}).get("artifact")
+                     and archive_ref in bound["request_inputs"], "Review wheel origin is not the original verified request archive")
+            archive_path, archive_bytes = read(archive_ref)
+            _require(archive_ref["sha256"] not in registered, "Registered media cannot supply review wheel origins")
+            wheel = parent.get("archives", {}).get("wheel")
+            _require(isinstance(wheel, dict) and set(wheel) == {"artifact", "members", "all_payloads_utf8", "repository_license_bytes_match", "embedded_private_media_or_executable_observed"}
+                     and wheel["artifact"] == archive_ref and isinstance(wheel["members"], list)
+                     and wheel["all_payloads_utf8"] is True,
+                     "Review wheel origin lacks the complete original archive observation")
+            extracted_members = []
+            total_bytes = 0
+            try:
+                with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+                    members = archive.infolist()
+                    _require(0 < len(members) <= MAX_UNITS and len({m.filename for m in members}) == len(members),
+                             "Review wheel archive members are empty, duplicated or oversized")
+                    for member in members:
+                        name = member.filename
+                        relative_member = PurePosixPath(name.rstrip("/") if member.is_dir() else name)
+                        mode = member.external_attr >> 16
+                        _require(relative_member.parts and not relative_member.is_absolute() and "\\" not in name and "\x00" not in name
+                                 and all(p not in {".", ".."} for p in relative_member.parts)
+                                 and relative_member.as_posix() == (name.rstrip("/") if member.is_dir() else name)
+                                 and not member.flag_bits & 1 and stat.S_IFMT(mode) in ({0, stat.S_IFDIR} if member.is_dir() else {0, stat.S_IFREG}),
+                                 "Review wheel member is aliased, encrypted, special or outside the archive")
+                        if member.is_dir():
+                            _require(member.file_size == 0, "Review wheel directory contains payload bytes")
+                            continue
+                        _require(0 <= member.file_size <= MAX_UNIT_BYTES, "Review wheel member exceeds the fixed per-unit bound")
+                        total_bytes += member.file_size
+                        _require(total_bytes <= MAX_TOTAL_BYTES, "Review wheel members exceed the fixed complete-byte bound")
+                        content_bytes = archive.read(member)
+                        _require(len(content_bytes) == member.file_size, "Review wheel member length differs from its declared bytes")
+                        content_bytes.decode("utf-8")
+                        extracted_members.append({"name": name, "bytes": len(content_bytes), "sha256": hashlib.sha256(content_bytes).hexdigest()})
+            except (zipfile.BadZipFile, UnicodeDecodeError, OSError, RuntimeError) as exc:
+                raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Review wheel archive cannot be completely read") from exc
+            _require(json.dumps(extracted_members, sort_keys=True) == json.dumps(wheel["members"], sort_keys=True),
+                     "Review wheel member rows differ from the complete original archive")
+            _require(isinstance(selected, str) and selected == extracted_members[selector[3]]["name"],
+                     "Review wheel selected name differs from its exact full member row")
+            read(locator["parent"])
+            read(archive_ref)
+            result.append({"parent": locator["parent"], "selector": selector, "kind": locator["kind"],
+                           "source": {"original_path": str(archive_path), "snapshot": archive_ref}, "source_snapshot": archive_ref,
+                           "selected_value": selected, "archive_members": extracted_members,
+                           "extractions": [{"edge": selector, "value": selected}], "authority": locator["authority"],
+                           "authority_refs": [*bound["refs"], archive_ref], "commands": [], "classification": "review",
+                           "claim_status": "UNVERIFIED", "scope": "Exact original archive-member name only; no archive privacy or execution approval"})
+            continue
         source = locator["source"]
         _require(isinstance(source, dict) and set(source) == {"original_path", "snapshot", "git_revision", "git_path", "git_blob"}
                  and all(isinstance(source[k], str) for k in ("original_path", "git_revision", "git_path", "git_blob"))
@@ -850,7 +1092,84 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
         except UnicodeDecodeError as exc:
             raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Review text source is not UTF-8") from exc
         exempt = []
-        if paragraph:
+        if download_url:
+            _require(source["git_path"] == "uv.lock", "Review download URL requires the original complete lockfile")
+            try:
+                lock = tomllib.loads(content)
+                syntax = ast.parse(bound["producer_source"])
+            except (ValueError, SyntaxError) as exc:
+                raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Review download source cannot be parsed") from exc
+            producers = [node for node in syntax.body if isinstance(node, ast.FunctionDef) and node.name == "_runtime_archives"]
+            expected_append = ast.parse('requests.append({"url": candidate["url"], "method": "GET", "status": 200, "started_at": started, "finished_at": now(), "bytes": count, "artifact": ref})', mode="eval").body
+            expected_write = ast.parse('atomic_json(directory / "downloads.json", requests)', mode="eval").body
+            _require(len(producers) == 1 and all(any(ast.dump(node) == ast.dump(expected) for node in ast.walk(producers[0]))
+                                               for expected in (expected_append, expected_write)),
+                     "Review download original producer does not bind the closed request row and output")
+            runtime = bound["report"].get("validations", {}).get("runtime_wheels")
+            _require(isinstance(runtime, dict) and runtime.get("downloads") == locator["parent"]
+                     and isinstance(runtime.get("archives"), list) and isinstance(parent, list)
+                     and 0 < len(parent) == len(runtime["archives"]) <= MAX_UNITS,
+                     "Review download parent differs from the complete original runtime archive table")
+            packages = lock.get("package")
+            _require(isinstance(packages, list) and len(packages) <= MAX_UNITS
+                     and all(isinstance(package, dict) and isinstance(package.get("wheels", []), list) for package in packages),
+                     "Review download lockfile package table is unsupported")
+            assert isinstance(packages, list)
+            candidates = [candidate for package in packages for candidate in package.get("wheels", [])]
+            _require(len(candidates) <= MAX_UNITS and all(isinstance(candidate, dict) for candidate in candidates),
+                     "Review download lockfile wheel table is malformed or oversized")
+            total_download_bytes = 0
+            download_refs = []
+            urls = set()
+            for index, row in enumerate(parent):
+                _require(isinstance(row, dict) and set(row) == {"url", "method", "status", "started_at", "finished_at", "artifact", "bytes"}
+                         and isinstance(row["url"], str) and row["url"] not in urls and row["method"] == "GET"
+                         and type(row["status"]) is int and row["status"] == 200 and type(row["bytes"]) is int and row["bytes"] >= 0
+                         and all(isinstance(row[k], str) and row[k] for k in ("started_at", "finished_at"))
+                         and isinstance(row["artifact"], dict) and row["artifact"] == runtime["archives"][index],
+                         "Review download row is not an exact closed original archive observation")
+                urls.add(row["url"])
+                url = urlsplit(row["url"])
+                _require(url.scheme == "https" and url.hostname == "files.pythonhosted.org"
+                         and not (url.username or url.password or url.query or url.fragment),
+                         "Review download URL is outside the original producer origin grammar")
+                matching = [candidate for candidate in candidates if candidate.get("url") == row["url"]]
+                _require(len(matching) == 1 and set(matching[0]) <= {"url", "hash", "size", "upload-time"}
+                         and matching[0].get("hash") == "sha256:" + row["artifact"].get("sha256", "")
+                         and type(matching[0].get("size")) is int and matching[0]["size"] == row["bytes"],
+                         "Review download URL does not match one complete original locked wheel identity")
+                path, data_bytes = read(row["artifact"])
+                _require(path.name == unquote(PurePosixPath(url.path).name) and len(data_bytes) == row["bytes"],
+                         "Review download archive bytes or filename differ from the original locked URL")
+                total_download_bytes += len(data_bytes)
+                _require(total_download_bytes <= MAX_TOTAL_BYTES, "Review download complete archive bytes exceed their fixed bound")
+                download_refs.append(row["artifact"])
+            _require(isinstance(selected, str) and selected == parent[selector[0]]["url"],
+                     "Review download selected URL differs from its complete original row")
+            result.append({"parent": locator["parent"], "selector": selector, "kind": locator["kind"],
+                           "source": source, "source_snapshot": artifact_ref(snapshot_path), "selected_value": selected,
+                           "complete_download_rows": parent, "extractions": [{"edge": selector, "value": selected}],
+                           "authority": locator["authority"], "authority_refs": [*bound["refs"], locator["parent"], *download_refs],
+                           "commands": [*bound.get("commands", []), *traces], "classification": "review", "claim_status": "UNVERIFIED",
+                           "scope": "Exact original locked download URL only; no new network request or historical execution approval"})
+            continue
+        if junit_name:
+            _require(relative.parts[0] == "tests" and relative.suffix == ".py", "Review JUnit name is outside the original test-source namespace")
+            _require(bound["selected_test_paths"] == ["tests"] or source["git_path"] in bound["selected_test_paths"],
+                     "Review JUnit source was not selected by the exact original pytest command")
+            try:
+                syntax = ast.parse(content)
+            except SyntaxError as exc:
+                raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Review JUnit test source is not Python") from exc
+            node = parent
+            for part in selector[:-1]:
+                node = node[part]
+            _require(isinstance(selected, str) and isinstance(node, dict)
+                     and node.get("classname") == ".".join(relative.with_suffix("").parts)
+                     and selected in {n.name for n in syntax.body if isinstance(n, ast.FunctionDef)},
+                     "Review JUnit name is not the exact unparameterized original function")
+            exempt.append({"edge": selector, "value": selected})
+        elif paragraph:
             quoted_document = parent["documentation_reviews"][selector[1]]
             _require(isinstance(quoted_document, dict) and quoted_document.get("path") == source["original_path"]
                      and quoted_document.get("sha256") == source["snapshot"]["sha256"]
@@ -894,7 +1213,7 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
         result.append({"parent": locator["parent"], "selector": selector, "kind": locator["kind"],
                        "source": source, "source_snapshot": artifact_ref(snapshot_path), "selected_value": selected,
                        "extractions": exempt, "authority": locator["authority"], "authority_refs": bound["refs"],
-                       "commands": traces, "classification": "review",
+                       "commands": [*bound.get("commands", []), *traces], "classification": "review",
                        "claim_status": "UNVERIFIED", "scope": "Exact source-derived fields only; no review or publication approval"})
     _require(set(authority_cache) == {ref["sha256"] for ref in approved}, "Review text authority root was not consumed")
     for observed_name, identity in identities.items():

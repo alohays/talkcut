@@ -157,3 +157,18 @@ replacement blobs, nested annotated tags and selected tree leaves. Original and
 replacement payloads both remain in scope. Unsupported tree metadata, symlinks
 and submodules remain explicitly unverified; traversal limits and changed
 references prevent a completeness claim.
+
+## Generated metadata in private evidence
+
+Explicit origin records now also support complete JUnit test names, wheel member
+names, locked download URLs and the root JSON Schema dialect identifier. Each
+family checks its original source or schema authority and the complete retained
+table before identifying a selected field. JUnit names must belong to an original
+source selected by the recorded test command. Wheel and download records require
+the retained archive bytes; schema validation uses the installed offline dialect.
+
+These checks do not execute old commands or certify their historical success.
+Whole evidence files remain private, and matching text in another review field,
+transcript or unverified prose still contributes its own protected origin.
+Incomplete tables, altered hashes, unselected sources and duplicate origin roots
+are rejected. A validated metadata origin provides no media or release approval.
