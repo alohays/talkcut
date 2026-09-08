@@ -35,7 +35,7 @@ def test_nested_tags_retain_leaf_and_each_annotation(algorithm, tmp_path):
 
 
 @pytest.mark.parametrize("algorithm", ["sha1", "sha256"])
-def test_tagged_tree_reads_all_nested_leaves_but_raw_tree_stays_unverified(algorithm, tmp_path):
+def test_tagged_tree_reads_all_nested_leaves_and_exact_binary_structure(algorithm, tmp_path):
     root, _, _, child = repository(tmp_path, algorithm)
     phrase = "Synthetic protected prose inside a deeply nested selected tree leaf."
     leaf = write(root, object_value("blob", phrase.encode(), algorithm))
@@ -47,17 +47,18 @@ def test_tagged_tree_reads_all_nested_leaves_but_raw_tree_stays_unverified(algor
     scanner = privacy.Scan({}, [phrase])
     result = privacy._git_inventory(root, child.oid, scanner, [])
     assert found(scanner, phrase)
-    assert any("tree metadata" in r["reason"] for r in scanner.unknown)
+    assert not scanner.unknown and len(result["selected_tree_structures"]) == 3
     assert {r["oid"] for r in result["selected_ref_objects"]}.issuperset({child.oid, top, tree, leaf})
     assert any(r["location"].endswith("outer/nested/leaf.txt") for r in scanner.findings)
 
 
-def test_empty_selected_tree_cannot_claim_complete_text_inspection(tmp_path):
+def test_empty_selected_tree_retains_complete_empty_binary_structure(tmp_path):
     root, tree, _, child = repository(tmp_path)
     git(root, "update-ref", "refs/fixture/empty", tree.oid)
     scanner = privacy.Scan({}, [])
     result = privacy._git_inventory(root, child.oid, scanner, [])
-    assert scanner.unknown and not scanner.findings
+    assert not scanner.unknown and not scanner.findings
+    assert result["selected_tree_structures"][0]["entries"] == []
     assert any(r["oid"] == tree.oid and r["bytes"] == 0 for r in result["selected_ref_objects"])
 
 

@@ -46,6 +46,8 @@ MAX_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_UNITS = 20000
 MAX_DEPTH = 5
 MAX_COMMITS = 10000
+# Selected tree traversal also bounds deep, repeatedly shared directory paths.
+MAX_GIT_TREE_DEPTH = 128
 # Finite traversal safeguard, not a quality/coverage denominator. Real preserved
 # whole-frame evidence can exceed 100,000 files; every file still enters inventory.
 MAX_TASK_FILES = 1000000
@@ -196,6 +198,62 @@ def _git_commit_context(commit: _GitObject, reachable: frozenset[str],
     return _GitCommitContext(commit, tuple(tokens), object_hash(sorted(reachable)), tuple(targets))
 
 
+@dataclass(frozen=True)
+class _GitTreeEntry:
+    mode: str
+    name: str
+    oid: str
+    byte_start: int
+    byte_end: int
+
+
+@dataclass(frozen=True)
+class _GitTreeContext:
+    tree: _GitObject
+    root_oid: str
+    prefix: tuple[str, ...]
+    entries: tuple[_GitTreeEntry, ...]
+
+
+def _git_tree_entries(tree: _GitObject) -> tuple[_GitTreeEntry, ...]:
+    """Interpret complete original binary records, never a filename-selected blob."""
+    _require(type(tree) is _GitObject and tree.kind == "tree", "An original typed Git tree is required")
+    _verified_git_object(tree.oid, tree.kind, tree.algorithm, tree.data)
+    width = 20 if tree.algorithm == "sha1" else 32
+    entries: list[_GitTreeEntry] = []
+    names: set[bytes] = set()
+    previous, offset = b"", 0
+    while offset < len(tree.data):
+        start = offset
+        space = tree.data.find(b" ", offset)
+        end_name = tree.data.find(b"\0", space + 1) if space >= 0 else -1
+        _require(space > offset and end_name > space + 1 and end_name + 1 + width <= len(tree.data),
+                 "Selected tree record is truncated or has invalid framing")
+        mode, raw_name = tree.data[offset:space], tree.data[space + 1:end_name]
+        _require(mode in {b"40000", b"100644", b"100755", b"120000", b"160000"},
+                 "Selected tree mode is unsupported or noncanonical")
+        _require(raw_name not in {b".", b".."} and b"/" not in raw_name
+                 and raw_name.lower() != b".git" and raw_name not in names,
+                 "Selected tree name is unsafe or duplicated")
+        try:
+            name = raw_name.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Non-UTF8 selected tree path was not interpreted") from exc
+        _require(not any(ord(char) < 32 or ord(char) == 127 for char in name),
+                 "Selected tree name contains unsupported control bytes")
+        # Git compares a directory name as if followed by '/', files by NUL.
+        key = raw_name + (b"/" if mode == b"40000" else b"\0")
+        _require(not entries or previous < key, "Selected tree entries are not in canonical Git order")
+        offset = end_name + 1 + width
+        oid = tree.data[end_name + 1:offset].hex()
+        _require(int(oid, 16) != 0 and len(entries) < MAX_UNITS,
+                 "Selected tree object identifier is zero or its entry bound is exhausted")
+        entries.append(_GitTreeEntry(mode.decode("ascii"), name, oid, start, offset))
+        names.add(raw_name)
+        previous = key
+    return tuple(entries)
+
+
 @dataclass
 class Scan:
     private: dict[str, str]
@@ -212,29 +270,41 @@ class Scan:
     seen_contexts: set[tuple[str, str]] = field(default_factory=set)
     git_structural_metadata: list[dict[str, Any]] = field(default_factory=list)
 
+    git_tree_structural: list[dict[str, Any]] = field(default_factory=list)
+
     def unverified(self, label: str, reason: str) -> None:
         self.unknown.append({"location": label, "reason": reason})
 
     def payload(self, data: bytes, label: str, *, depth: int = 0, path: str | None = None) -> None:
-        self._payload(data, label, depth=depth, path=path, commit_context=None)
+        self._payload(data, label, depth=depth, path=path, commit_context=None, tree_context=None)
 
     def _commit_payload(self, context: _GitCommitContext) -> None:
         _require(type(context) is _GitCommitContext, "Only internal verified commit context is supported")
         self._payload(context.commit.data, "git-commit:" + context.commit.oid,
-                      depth=0, path=None, commit_context=context)
+                      depth=0, path=None, commit_context=context, tree_context=None)
+
+    def _tree_payload(self, context: _GitTreeContext) -> None:
+        _require(type(context) is _GitTreeContext and context.entries == _git_tree_entries(context.tree),
+                 "Only an internal complete Git tree context is supported")
+        self._payload(context.tree.data, "git-ref-tree:" + context.tree.oid,
+                      depth=0, path=None, commit_context=None, tree_context=context)
+
+    def _path(self, path: str, label: str) -> bool:
+        parts = PurePosixPath(path).parts
+        if PurePosixPath(path).is_absolute() or ".." in parts:
+            self.unverified(label, "Unsafe publication member path")
+            return False
+        if "projects" in parts or any(part == ".env" or (part.startswith(".env.") and part not in {".env.example", ".env.sample"}) for part in parts):
+            self.unverified(label, "Private project/environment path appears in publication payload")
+        return True
 
     def _payload(self, data: bytes, label: str, *, depth: int, path: str | None,
-                 commit_context: _GitCommitContext | None) -> None:
+                 commit_context: _GitCommitContext | None, tree_context: _GitTreeContext | None) -> None:
         if self.exhausted:
             return
         digest = hashlib.sha256(data).hexdigest()
-        if path is not None:
-            parts = PurePosixPath(path).parts
-            if PurePosixPath(path).is_absolute() or ".." in parts:
-                self.unverified(label, "Unsafe publication member path")
-                return
-            if "projects" in parts or any(part == ".env" or (part.startswith(".env.") and part not in {".env.example", ".env.sample"}) for part in parts):
-                self.unverified(label, "Private project/environment path appears in publication payload")
+        if path is not None and not self._path(path, label):
+            return
         if digest in self.private:
             kind = self.private[digest]
             if kind == "media":
@@ -245,7 +315,10 @@ class Scan:
                 self.credentials.add(digest)
             self.findings.append({"kind": "private_" + kind, "location": label, "sha256": digest})
             return
-        context_key = (digest, "ordinary" if commit_context is None else "verified_git_commit")
+        context_kind = "ordinary" if commit_context is None else "verified_git_commit"
+        if tree_context is not None:
+            context_kind = "verified_git_tree:" + tree_context.root_oid + ":" + "/".join(tree_context.prefix)
+        context_key = (digest, context_kind)
         if context_key in self.seen_contexts:
             return
         fresh = digest not in self.seen
@@ -260,6 +333,20 @@ class Scan:
             self.total_bytes += len(data)
             self.units.append({"location": label, "sha256": digest, "bytes": len(data)})
         try:
+            if tree_context is not None:
+                rows = []
+                for tree_entry in tree_context.entries:
+                    name = "/".join((*tree_context.prefix, tree_entry.name))
+                    tree_entry_label = label + ":" + name
+                    if self._path(name, tree_entry_label):
+                        self._text(name, tree_entry_label)
+                    rows.append({"mode": tree_entry.mode, "name": tree_entry.name, "path": name, "oid": tree_entry.oid,
+                                 "byte_start": tree_entry.byte_start, "byte_end": tree_entry.byte_end})
+                self.git_tree_structural.append({"location": label, "oid": tree_context.tree.oid,
+                    "sha256": digest, "bytes": len(data), "root_oid": tree_context.root_oid,
+                    "path": "/".join(tree_context.prefix), "object_format": tree_context.tree.algorithm,
+                    "entries": rows, "scope": "Typed binary structure and names only; every child payload remains separately inspected"})
+                return
             if data.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
                 with zipfile.ZipFile(io.BytesIO(data)) as archive:
                     entries = archive.infolist()
@@ -313,44 +400,105 @@ class Scan:
             if "\x00" in text or any(ord(char) < 32 and char not in "\n\r\t\f" for char in text):
                 self.unverified(label, "Unknown binary/control-byte payload")
                 return
-            for kind, pattern in CREDENTIALS.items():
-                for match in pattern.finditer(text):
-                    secret_hash = hashlib.sha256(match.group().encode()).hexdigest()
-                    self.credentials.add(secret_hash)
-                    self.findings.append({"kind": kind, "location": label, "matched_sha256": secret_hash})
-            for phrase in self.phrases:
-                if phrase in text:
-                    phrase_hash = hashlib.sha256(phrase.encode()).hexdigest()
-                    allowed = {(start, end): (role, oid) for start, end, role, oid in commit_context.tokens
-                               if oid == phrase} if commit_context is not None else {}
-                    if allowed:
-                        found_ordinary, offset = False, 0
-                        while (offset := text.find(phrase, offset)) >= 0:
-                            byte_start = len(text[:offset].encode("utf-8"))
-                            span = (byte_start, byte_start + len(phrase.encode("utf-8")))
-                            if span in allowed:
-                                role, oid = allowed[span]
-                                assert commit_context is not None
-                                target = next(item for item in commit_context.targets if item.oid == oid)
-                                self.git_structural_metadata.append({"location": label, "sha256": digest,
-                                    "bytes": len(data), "commit_oid": commit_context.commit.oid,
-                                    "object_format": commit_context.commit.algorithm, "field": role,
-                                    "byte_start": span[0], "byte_end": span[1], "matched_sha256": phrase_hash,
-                                    "target_oid": oid, "disposition": "verified_git_structural_oid",
-                                    "validation": {"commit_type": "commit", "target_type": target.kind,
-                                        "target_sha256": hashlib.sha256(target.data).hexdigest(),
-                                        "target_bytes": len(target.data),
-                                        "selected_commits_sha256": commit_context.selected_commits_sha256},
-                                    "scope": "This occurrence only; private corpus and other occurrences remain protected"})
-                            else:
-                                found_ordinary = True
-                            offset += 1
-                        if not found_ordinary:
-                            continue
-                    self.transcripts.add(phrase_hash)
-                    self.findings.append({"kind": "protected_transcript_phrase", "location": label, "matched_sha256": phrase_hash})
+            self._text(text, label, commit_context=commit_context)
         except (UnicodeDecodeError, ValueError, OSError, RuntimeError, EOFError, zipfile.BadZipFile, tarfile.TarError) as exc:
             self.unverified(label, f"Unreadable or unsupported payload: {type(exc).__name__}")
+
+    def _text(self, text: str, label: str, *, commit_context: _GitCommitContext | None = None) -> None:
+        for kind, pattern in CREDENTIALS.items():
+            for match in pattern.finditer(text):
+                secret_hash = hashlib.sha256(match.group().encode()).hexdigest()
+                self.credentials.add(secret_hash)
+                self.findings.append({"kind": kind, "location": label, "matched_sha256": secret_hash})
+        for phrase in self.phrases:
+            if phrase in text:
+                phrase_hash = hashlib.sha256(phrase.encode()).hexdigest()
+                allowed = {(start, end): (role, oid) for start, end, role, oid in commit_context.tokens
+                           if oid == phrase} if commit_context is not None else {}
+                if allowed:
+                    found_ordinary, offset = False, 0
+                    while (offset := text.find(phrase, offset)) >= 0:
+                        byte_start = len(text[:offset].encode("utf-8"))
+                        span = (byte_start, byte_start + len(phrase.encode("utf-8")))
+                        if span in allowed:
+                            role, oid = allowed[span]
+                            assert commit_context is not None
+                            target = next(item for item in commit_context.targets if item.oid == oid)
+                            data = commit_context.commit.data
+                            digest = hashlib.sha256(data).hexdigest()
+                            self.git_structural_metadata.append({"location": label, "sha256": digest,
+                                "bytes": len(data), "commit_oid": commit_context.commit.oid,
+                                "object_format": commit_context.commit.algorithm, "field": role,
+                                "byte_start": span[0], "byte_end": span[1], "matched_sha256": phrase_hash,
+                                "target_oid": oid, "disposition": "verified_git_structural_oid",
+                                "validation": {"commit_type": "commit", "target_type": target.kind,
+                                    "target_sha256": hashlib.sha256(target.data).hexdigest(),
+                                    "target_bytes": len(target.data),
+                                    "selected_commits_sha256": commit_context.selected_commits_sha256},
+                                "scope": "This occurrence only; private corpus and other occurrences remain protected"})
+                        else:
+                            found_ordinary = True
+                        offset += 1
+                    if not found_ordinary:
+                        continue
+                self.transcripts.add(phrase_hash)
+                self.findings.append({"kind": "protected_transcript_phrase", "location": label, "matched_sha256": phrase_hash})
+
+
+def _selected_tree_inventory(target: _GitObject, scanner: Scan,
+                             read_object: Callable[[str, str], _GitObject],
+                             record_object: Callable[[_GitObject], None], listing: bytes) -> None:
+    """Close a selected original tree before giving its binary records context."""
+    pending: list[tuple[_GitObject, tuple[str, ...], tuple[str, ...]]] = [(target, (), ())]
+    contexts: list[_GitTreeContext] = []
+    leaves: list[tuple[str, str, str, _GitObject | None]] = []
+    visited, path_bytes = 0, 0
+    while pending:
+        node, prefix, ancestors = pending.pop()
+        _require(len(prefix) <= MAX_GIT_TREE_DEPTH, "Selected tree depth exceeds inspection bound")
+        _require(node.oid not in ancestors and node.algorithm == target.algorithm,
+                 "Selected tree ancestry or object format is inconsistent")
+        record_object(node)
+        entries = _git_tree_entries(node)
+        contexts.append(_GitTreeContext(node, target.oid, prefix, entries))
+        work: list[tuple[_GitObject, tuple[str, ...], tuple[str, ...]]] = []
+        for entry in entries:
+            visited += 1
+            name = "/".join((*prefix, entry.name))
+            path_bytes += len(name.encode())
+            _require(visited <= MAX_UNITS and path_bytes <= MAX_TOTAL_BYTES,
+                     "Selected tree path traversal exceeds inspection bounds")
+            if entry.mode == "160000":
+                leaves.append((entry.mode, name, entry.oid, None))
+                continue
+            kind = "tree" if entry.mode == "40000" else "blob"
+            child = read_object(entry.oid, kind)
+            _require(type(child) is _GitObject and child.kind == kind and child.oid == entry.oid
+                     and child.algorithm == target.algorithm, "Selected tree child identity is inconsistent")
+            _verified_git_object(child.oid, child.kind, child.algorithm, child.data)
+            record_object(child)
+            if kind == "tree":
+                work.append((child, (*prefix, entry.name), (*ancestors, node.oid)))
+            else:
+                leaves.append((entry.mode, name, entry.oid, child))
+        pending.extend(reversed(work))
+    # Compare the entire typed closure with Git's original recursive enumeration.
+    # ls-tree traverses directories recursively; sorting by component order
+    # with '/' for directories is equivalent to byte ordering of full leaf paths.
+    leaves.sort(key=lambda row: row[1].encode())
+    expected = b"".join((mode + " " + ("commit" if child is None else "blob") + " " + oid + "\t").encode()
+                        + name.encode() + b"\0" for mode, name, oid, child in leaves)
+    _require(expected == listing, "Selected tree typed closure differs from its original recursive listing")
+    for context in contexts:
+        scanner._tree_payload(context)
+    for mode, name, _, leaf_object in leaves:
+        label = "git-ref-tree:" + target.oid + ":" + name
+        if leaf_object is None:
+            scanner.unverified(label, "Selected tree submodule or unsupported leaf is not fully inspected")
+        else:
+            scanner.payload(leaf_object.data, label, path=name)
+            if mode == "120000":
+                scanner.unverified(label, "Selected Git symlink target text retained; link was not followed")
 
 
 def _git_inventory(root: Path, expected_head: str, scanner: Scan, traces: list[dict[str, Any]]) -> dict[str, Any]:
@@ -461,37 +609,18 @@ def _git_inventory(root: Path, expected_head: str, scanner: Scan, traces: list[d
         if kind == "commit":
             _require(oid in reachable, "Selected commit target was not in the original scanned graph")
         elif kind == "tree":
-            # Keep raw tree bytes and inspect every listed leaf using original
-            # object reads. Opaque tree metadata still cannot receive a complete
-            # text-scanning claim or commit-token exemptions.
-            scanner.payload(target.data, "git-ref-tree:" + oid)
-            scanner.unverified("git-ref-tree:" + oid,
-                               "Selected tree metadata is not supported as fully inspected publication text")
-            listing = git("ls-tree", "-r", "-z", "--full-tree", oid)
-            for item in listing.split(b"\0"):
-                if not item:
-                    continue
-                entry, raw_path = item.split(b"\t", 1)
-                mode, leaf_kind, leaf_oid = entry.decode("ascii").split()
-                _require(re.fullmatch(oid_pattern, leaf_oid), "Selected tree leaf has an invalid identity")
-                try:
-                    name = raw_path.decode("utf-8")
-                except UnicodeDecodeError:
-                    scanner.unverified("git-ref-tree:" + oid, "Non-UTF8 selected tree path was not interpreted")
-                    continue
-                if leaf_kind != "blob" or mode not in {"100644", "100755", "120000"}:
-                    scanner.unverified("git-ref-tree:" + oid + ":" + name,
-                                       "Selected tree submodule or unsupported leaf is not fully inspected")
-                    continue
-                leaf = read_object(leaf_oid, "blob")
-                _require(leaf_oid in ref_objects or len(ref_objects) < MAX_UNITS,
+            def record_tree_object(value: _GitObject) -> None:
+                _require(value.oid in ref_objects or len(ref_objects) < MAX_UNITS,
                          "Selected Git target traversal exceeds inspection bound")
-                ref_objects[leaf_oid] = {"oid": leaf_oid, "type": "blob",
-                                        "sha256": hashlib.sha256(leaf.data).hexdigest(), "bytes": len(leaf.data)}
-                scanner.payload(leaf.data, "git-ref-tree:" + oid + ":" + name, path=name)
-                if mode == "120000":
-                    scanner.unverified("git-ref-tree:" + oid + ":" + name,
-                                       "Selected Git symlink target text retained; link was not followed")
+                ref_objects[value.oid] = {"oid": value.oid, "type": value.kind,
+                                         "sha256": hashlib.sha256(value.data).hexdigest(), "bytes": len(value.data)}
+
+            try:
+                listing = git("ls-tree", "-r", "-z", "--full-tree", oid)
+                _selected_tree_inventory(target, scanner, read_object, record_tree_object, listing)
+            except TalkCutError as exc:
+                scanner.payload(target.data, "git-ref-tree:" + oid)
+                scanner.unverified("git-ref-tree:" + oid, "Selected tree structural inspection failed: " + str(exc))
         elif kind == "blob":
             scanner.payload(target.data, "git-ref-blob:" + oid)
         else:
@@ -517,7 +646,10 @@ def _git_inventory(root: Path, expected_head: str, scanner: Scan, traces: list[d
             "object_format": algorithm, "original_objects_without_replacements": True,
             "structural_oid_occurrences": scanner.git_structural_metadata,
             "structural_verification": {"objects": len(objects), "bytes": object_bytes},
-            "selected_refs": selected_refs, "selected_ref_objects": list(ref_objects.values())}
+            "selected_refs": selected_refs, "selected_ref_objects": list(ref_objects.values()),
+            "selected_tree_structures": scanner.git_tree_structural,
+            "selected_tree_limits": {"max_depth": MAX_GIT_TREE_DEPTH, "max_path_occurrences": MAX_UNITS,
+                                     "max_path_bytes": MAX_TOTAL_BYTES}}
 
 
 def _asset_refs(values: Any) -> dict[str, dict[str, Any]]:
