@@ -75,6 +75,20 @@ def source_recipe(trees: dict[str, ast.Module]) -> dict[str, Any]:
     checker = method(owner, "check")
     machine.require(any(machine.matches(call, "self.add(criterion, name, exc.status, str(exc))") for call in calls(checker, "self.add")),
                     "Acceptance exception reason is not copied through the original check writer")
+    success = one([call for call in calls(checker, "self.add") if len(call.args) == 5],
+                  "Acceptance successful check lacks its unique original constructor")
+    machine.require(not success.keywords and machine.matches(success.args[0], "criterion")
+                    and machine.matches(success.args[1], "name") and literal(success.args[2]) == "PASS"
+                    and machine.matches(success.args[4], "result"),
+                    "Acceptance successful check has another result or status writer")
+    success_reason = literal(success.args[3])
+    machine.require(isinstance(success_reason, str), "Acceptance successful check reason is not literal")
+    exception_calls = [call for call in calls(checker, "self.add") if call is not success]
+    machine.require(len(exception_calls) == 2 and all(len(call.args) == 4 and not call.keywords
+                    for call in exception_calls), "Acceptance exception check has another measurements writer")
+    machine.require(add.args.args[-1].arg == "measurements" and len(add.args.defaults) == 1
+                    and literal(add.args.defaults[0]) is None,
+                    "Acceptance missing check measurements no longer default to null")
     artifact = method(owner, "artifact")
     guard = artifact.body[0]
     machine.require(isinstance(guard, ast.If) and machine.matches(guard.test, "not isinstance(ref, dict) or not ref.get('path') or not ref.get('sha256')")
@@ -170,6 +184,7 @@ def source_recipe(trees: dict[str, ast.Module]) -> dict[str, Any]:
     machine.require(ast.dump(dependency) == ast.dump(expected_dependency),
                     "Acceptance media dependency row differs from its original writer")
     return {"criteria": criteria, "reasons": reasons, "provenance": literal(fields["provenance_limitations"]),
+            "success_reason": success_reason,
             "check_order": order, "media_ids": literal(machine.assignment(evaluator, "media_ids")),
             "finding_reason": literal(finding.args[3]),
             "dependency_reason": literal(dependency.body[1].value.args[3]),
@@ -195,6 +210,18 @@ def criterion_writers(report: dict[str, Any], recipe: dict[str, Any]) -> None:
         else:
             machine.require(names == expected, "Acceptance fixed check sequence differs from its original dispatcher")
         machine.require(row["evidence_refs"] == [], "Acceptance criterion evidence refs have no original writer")
+        for check in checks:
+            # These two explicit add() routes have their complete constructors
+            # checked below. Every other row is check() or the null-measurement
+            # no-capability branch. Callback evidence truth remains unverified.
+            if identifier == "AC09" and check["check_id"] in {"open_P0_P1", "G0_G5_dependencies"}:
+                continue
+            if check["status"] == "PASS":
+                machine.require(check["reason"] == recipe["success_reason"],
+                                "Acceptance successful check reason differs from its original constructor")
+            else:
+                machine.require(check["measurements"] is None,
+                                "Acceptance exception check carries measurements absent from its original constructor")
         # The dependency row is appended after the original criterion reduction.
         initial = checks[:-1] if identifier == "AC09" and names[-1] == "G0_G5_dependencies" else checks
         statuses = [check["status"] for check in initial]
