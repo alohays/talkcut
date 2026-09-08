@@ -134,7 +134,7 @@ def test_descriptor_family_is_closed(tmp_path: Path, mutation: str) -> None:
     ['current_inventory', 'public_work_candidates', 0], ['current_inventory', 'public_work_candidates', True, 'reason'],
     ['current_inventory', 'public_work_candidates', 0.0, 'reason'], ['current_inventory', 'public_work_candidates', '0', 'reason'],
     ['current_inventory', 'public_work_candidates', -1, 'reason'], ['current_inventory', 'public_work_candidates', 0, 'classification'],
-    ['current_inventory', 'public_work_candidates', 0, 'matching_git_source_bytes'], ['scope'],
+    ['current_inventory', 'public_work_candidates', 0, 'matching_git_source_bytes'], ['status'],
     ['transcript_files_checked', 11, 'speech_fields', 0, 'sha256']])
 def test_selector_type_scope_and_container_refusals(tmp_path: Path, selector: list[object]) -> None:
     context = fixture(tmp_path)

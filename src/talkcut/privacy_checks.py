@@ -1127,13 +1127,16 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
                 selected_leaf = associated[selector[-1]]
             except (KeyError, IndexError, TypeError) as exc:
                 raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Machine review selector does not exist") from exc
-            _require(not speech(associated) and selected_leaf == projection["value"]
+            retention_report_scope = retention and selector == ["scope"]
+            # Only the exact bound report scope may have the already verified
+            # descriptor sibling; other associated rows retain speech refusal.
+            _require((retention_report_scope or not speech(associated)) and selected_leaf == projection["value"]
                      and json.dumps(associated, sort_keys=True) == json.dumps(projection["row"], sort_keys=True),
                      "Machine review field or complete associated row changed")
-            source_ref = machine["source"]
+            source_ref = machine["report_source"] if retention_report_scope else machine["source"]
             read(source_ref)
             _require(source_ref["sha256"] not in registered, "Registered private media cannot supply machine review source")
-            original_source = machine.get("original_source", source_ref)
+            original_source = source_ref if retention_report_scope else machine.get("original_source", source_ref)
             _require(original_source["sha256"] == source_ref["sha256"], "Machine source snapshot differs from its original identity")
             read(locator["parent"])
             result.append({"parent": locator["parent"], "selector": selector, "kind": locator["kind"],

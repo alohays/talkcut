@@ -327,6 +327,7 @@ def verify_retention_inventory(selected: dict[str, Any], root: Path, read: Read,
         _, current = read(ref)
         require(current == data, "Retention authority changed during complete verification")
     return {"source": selected["source_snapshot"], "original_source": original, "source_tree": source,
+            "report_source": copy.deepcopy(selected["reproducer"]), "report_tree": script,
             "parent": copy.deepcopy(report), "parent_ref": copy.deepcopy(selected["result"]),
             "parent_content": canonical(report), "writers": writers,
             "refs": [ref for ref, _ in observed],
@@ -416,6 +417,16 @@ def candidate_reason(producer: ast.FunctionDef, known_fields: dict[str, ast.expr
 def retention_field(bound: dict[str, Any], parent_ref: dict[str, Any], selector: list[Any]) -> dict[str, Any]:
     require(parent_ref == bound["parent_ref"] and canonical(bound["parent"]) == bound["parent_content"],
             "Retention selected parent is unbound or changed after verification")
+    if selector == ["scope"]:
+        # The complete report writer and its closed descriptor sibling were
+        # already verified; this grants no projection of the sibling's content.
+        report_fields = dict_fields(assignment(bound["report_tree"], "report"))
+        report_scope = literal(report_fields["scope"])
+        require(type(report_scope) is str and bound["parent"]["scope"] == report_scope,
+                "Retention root scope differs from its complete original report writer")
+        return {"value": report_scope, "row": copy.deepcopy(bound["parent"]),
+                "source": bound["report_source"], "parent": parent_ref,
+                "extractions": [{"edge": ["scope"], "value": report_scope}], "status": "UNVERIFIED"}
     require(isinstance(selector, list) and len(selector) >= 2 and all(type(v) in {str, int} for v in selector)
             and selector[0] == "current_inventory", "Retention selector is outside the exact machine subtree")
     parent = bound["parent"]
