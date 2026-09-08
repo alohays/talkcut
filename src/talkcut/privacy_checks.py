@@ -37,6 +37,7 @@ from jsonschema.exceptions import SchemaError
 
 from . import privacy_machine_origins, privacy_retention_origins
 from .contracts import code_identity, object_hash
+from .formal_schemas import formal_schema_types
 from .project import TalkCutError, artifact_ref, load_project, sha256
 from .verification import _junit, _terminate_group
 
@@ -4747,11 +4748,7 @@ def _runtime_library_inventory(request_refs: list[dict[str, Any]] | None, direct
 
 
 def _contains_formal_schema(value: Any, repo: Path | None, registered: set[str]) -> bool:
-    reserved: set[str] = set(re.findall(r"[a-z][a-z0-9_-]*/v[0-9]+", Path(__file__).read_text()))
-    if repo is not None:
-        for base, pattern in ((repo / "src/talkcut", "*.py"), (repo / "schemas", "*.json")):
-            for source in base.rglob(pattern):
-                reserved.update(re.findall(r"[a-z][a-z0-9_-]*/v[0-9]+", source.read_text()))
+    reserved = formal_schema_types(repo)
     def immutable_claim(item: Any) -> bool:
         if isinstance(item, dict):
             return (item.get("schema_version") in reserved

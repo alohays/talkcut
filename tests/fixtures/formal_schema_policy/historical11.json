@@ -1,0 +1,13 @@
+[
+  "artifact-audit-request/v1",
+  "artifact-audit-response/v1",
+  "independent-audit-command/v1",
+  "independent-execution-tool-alias-inventory/v1",
+  "independent-oss-inspection/v1",
+  "independent-staged-privacy-review/v1",
+  "privacy-revision-handoff/v1",
+  "private-staged-privacy-handoff/v1",
+  "public-integration-recheck/v1",
+  "public-integration-validation/v1",
+  "transcript-corpus-retention-audit/v1"
+]

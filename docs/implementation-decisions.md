@@ -188,3 +188,18 @@ families retain their recursive transcript refusal. The consumer traverses all
 unselected values, retains every dependency and refuses changed parents, private
 source identities, duplicate or unconsumed field selections. A matching private
 copy or a caller-submitted protected phrase still prevents publication.
+
+## Explicit formal artifact types
+
+Formal artifact roles are declared in `talkcut.formal_schemas`. Mentioning a
+schema name in a validator, comment or embedded grammar cannot change the role
+of an unchanged historical metadata record. The installed policy remains the
+minimum protection set, including accepted input contracts without local writers.
+
+Supported output expressions and JSON Schema type constants or enums must be
+covered by an explicit policy declaration; schema files do not extend the policy
+automatically. A caller repository without its own policy can use installed
+types only when this coverage check passes. Missing installed policy prevents
+the guard from loading. The static check does not infer every possible Python
+input contract, so new accepted types require a reviewed declaration. Recursive
+private-source checks and whole-parent preservation remain in force.
