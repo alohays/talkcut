@@ -52,7 +52,7 @@ def body_call(function: ast.FunctionDef, target: str) -> list[ast.Call]:
     return result
 
 
-def source_recipe(trees: dict[str, ast.Module]) -> dict[str, Any]:
+def source_recipe(trees: dict[str, ast.Module], *, allow_analysis_import: bool = False) -> dict[str, Any]:
     acceptance = trees["src/talkcut/acceptance.py"]
     contracts = trees["src/talkcut/contracts.py"]
     owner = one([node for node in acceptance.body if isinstance(node, ast.ClassDef) and node.name == "Evaluator"],
@@ -127,7 +127,18 @@ def source_recipe(trees: dict[str, ast.Module]) -> dict[str, Any]:
                          "Acceptance selected check has no original dispatcher")
         machine.require(machine.matches(dispatcher.args[2], "self." + invoked), "Acceptance selected check calls another source method")
         function = method(owner, invoked)
-        machine.require(isinstance(function.body[0], ast.Assign) and machine.matches(function.body[0].value, expression),
+        offset = 0
+        if allow_analysis_import and invoked == "analysis_check":
+            # Only the separately hash-bound report-data profile enables this
+            # exact prelude. It proves no successful import or callback run.
+            prelude = function.body[0]
+            machine.require(isinstance(prelude, ast.ImportFrom) and prelude.level == 1
+                            and prelude.module == "editorial_binding" and len(prelude.names) == 1
+                            and prelude.names[0].name == "verify_editorial_binding" and prelude.names[0].asname is None,
+                            "Acceptance analysis has another original import prelude")
+            offset = 1
+        lookup = function.body[offset] if len(function.body) > offset else None
+        machine.require(isinstance(lookup, ast.Assign) and machine.matches(lookup.value, expression),
                         "Acceptance selected check does not read its original artifact input")
         reasons[(criterion, name)] = (missing, "UNVERIFIED")
     capability = one([s for s in evaluator.body if isinstance(s, ast.If) and machine.matches(s.test, "not self.capabilities")],

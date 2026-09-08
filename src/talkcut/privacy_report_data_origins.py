@@ -16,6 +16,16 @@ from . import privacy_machine_origins as machine
 MAX_ROWS = 20000
 ORIGINAL_EVALUATOR_SHAPE = '0748ecdb2e58d3272ef3a3b8117d3052d9c8d44adfc077eff1dd9e7e736bc27a'
 ROLES = set(grammar.MODULE_SHAPES) | {'pyproject.toml'}
+# One reviewed source-data profile. These six roles form one indivisible
+# combination; none extends the historical command/CLI source grammar.
+CANONICAL_SOURCE_PROFILE = {
+    'src/talkcut/acceptance.py': '5ea3414a253cc95244317c2189eb4cf15b735d4e5f5ab536181e0bb466693aeb',
+    'src/talkcut/contracts.py': '257ae59b0299580e166085d9047660ff1c0825283d52e1d6d153742f87d4f376',
+    'src/talkcut/project.py': '5713bdb9484eceef1bcd905f83bc92821854cf96c87c7f57e17d115e7bb2117d',
+    'src/talkcut/__main__.py': '937affd5182a05d49f3b9b7667f5206c191c6ec603c8713e79be3bd43c2360d3',
+    'src/talkcut/__init__.py': '79bf16270c2da40a458ff6d4c6c4db9012b132c2156449b5819051e0a2243b39',
+    'pyproject.toml': '2f43a22d975e4d23312bdd754e5fddf94255c8e2c4d9f6eac59700a442bcce3f',
+}
 
 
 def reference(value: Any) -> dict[str, str]:
@@ -129,9 +139,10 @@ def verify(selected: dict[str, Any], root: Path, read: machine.Read, document: m
 
     sources = selected['sources']
     machine.require(isinstance(sources, dict) and set(sources) == ROLES, 'Original report source dependency closure is incomplete')
+    contents = {name: data(ref)[1] for name, ref in sources.items()}
+    canonical_profile = {name: hashlib.sha256(content).hexdigest() for name, content in contents.items()} == CANONICAL_SOURCE_PROFILE
     trees = {}
-    for name, ref in sources.items():
-        _, content = data(ref)
+    for name, content in contents.items():
         if name == 'pyproject.toml':
             try:
                 metadata = tomllib.loads(content.decode('utf-8'))
@@ -145,9 +156,9 @@ def verify(selected: dict[str, Any], root: Path, read: machine.Read, document: m
             tree = machine.syntax(content)
             shape = hashlib.sha256(ast.dump(tree).encode()).hexdigest()
             allowed = {ORIGINAL_EVALUATOR_SHAPE} if name == 'src/talkcut/acceptance.py' else set(grammar.MODULE_SHAPES[name])
-            machine.require(shape in allowed, 'Original report complete source profile is unsupported')
+            machine.require(canonical_profile or shape in allowed, 'Original report complete source profile is unsupported')
             trees[name] = tree
-    recipe = acceptance.source_recipe(trees)
+    recipe = acceptance.source_recipe(trees, allow_analysis_import=canonical_profile)
     owner = acceptance.one([node for node in trees['src/talkcut/acceptance.py'].body
                             if isinstance(node, ast.ClassDef) and node.name == 'Evaluator'],
                            'Original report evaluator class is absent')
@@ -195,6 +206,8 @@ def verify(selected: dict[str, Any], root: Path, read: machine.Read, document: m
                         and pair['serialization'] in ('pretty_json_lf', 'canonical_json_lf'),
                         'Original report parent requires one closed retained-map case and serialization')
         cases_seen.add(pair['retained_case'])
+        machine.require(not canonical_profile or pair['serialization'] == 'canonical_json_lf',
+                        'Original report source profile requires its canonical serializer')
         original, snapshot = reference(pair['original']), reference(pair['snapshot'])
         machine.require(original['path'] not in originals and original['sha256'] == snapshot['sha256'],
                         'Original report physical parent identity is changed or duplicated')
