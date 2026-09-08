@@ -125,3 +125,20 @@ identity checks. Archive writes use a pinned directory descriptor. Existing
 successes are preserved, interrupted partials remain available for diagnosis,
 and only complete verified objects enter the returned mapping. Byte preservation
 provides no classification, semantic review or publication approval.
+
+## Source excerpts inside private review records
+
+Private audit records can contain verbatim public source extracts and document
+quotes. Treating every long string in those records as private speech caused
+publication scans to flag the original code. Explicit review-text observations
+now identify exact fields through separately supplied original audit roots,
+complete source maps, preserved Git members and recomputed extraction rows.
+The supported fields are Python inspection imports, function names and selected
+calls, plus complete document or paragraph quotes.
+
+Only the selected occurrence stops contributing a private phrase. An identical
+string in a transcript, unselected review field or private prose keeps its
+protection, and the full private file remains protected. Changed, missing or
+unconsumed origins fail validation. The supplied roots are provenance inputs;
+hash consistency does not authenticate an entirely fabricated replacement
+history or certify a historical review, execution or publication.

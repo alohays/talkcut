@@ -387,6 +387,294 @@ def _public_source_candidates(root: Path | None, registered: set[str]) -> tuple[
     return candidates, traces, transcript_hashes
 
 
+def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | None,
+                                  registered: set[str], authorities: Any = None) -> list[dict[str, Any]]:
+    """Observe two closed source extractions; never certify a review or publication."""
+    _require(authorities is None or isinstance(authorities, list), "Review text authority roots must be an explicit list")
+    if locators is None:
+        _require(not authorities, "Review text authority roots have no occurrence observations")
+        return []
+    _require(isinstance(locators, list) and len(locators) <= MAX_UNITS,
+             "Review text origins require a bounded explicit list")
+    if not locators:
+        _require(not authorities, "Review text authority roots have no occurrence observations")
+        return []
+    _require(root is not None, "Review text origins require a Git source authority")
+    assert root is not None
+    result = []
+    seen: set[tuple[str, tuple[str | int, ...]]] = set()
+    identities: dict[str, tuple[int, ...]] = {}
+
+    def read(ref: Any) -> tuple[Path, bytes]:
+        _require(isinstance(ref, dict) and set(ref) == {"path", "sha256"}
+                 and isinstance(ref["path"], str) and isinstance(ref["sha256"], str)
+                 and re.fullmatch(r"[a-f0-9]{64}", ref["sha256"]),
+                 "Review text origin requires an exact artifact reference")
+        path = Path(ref["path"])
+        _require(path.is_absolute() and path == path.resolve() and path.is_file()
+                 and not path.is_symlink() and path.stat().st_size <= MAX_UNIT_BYTES,
+                 "Review text origin is missing, aliased or oversized")
+        before = _source_file_identity(path.lstat())
+        _require(str(path) not in identities or identities[str(path)] == before, "Review text origin path identity changed")
+        identities[str(path)] = before
+        data = path.read_bytes()
+        _require(hashlib.sha256(data).hexdigest() == ref["sha256"]
+                 and before == _source_file_identity(path.lstat()), "Review text origin bytes or identity changed")
+        return path, data
+
+    def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, child in pairs:
+            _require(key not in value, "Review text parent contains duplicate JSON keys")
+            value[key] = child
+        return value
+
+    def speech(value: Any) -> bool:
+        if isinstance(value, dict):
+            return value.get("schema_version") == "transcript/v1" or any(speech(v) for v in value.values())
+        return isinstance(value, list) and any(speech(v) for v in value)
+
+    _require(authorities is None or isinstance(authorities, list), "Review text authority roots must be an explicit list")
+    approved = authorities or []
+    _require(len(approved) <= MAX_UNITS and len({json.dumps(ref, sort_keys=True) for ref in approved}) == len(approved),
+             "Review text authority roots are duplicated or oversized")
+    for approved_ref in approved:
+        read(approved_ref)
+    _require(len({ref["sha256"] for ref in approved}) == len(approved), "Review text authority root bytes are duplicated")
+    authority_cache: dict[str, dict[str, Any]] = {}
+
+    def document(ref: Any) -> dict[str, Any]:
+        _, data = read(ref)
+        try:
+            value = json.loads(data, object_pairs_hook=object_pairs)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Review text authority is not bounded JSON") from exc
+        _require(isinstance(value, dict), "Review text authority must be an object")
+        return value
+
+    def authority(ref: Any) -> dict[str, Any]:
+        _require(ref in approved, "Review text observation has no separately bound authority root")
+        read(ref)
+        if ref["sha256"] in authority_cache:
+            return authority_cache[ref["sha256"]]
+        selected = document(ref)
+        names = {"inspection", "request", "snapshot", "verification", "execution", "producer", "response"}
+        _require(set(selected) == {"schema_version", *names}
+                 and selected["schema_version"] == "review-text-source-authority/v1",
+                 "Review text authority has unsupported fields")
+        values = {name: document(selected[name]) for name in names - {"producer"}}
+        inspection, request, snapshot, report, execution, response = (
+            values[name] for name in ("inspection", "request", "snapshot", "verification", "execution", "response"))
+        _require(inspection.get("schema_version") == "independent-oss-inspection/v1"
+                 and inspection.get("request") == selected["request"] and inspection.get("snapshot") == selected["snapshot"]
+                 and response.get("schema_version") == "artifact-audit-response/v1"
+                 and response.get("inspection") == selected["inspection"]
+                 and response.get("actual_inspection_execution") == selected["execution"],
+                 "Review text authority does not bind its original inspection and response")
+        _require(request.get("schema_version") == "artifact-audit-request/v1"
+                 and request.get("scope") == "reproducibility_license_support"
+                 and request.get("snapshot_hash") == selected["snapshot"]["sha256"]
+                 and request.get("reviewer_role") == "independent_auditor"
+                 and snapshot.get("schema_version") == "reproducibility-audit-snapshot/v1"
+                 and snapshot.get("verification") == selected["verification"],
+                 "Review text authority request/snapshot relationship differs")
+        _require(report.get("schema_version") == "oss-verification/v1" and report.get("repo_root") == str(root)
+                 and isinstance(report.get("before"), dict) and report["before"] == report.get("after"),
+                 "Review text authority lacks the unchanged original source observation")
+        before = report["before"]
+        identity = before.get("code_identity")
+        extra = before.get("documentation_example_files")
+        _require(isinstance(identity, dict) and set(identity) == {"code_revision", "code_tree_hash", "files"}
+                 and isinstance(identity["files"], dict) and isinstance(extra, dict)
+                 and identity["code_tree_hash"] == object_hash(identity["files"])
+                 and before.get("documentation_example_hash") == object_hash(extra),
+                 "Review text authority source maps are incomplete or hash-inconsistent")
+        maps = {**identity["files"], **extra}
+        _require(all(isinstance(k, str) and isinstance(v, str) and re.fullmatch(r"[a-f0-9]{64}", v) for k, v in maps.items())
+                 and all(k not in extra or extra[k] == v for k, v in identity["files"].items()),
+                 "Review text authority source maps conflict")
+        public_rows = inspection.get("public_files")
+        _require(isinstance(public_rows, list) and 0 < len(public_rows) == len(maps) <= MAX_UNITS
+                 and all(isinstance(row, dict) and isinstance(row.get("path"), str)
+                         and type(row.get("utf8_bytes")) is int and row["utf8_bytes"] >= 0
+                         and row.get("is_symlink") is False for row in public_rows)
+                 and len({row["path"] for row in public_rows}) == len(public_rows)
+                 and {row["path"]: row.get("sha256") for row in public_rows} == {str(root / path): digest for path, digest in maps.items()},
+                 "Review text inspection does not retain the complete original source-file map")
+        dependencies = {"code_tree_hash": identity["code_tree_hash"],
+                        "documentation_example_hash": before["documentation_example_hash"],
+                        "verification_hash": selected["verification"]["sha256"]}
+        _require(request.get("dependencies") == snapshot.get("dependencies") == dependencies
+                 and isinstance(request.get("input_artifacts"), list) and isinstance(snapshot.get("input_refs"), list)
+                 and request["input_artifacts"] == [selected["snapshot"], *snapshot["input_refs"]],
+                 "Review text authority request inputs or dependencies differ")
+        inspected = inspection.get("inspected_artifacts")
+        _require(isinstance(inspected, list) and len(inspected) == len(request["input_artifacts"])
+                 and all(isinstance(row, dict) and set(row) == {"path", "sha256", "bytes"}
+                         and type(row["bytes"]) is int and row["bytes"] >= 0 for row in inspected)
+                 and [{"path": row.get("path"), "sha256": row.get("sha256")} for row in inspected] == request["input_artifacts"],
+                 "Review text authority inspection omits or replaces original input rows")
+        producer_path, producer_bytes = read(selected["producer"])
+        argv = execution.get("argv")
+        basic = {"argv", "cwd", "exit_code", "started_at", "finished_at", "stdout", "stderr"}
+        typed_command = (set(execution) == basic | {"schema_version", "wall_seconds"}
+                         and execution.get("schema_version") == "independent-audit-command/v1"
+                         and type(execution.get("wall_seconds")) in {int, float}
+                         and math.isfinite(execution["wall_seconds"]) and execution["wall_seconds"] >= 0)
+        script_command = (set(execution) == basic | {"script", "reviewer_task_id"}
+                          and execution.get("script") == selected["producer"]
+                          and execution.get("reviewer_task_id") == request.get("reviewer_task_id")
+                          and isinstance(request.get("reviewer_task_id"), str))
+        _require((typed_command or script_command)
+                 and isinstance(argv, list) and len(argv) == 4 and isinstance(argv[0], str)
+                 and Path(argv[0]).is_absolute() and argv[1:] == ["-I", "-B", str(producer_path)]
+                 and execution.get("cwd") == str(root) and type(execution.get("exit_code")) is int and execution["exit_code"] == 0
+                 and isinstance(execution.get("started_at"), str) and isinstance(execution.get("finished_at"), str),
+                 "Review text authority command is not its retained fixed inspection")
+        try:
+            syntax = ast.parse(producer_bytes.decode())
+        except (ValueError, UnicodeDecodeError, SyntaxError) as exc:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Review text inspection producer is not Python") from exc
+        expected_public = ast.parse("public = {**report['before']['code_identity']['files'], **report['before']['documentation_example_files']}").body[0]
+        _require(any(ast.dump(node) == ast.dump(expected_public) for node in syntax.body),
+                 "Review text inspection producer does not select the original source maps")
+        _, stdout = read(execution.get("stdout"))
+        _, stderr = read(execution.get("stderr"))
+        _require(not stderr, "Review text inspection stderr is not the original clean observation")
+        try:
+            log = [json.loads(line, object_pairs_hook=object_pairs) for line in stdout.decode().splitlines() if line.strip()]
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Review text inspection log is malformed") from exc
+        completed = [row for row in log if isinstance(row, dict) and row.get("stage") == "inspection_completed_without_issuing_audit_verdict"]
+        _require(len(completed) == 1 and completed[0].get("result") == selected["inspection"],
+                 "Review text inspection log does not bind the exact original result")
+        observed = {"root": ref, "refs": [ref, *[selected[name] for name in sorted(names)], execution["stdout"], execution["stderr"]],
+                    "source_files": maps, "code_identity": identity, "inspection": selected["inspection"],
+                    "response": selected["response"], "request_inputs": request["input_artifacts"]}
+        authority_cache[ref["sha256"]] = observed
+        return observed
+
+
+    for locator in locators:
+        _require(isinstance(locator, dict) and locator.get("kind") in {"python_inspection", "document_paragraph", "document_complete"},
+                 "Unsupported review text origin kind")
+        paragraph = locator["kind"] != "python_inspection"
+        complete_document = locator["kind"] == "document_complete"
+        _require(set(locator) == {"schema_version", "kind", "parent", "selector", "source", "authority"}
+                 | ({"paragraph_index"} if paragraph and not complete_document else set())
+                 and locator["schema_version"] == "review-text-origin/v1", "Unsupported review text origin fields")
+        bound = authority(locator["authority"])
+        _require(locator["parent"] == bound["response" if paragraph else "inspection"],
+                 "Review text parent differs from the separately frozen authority root")
+        parent_path, data = read(locator["parent"])
+        _require(parent_path.is_relative_to(directory)
+                 and not any(parent_path.is_relative_to(directory / name) for name in
+                             ("sources", "transcripts", "renders", "reviews", "review", "analysis")),
+                 "Review text origin cannot scope source, transcript or audiovisual review namespaces")
+        try:
+            parent = json.loads(data, object_pairs_hook=object_pairs)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Review text parent is not bounded JSON") from exc
+        _require(isinstance(parent, dict) and not speech(parent)
+                 and parent.get("schema_version") == ("artifact-audit-response/v1" if paragraph else "independent-oss-inspection/v1"),
+                 "Review text parent has a different schema or transcript context")
+        selector = locator["selector"]
+        pattern = ["documentation_reviews", int, "claims", int, "quote"] if paragraph else ["public_files", int]
+        _require(isinstance(selector, list) and len(selector) == len(pattern)
+                 and all((type(part) is int and 0 <= part < MAX_UNITS) if expected is int else
+                         (type(part) is str and part == expected) for part, expected in zip(selector, pattern, strict=True)),
+                 "Review text selector is outside the closed extraction grammar")
+        key = (str(parent_path), tuple(selector))
+        _require(key not in seen, "Review text origin selector is duplicated")
+        seen.add(key)
+        try:
+            selected = parent
+            for part in selector:
+                selected = selected[part]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Review text selector does not exist") from exc
+        source = locator["source"]
+        _require(isinstance(source, dict) and set(source) == {"original_path", "snapshot", "git_revision", "git_path", "git_blob"}
+                 and all(isinstance(source[k], str) for k in ("original_path", "git_revision", "git_path", "git_blob"))
+                 and re.fullmatch(r"[a-f0-9]{40}", source["git_revision"])
+                 and re.fullmatch(r"[a-f0-9]{40}", source["git_blob"]), "Review text source Git identity is incomplete")
+        relative = PurePosixPath(source["git_path"])
+        _require(not relative.is_absolute() and relative.as_posix() == source["git_path"]
+                 and relative.parts and all(part not in {".", ".."} for part in relative.parts)
+                 and source["original_path"] == str(root / relative)
+                 and (root / relative).resolve() == root / relative,
+                 "Review text source path is noncanonical or outside its Git identity")
+        snapshot_path, source_data = read(source["snapshot"])
+        _require(source["git_revision"] == bound["code_identity"]["code_revision"]
+                 and bound["source_files"].get(source["git_path"]) == source["snapshot"].get("sha256")
+                 and {"path": source["original_path"], "sha256": source["snapshot"].get("sha256")} in bound["request_inputs"],
+                 "Review text source differs from the original request and verification maps")
+        _require(source["snapshot"]["sha256"] not in registered, "Registered media cannot supply review text origins")
+        traces: list[dict[str, Any]] = []
+        _command(["git", "cat-file", "commit", source["git_revision"]], root, traces)
+        tree = _command(["git", "ls-tree", "-z", source["git_revision"], "--", source["git_path"]], root, traces)
+        expected = ("100644 blob " + source["git_blob"] + "\t" + source["git_path"] + "\0").encode()
+        executable = ("100755 blob " + source["git_blob"] + "\t" + source["git_path"] + "\0").encode()
+        _require(tree in {expected, executable}, "Review text source is not the exact regular Git tree member")
+        blob = _command(["git", "cat-file", "blob", source["git_blob"]], root, traces)
+        _require(blob == source_data, "Review text preserved source differs from its Git blob")
+        try:
+            content = source_data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Review text source is not UTF-8") from exc
+        exempt = []
+        if paragraph:
+            quoted_document = parent["documentation_reviews"][selector[1]]
+            _require(isinstance(quoted_document, dict) and quoted_document.get("path") == source["original_path"]
+                     and quoted_document.get("sha256") == source["snapshot"]["sha256"]
+                     and relative.suffix == ".md", "Review text quote names a different source document")
+            if complete_document:
+                _require(isinstance(selected, str) and len(selected.strip()) >= 10 and selected == content.strip(),
+                         "Review text quote is not the exact complete source document")
+            else:
+                _require(type(locator["paragraph_index"]) is int and 0 <= locator["paragraph_index"] < MAX_UNITS,
+                         "Review text paragraph index must be an exact bounded integer")
+                pieces = content.split("\n\n")
+                index = locator["paragraph_index"]
+                _require(index < len(pieces) and isinstance(selected, str) and len(selected.strip()) >= 10
+                         and not selected.startswith("#") and selected == pieces[index].strip(),
+                         "Review text quote is not the exact selected complete paragraph")
+            exempt.append({"edge": selector, "value": selected})
+        else:
+            _require(relative.parts[0] in {"tests", "examples"} and relative.suffix == ".py",
+                     "Review text Python extraction is outside its source grammar")
+            try:
+                syntax = ast.parse(content)
+            except SyntaxError as exc:
+                raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Review text source has invalid Python syntax") from exc
+            extraction = {"path": source["original_path"], "sha256": source["snapshot"]["sha256"],
+                          "utf8_bytes": len(content.encode()), "is_symlink": False,
+                          "imports": [ast.unparse(n) for n in syntax.body if isinstance(n, (ast.Import, ast.ImportFrom))],
+                          "functions": [n.name for n in syntax.body if isinstance(n, ast.FunctionDef)],
+                          "asset_creation_calls": [ast.get_source_segment(content, n) for n in ast.walk(syntax)
+                              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                              and n.func.attr in {"write_text", "write_bytes", "run", "writestr", "pack", "pack_into"}]}
+            _require(isinstance(selected, dict) and set(selected) == set(extraction)
+                     and json.dumps(selected, sort_keys=True, separators=(",", ":"))
+                     == json.dumps(extraction, sort_keys=True, separators=(",", ":")),
+                     "Review text Python row differs from its complete source extraction")
+            for field in ("imports", "functions", "asset_creation_calls"):
+                _require(len(extraction[field]) <= MAX_UNITS, "Review text source extraction exceeds its bound")
+                for index, value in enumerate(extraction[field]):
+                    exempt.append({"edge": [*selector, field, index], "value": value})
+        read(locator["parent"])
+        read(source["snapshot"])
+        result.append({"parent": locator["parent"], "selector": selector, "kind": locator["kind"],
+                       "source": source, "source_snapshot": artifact_ref(snapshot_path), "selected_value": selected,
+                       "extractions": exempt, "authority": locator["authority"], "authority_refs": bound["refs"],
+                       "commands": traces, "classification": "review",
+                       "claim_status": "UNVERIFIED", "scope": "Exact source-derived fields only; no review or publication approval"})
+    _require(set(authority_cache) == {ref["sha256"] for ref in approved}, "Review text authority root was not consumed")
+    for observed_name, identity in identities.items():
+        _require(_source_file_identity(Path(observed_name).lstat()) == identity, "Review text authority identity changed after readback")
+    return result
+
+
 def _known_private_inventory(project_dir: Path | None, expected_source_hashes: dict[str, str] | None,
                              repo_root: Path | None = None, *,
                              historical_artifacts: list[dict[str, Any]] | None = None,
@@ -399,6 +687,8 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
                              native_runtime_request_observations: list[dict[str, Any]] | None = None,
                              native_runtime_alias_reobservations: list[dict[str, Any]] | None = None,
                              inventory_alias_row_reobservations: list[dict[str, Any]] | None = None,
+                             review_text_origins: list[dict[str, Any]] | None = None,
+                             review_text_origin_authorities: list[dict[str, Any]] | None = None,
                              historical_verification_command_observations: list[dict[str, Any]] | None = None,
                              auxiliary_source_trees: list[dict[str, Any]] | None = None,
                              auxiliary_source_tree_reobservations: list[dict[str, Any]] | None = None,
@@ -481,6 +771,10 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
                              "Auxiliary runtime alias identities conflict")
                 else:
                     runtime_aliases[alias_key] = row
+    text_origins = _review_text_origin_inventory(review_text_origins, directory, repo_root, set(registered.values()), review_text_origin_authorities)
+    text_origin_edges = {(row["parent"]["path"], tuple(item["edge"])): item["value"]
+                         for row in text_origins for item in row["extractions"]}
+    text_origins_consumed: set[tuple[str, tuple[str | int, ...]]] = set()
     known: dict[str, str] = {}
     refs: dict[str, dict[str, Any]] = {}
     pending: list[tuple[Path, str]] = []
@@ -601,14 +895,20 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
             return any(contains_transcript(child) for child in value.values())
         return isinstance(value, list) and any(contains_transcript(child) for child in value)
 
-    def protect_values(value: Any, key: str = "") -> None:
+    def protect_values(value: Any, key: str = "", *, origin_path: Path | None = None,
+                       edge: tuple[str | int, ...] = ()) -> None:
         """Protect this file's private strings; never follow its artifact refs."""
+        selected = (str(origin_path), edge)
+        if selected in text_origin_edges:
+            _require(value == text_origin_edges[selected], "Review text selected value changed during phrase collection")
+            text_origins_consumed.add(selected)
+            return
         if isinstance(value, dict):
             for child_key, child in value.items():
-                protect_values(child, child_key)
+                protect_values(child, child_key, origin_path=origin_path, edge=(*edge, child_key))
         elif isinstance(value, list):
-            for child in value:
-                protect_values(child, key)
+            for index, child in enumerate(value):
+                protect_values(child, key, origin_path=origin_path, edge=(*edge, index))
         elif (isinstance(value, str) and len(value.strip()) >= 40 and
               (key in {"text", "word", "utterance", "transcript", "sentence"}
                or (not Path(value).is_absolute() and not re.fullmatch(r"[a-f0-9]{64}", value)))):
@@ -631,7 +931,7 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
                 # Only this closed run's exact public CLI boilerplate is
                 # excluded; its error stdout and all other strings stay private.
                 protect_values({key: child for key, child in value.items() if key != "reason"}
-                               if str(path) in failed_run_paths else value)
+                               if str(path) in failed_run_paths else value, origin_path=path)
             if str(path) not in json_scheduled and (protect or parse_json or path.suffix.lower() == ".json"):
                 pending.append((path, refs[str(path)]["kind"]))
                 json_scheduled.add(str(path))
@@ -951,6 +1251,15 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         add(old_path, "review", expected, parse_json=True)
         inspect_text(path, True, parse_json=True)
         inspect_text(old_path, True, parse_json=True)
+    for observation in text_origins:
+        for authority_ref in observation["authority_refs"]:
+            authority_path = Path(authority_ref["path"])
+            collect_candidate(authority_path, authority_ref, authority_ref)
+        parent_ref = observation["parent"]
+        add(Path(parent_ref["path"]), "review", parent_ref["sha256"], parse_json=True)
+        source = observation["source"]
+        original = {"path": source["original_path"], "sha256": source["snapshot"]["sha256"]}
+        collect_candidate(Path(source["original_path"]), original, source["snapshot"])
     for observation in inventory_alias_rows:
         for parent_ref in (observation["parent"], observation["typed_origin"]["parent"]):
             add(Path(parent_ref["path"]), "review", parent_ref["sha256"], parse_json=True)
@@ -1007,6 +1316,13 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         # from the provenance of files it references. Only an explicit,
         # source-bound transcript marker propagates across artifact edges.
         walk(value, origin_path=path)
+    _require(text_origins_consumed == set(text_origin_edges), "Review text origin did not select a consumed private field")
+    _require(text_origins == _review_text_origin_inventory(review_text_origins, directory, repo_root, digests, review_text_origin_authorities),
+             "Review text origin or source changed during inventory")
+    _require(not any(row["source_snapshot"]["sha256"] in known for row in text_origins),
+             "Known private bytes cannot supply review text source authority")
+    _require(not any(refs[row["parent"]["path"]]["kind"] != "review" for row in text_origins),
+             "Review text origin parent acquired transcript or media classification")
     _require(inventory_alias_consumed == set(inventory_alias_edges),
              "Inventory alias locator did not name a consumed exact metadata edge")
     _require(inventory_alias_rows == _inventory_alias_row_inventory(inventory_alias_row_reobservations, directory,
@@ -1066,6 +1382,7 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         "native_runtime_request_observations": native_runtime_observations,
         "native_runtime_alias_reobservations": native_reobservations,
         "inventory_alias_row_reobservations": inventory_alias_rows,
+        "review_text_origins": text_origins,
         "historical_verification_command_observations": command_history,
         "auxiliary_runtime_reobservations": list(runtime_reuses.values()),
         "auxiliary_source_trees": current_tree_observations,
@@ -1497,6 +1814,8 @@ def build_private_inventory(project_dir: str | Path, expected_source_hashes: dic
                              native_runtime_request_observations: list[dict[str, Any]] | None = None,
                              native_runtime_alias_reobservations: list[dict[str, Any]] | None = None,
                              inventory_alias_row_reobservations: list[dict[str, Any]] | None = None,
+                             review_text_origins: list[dict[str, Any]] | None = None,
+                             review_text_origin_authorities: list[dict[str, Any]] | None = None,
                              historical_verification_command_observations: list[dict[str, Any]] | None = None,
                              auxiliary_source_trees: list[dict[str, Any]] | None = None,
                              auxiliary_source_tree_reobservations: list[dict[str, Any]] | None = None,
@@ -1519,6 +1838,8 @@ def build_private_inventory(project_dir: str | Path, expected_source_hashes: dic
                                           native_runtime_request_observations=native_runtime_request_observations,
                                           native_runtime_alias_reobservations=native_runtime_alias_reobservations,
                                           inventory_alias_row_reobservations=inventory_alias_row_reobservations,
+                                          review_text_origins=review_text_origins,
+                                          review_text_origin_authorities=review_text_origin_authorities,
                                           historical_verification_command_observations=historical_verification_command_observations,
                                           auxiliary_source_trees=auxiliary_source_trees,
                                           auxiliary_source_tree_reobservations=auxiliary_source_tree_reobservations,
@@ -1634,6 +1955,8 @@ def _audited_private_inventory(raw: dict[str, Any], directory: Path | None,
                                       native_runtime_request_observations=raw.get("native_runtime_request_observations"),
                                       native_runtime_alias_reobservations=raw.get("native_runtime_alias_reobservations"),
                                       inventory_alias_row_reobservations=raw.get("inventory_alias_row_reobservations"),
+                                      review_text_origins=raw.get("review_text_origins"),
+                                      review_text_origin_authorities=raw.get("review_text_origin_authorities"),
                                       historical_verification_command_observations=raw.get("historical_verification_command_observations"),
                                       auxiliary_source_trees=raw.get("auxiliary_source_trees"),
                                       auxiliary_source_tree_reobservations=raw.get("auxiliary_source_tree_reobservations"),
@@ -1765,6 +2088,8 @@ def verify_release_privacy(raw_ref: dict[str, Any], repo_root: str | Path, *, pr
                                       native_runtime_request_observations=raw.get("native_runtime_request_observations"),
                                       native_runtime_alias_reobservations=raw.get("native_runtime_alias_reobservations"),
                                       inventory_alias_row_reobservations=raw.get("inventory_alias_row_reobservations"),
+                                      review_text_origins=raw.get("review_text_origins"),
+                                      review_text_origin_authorities=raw.get("review_text_origin_authorities"),
                                       historical_verification_command_observations=raw.get("historical_verification_command_observations"),
                                       auxiliary_source_trees=raw.get("auxiliary_source_trees"),
                                       auxiliary_source_tree_reobservations=raw.get("auxiliary_source_tree_reobservations"),
@@ -1776,6 +2101,8 @@ def verify_release_privacy(raw_ref: dict[str, Any], repo_root: str | Path, *, pr
     # Nonempty caller-supplied hashes never establish the denominator. An exact
     # current task inventory plus separately executed classification audit can.
     audited = _audited_private_inventory(raw, project_dir, expected_source_hashes, root, private, refs)
+    _require(not any(row["source_snapshot"]["sha256"] in private for row in private_inventory.get("review_text_origins", [])),
+             "Explicit or audited private corpus bytes cannot supply review text source authority")
     corpus_complete = audited is not None
     if audited is not None:
         private_inventory["classification_audit"] = audited
