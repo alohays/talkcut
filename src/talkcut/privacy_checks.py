@@ -37,6 +37,7 @@ from jsonschema.exceptions import SchemaError
 
 from . import (
     privacy_acceptance_origins,
+    privacy_checkpoint_origins,
     privacy_contract_origins,
     privacy_machine_origins,
     privacy_oversized_origins,
@@ -961,6 +962,17 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
                 machine = privacy_acceptance_origins.verify(selected, root, read, document)
             elif family == "acceptance_report_data":
                 machine = privacy_report_data_origins.verify(selected, root, read, document)
+            elif family == "acceptance_checkpoint_data":
+                upstream_ref = selected.get("upstream_authority")
+                _require(upstream_ref in approved, "Checkpoint upstream authority is not separately approved")
+                upstream_declaration = document(upstream_ref)
+                _require(upstream_declaration.get("schema_version") == "review-machine-field-authority/v1"
+                         and isinstance(upstream_declaration.get("family"), str)
+                         and upstream_declaration["family"] in {"acceptance_cli_report", "acceptance_report_data"},
+                         "Checkpoint upstream authority is not an approved report family")
+                upstream = authority(upstream_ref)
+                machine = privacy_checkpoint_origins.verify(selected, upstream["machine"], upstream_declaration, read, document)
+                machine["refs"] = [*machine["refs"], *upstream["refs"]]
             elif family == "contract_template":
                 machine = privacy_contract_origins.verify(selected, root, read, document)
             elif family == "independent_privacy_inventory":
@@ -1117,10 +1129,24 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
             acceptance = bound["machine_family"] == "acceptance_cli_report"
             template = bound["machine_family"] == "contract_template"
             report_data = bound["machine_family"] == "acceptance_report_data"
+            checkpoint = bound["machine_family"] == "acceptance_checkpoint_data"
             origin_path = parent_path
             if acceptance:
                 _require(bound["machine"]["project"] == directory, "Acceptance original command names another project")
                 origin_path = Path(privacy_acceptance_origins.original_parent(bound["machine"], locator["parent"])["path"])
+            elif checkpoint:
+                _require(bound["machine"]["project"] in (None, directory), "Checkpoint upstream command names another project")
+                origin_path = Path(privacy_checkpoint_origins.original_parent(bound["machine"], locator["parent"])["path"])
+                for upstream_parent in bound["machine"]["upstream_parents"]:
+                    upstream_path, _ = read(upstream_parent["ref"])
+                    upstream_original = Path(upstream_parent["original"]["path"])
+                    _require(upstream_original.is_relative_to(directory)
+                             and upstream_parent["ref"]["sha256"] not in registered
+                             and not any(path.is_relative_to(directory / name)
+                                         for path in (upstream_path, upstream_original) for name in
+                                         ("sources", "transcripts", "renders", "reviews", "review", "analysis"))
+                             and not speech(document(upstream_parent["ref"])),
+                             "Checkpoint upstream report cannot scope private source or transcript contexts")
             elif report_data:
                 origin_path = Path(privacy_report_data_origins.original_parent(bound["machine"], locator["parent"])["path"])
             elif template:
@@ -1136,6 +1162,7 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
             _require(retention or not speech(parent), "Machine review parent contains a transcript context")
             machine = bound["machine"]
             project_field = (privacy_acceptance_origins.project_field if acceptance
+                             else privacy_checkpoint_origins.project_field if checkpoint
                              else privacy_report_data_origins.project_field if report_data
                              else privacy_contract_origins.project_field if template
                              else privacy_retention_origins.retention_field if retention
@@ -1178,9 +1205,10 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
                            "source_snapshot": source_ref, "selected_value": selected_leaf,
                            "associated_row": projection["row"], "extractions": projection["extractions"],
                            "authority": locator["authority"], "authority_refs": bound["refs"], "commands": [],
-                           **({"source_dependencies": source_dependencies} if acceptance or template or report_data else {}),
+                           **({"source_dependencies": source_dependencies} if acceptance or template or report_data or checkpoint else {}),
                            "classification": "review", "claim_status": "UNVERIFIED",
-                           "scope": ("Exact original source-data construction leaf only; full parent remains private and contract validity, invocation and physical copying are not approved"
+                           "scope": ("Exact retained checkpoint data projection only; full parent remains private and historical execution, physical copying and acceptance are not approved"
+                                     if checkpoint else "Exact original source-data construction leaf only; full parent remains private and contract validity, invocation and physical copying are not approved"
                                      if template else "Exact original reported-data construction leaf only; full parent remains private and invocation, physical copying and acceptance are not approved"
                                      if report_data else "Exact original machine-written leaf only; full parent remains private and original execution is not approved")})
             continue
