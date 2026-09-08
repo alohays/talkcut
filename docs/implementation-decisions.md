@@ -110,3 +110,18 @@ complete code identity. The inventory reruns every supported technical control
 with the current implementation and checks conservation of the original files.
 Missing audiovisual controls remain unknown, and historical execution remains
 unverified. This origin check does not establish publication readiness.
+
+## Preserving large private evidence
+
+The private inventory archive previously reused the generic 16 MiB inspection
+limit, so complete metric streams and other large review inputs could prevent
+inventory creation. Private review and transcript inputs are now preserved as
+opaque bytes with separate bounds of 32 GiB per file and 64 GiB across all
+selected paths. Equal-byte paths retain individual mappings when storage is
+reused. Generic parsing and publication scan limits remain unchanged.
+
+Copies use bounded reads, exact byte counts, full hashes and source and target
+identity checks. Archive writes use a pinned directory descriptor. Existing
+successes are preserved, interrupted partials remain available for diagnosis,
+and only complete verified objects enter the returned mapping. Byte preservation
+provides no classification, semantic review or publication approval.

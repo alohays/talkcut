@@ -16,7 +16,7 @@ import json
 import math
 import os
 import re
-import shutil
+import secrets
 import stat
 import struct
 import subprocess
@@ -41,6 +41,11 @@ MAX_COMMITS = 10000
 # Finite traversal safeguard, not a quality/coverage denominator. Real preserved
 # whole-frame evidence can exceed 100,000 files; every file still enters inventory.
 MAX_TASK_FILES = 1000000
+# Opaque private preservation has independent finite I/O bounds. Parsing and
+# publication scanning retain MAX_UNIT_BYTES and MAX_TOTAL_BYTES unchanged.
+MAX_PRIVATE_ARCHIVE_FILE_BYTES = 32 * 1024**3
+MAX_PRIVATE_ARCHIVE_TOTAL_BYTES = 64 * 1024**3
+PRIVATE_ARCHIVE_CHUNK_BYTES = 1024 * 1024
 CREDENTIALS = {
     "private_key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
     "github_token": re.compile(r"\b(?:gh[opusr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
@@ -1267,6 +1272,219 @@ def _bookkeeping(path: Path, directory: Path, *, referenced_input: bool = False)
     return {"kind": "review", "state": "private_measurement_artifact"}
 
 
+def _private_archive_stream(source_fd: int, size: int, output_fd: int | None = None) -> str:
+    """Consume exact opaque bytes with bounded reads; never decode private content."""
+    digest = hashlib.sha256()
+    remaining = size
+    while remaining:
+        block = os.read(source_fd, min(PRIVATE_ARCHIVE_CHUNK_BYTES, remaining))
+        _require(bool(block), "Private archive source ended before its observed size")
+        remaining -= len(block)
+        digest.update(block)
+        if output_fd is not None:
+            pending = memoryview(block)
+            while pending:
+                written = os.write(output_fd, pending)
+                _require(written > 0, "Private archive write made no progress")
+                pending = pending[written:]
+    _require(not os.read(source_fd, 1), "Private archive source grew beyond its observed size")
+    return digest.hexdigest()
+
+
+def _preserve_private_inputs(entries: dict[str, dict[str, Any]], directory: Path,
+                             archive: Path) -> tuple[dict[str, dict[str, str]], dict[str, Any]]:
+    """Preserve the already selected bytes; this provides no content approval.
+
+    Failed partials stay in the private archive for diagnosis. Only complete,
+    independently read-back files are published under their digest; an existing
+    successful target is never overwritten. Bounds count every selected path,
+    including equal-byte copies, before any deduplication or copying.
+    """
+    selected: list[tuple[dict[str, Any], Path, tuple[int, ...], Path]] = []
+    total = 0
+    for name, row in entries.items():
+        if row["entry_type"] != "file" or row["classification"] not in {"review", "transcript"}:
+            continue
+        _require(row["path"] == name and isinstance(row["sha256"], str)
+                 and re.fullmatch(r"[a-f0-9]{64}", row["sha256"]), "Private archive row identity is malformed")
+        path = Path(name)
+        state = path.lstat()
+        _require(path.is_absolute() and stat.S_ISREG(state.st_mode), "Private archive source is not a regular file")
+        _require(state.st_size <= MAX_PRIVATE_ARCHIVE_FILE_BYTES, "Private archive file exceeds its preservation bound")
+        total += state.st_size
+        _require(total <= MAX_PRIVATE_ARCHIVE_TOTAL_BYTES, "Private archive paths exceed the total preservation bound")
+        resolved = path.resolve(strict=True)
+        _require(path == resolved, "Private archive source path must be canonical without ancestor aliases")
+        selected.append((row, path, _source_file_identity(state), resolved))
+    _require(len(selected) <= MAX_TASK_FILES, "Private archive exceeds the task file-count bound")
+    _require(archive.absolute() == archive.resolve(), "Private archive path must be canonical without ancestor aliases")
+    archive = archive.resolve()
+    _require(not archive.is_relative_to(directory), "Private inventory archive must be outside the task project")
+    archive.mkdir(parents=True, exist_ok=True)
+    directory_fd = os.open(archive, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    directory_state = os.fstat(directory_fd)
+
+    def directory_identity(state: os.stat_result) -> tuple[int, ...]:
+        # Creating archive members changes directory timestamps, not its identity.
+        return state.st_dev, state.st_ino, state.st_mode, state.st_uid, state.st_gid
+
+    def check_directory() -> None:
+        _require(archive == archive.resolve(strict=True)
+                 and directory_identity(archive.lstat()) == directory_identity(directory_state)
+                 == directory_identity(os.fstat(directory_fd)), "Private archive directory identity changed")
+
+    def check_source(path: Path, source_fd: int, identity: tuple[int, ...], resolved: Path) -> None:
+        _require(path.resolve(strict=True) == resolved
+                 and _source_file_identity(path.lstat()) == identity
+                 == _source_file_identity(os.fstat(source_fd)), "Private archive source identity changed")
+
+    preserved: dict[str, dict[str, str]] = {}
+    observations: list[dict[str, Any]] = []
+    verified_targets: dict[str, tuple[int, ...]] = {}
+    try:
+        for row, path, identity, resolved in selected:
+            check_directory()
+            source_fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            partial_fd: int | None = None
+            try:
+                check_source(path, source_fd, identity, resolved)
+                size = os.fstat(source_fd).st_size
+                digest = row["sha256"]
+                try:
+                    os.stat(digest, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    # Create relative to the pinned directory, so a replaced
+                    # pathname cannot redirect even a failed partial write.
+                    partial_name = ".partial-" + secrets.token_hex(16)
+                    partial_fd = os.open(partial_name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                         0o600, dir_fd=directory_fd)
+                    check_directory()
+                    source_digest = _private_archive_stream(source_fd, size, partial_fd)
+                    os.fsync(partial_fd)
+                    _require(source_digest == digest, "Private archive source digest changed")
+                    check_source(path, source_fd, identity, resolved)
+                    check_directory()
+                    partial_state = os.fstat(partial_fd)
+                    _require(stat.S_ISREG(partial_state.st_mode) and partial_state.st_nlink == 1
+                             and _source_file_identity(os.stat(partial_name, dir_fd=directory_fd, follow_symlinks=False)) == _source_file_identity(partial_state),
+                             "Private archive partial identity changed")
+                    os.lseek(partial_fd, 0, os.SEEK_SET)
+                    _require(_private_archive_stream(partial_fd, size) == digest,
+                             "Private archive partial bytes differ from the source")
+                    _require(_source_file_identity(os.fstat(partial_fd)) == _source_file_identity(partial_state)
+                             == _source_file_identity(os.stat(partial_name, dir_fd=directory_fd, follow_symlinks=False)), "Private archive partial changed during readback")
+                    # Hard-link publication is exclusive; never replace a prior
+                    # success or follow a target introduced during this copy.
+                    os.link(partial_name, digest, src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+                            follow_symlinks=False)
+                    created = True
+                else:
+                    source_digest = _private_archive_stream(source_fd, size)
+                    _require(source_digest == digest, "Private archive source digest changed")
+                    check_source(path, source_fd, identity, resolved)
+                    created = False
+                target_fd = os.open(digest, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+                try:
+                    target_state = os.fstat(target_fd)
+                    _require(digest not in verified_targets or _source_file_identity(target_state) == verified_targets[digest],
+                             "Previously preserved private target identity changed")
+                    expected_links = 2 if created else 1
+                    _require(stat.S_ISREG(target_state.st_mode) and target_state.st_nlink == expected_links
+                             and (target_state.st_dev, target_state.st_ino) != (identity[0], identity[1])
+                             and _source_file_identity(target_state)
+                             == _source_file_identity(os.stat(digest, dir_fd=directory_fd, follow_symlinks=False)),
+                             "Private archive target is linked, replaced or aliases its source")
+                    if partial_fd is not None:
+                        _require(_source_file_identity(target_state) == _source_file_identity(os.fstat(partial_fd)),
+                                 "Private archive publication differs from its verified partial")
+                    _require(target_state.st_size == size and _private_archive_stream(target_fd, size) == digest,
+                             "Preserved private audit bytes changed")
+                    _require(_source_file_identity(os.fstat(target_fd)) == _source_file_identity(target_state)
+                             == _source_file_identity(os.stat(digest, dir_fd=directory_fd, follow_symlinks=False)),
+                             "Private archive target changed during readback")
+                    check_source(path, source_fd, identity, resolved)
+                    check_directory()
+                    if partial_fd is not None:
+                        # This removes only our verified successful staging name.
+                        _require(_source_file_identity(os.stat(partial_name, dir_fd=directory_fd, follow_symlinks=False)) == _source_file_identity(os.fstat(partial_fd)),
+                                 "Private archive partial changed before completed cleanup")
+                        os.unlink(partial_name, dir_fd=directory_fd)
+                        os.fsync(directory_fd)
+                    final_state = os.fstat(target_fd)
+                    _require(final_state.st_nlink == 1 and _source_file_identity(final_state)
+                             == _source_file_identity(os.stat(digest, dir_fd=directory_fd, follow_symlinks=False)),
+                             "Completed private archive target changed")
+                    os.lseek(target_fd, 0, os.SEEK_SET)
+                    _require(_private_archive_stream(target_fd, size) == digest,
+                             "Completed private archive target bytes changed")
+                    _require(_source_file_identity(final_state) == _source_file_identity(os.fstat(target_fd))
+                             == _source_file_identity(os.stat(digest, dir_fd=directory_fd, follow_symlinks=False)),
+                             "Completed private archive target identity changed")
+                    check_source(path, source_fd, identity, resolved)
+                    check_directory()
+                    verified_targets[digest] = _source_file_identity(final_state)
+                    ref = {"path": str(archive / digest), "sha256": digest}
+                    preserved[str(path)] = ref
+                    observations.append({"source": {"path": str(path), "sha256": source_digest},
+                                         "source_resolved_path": str(resolved), "source_digest_before": source_digest,
+                                         "source_identity_before": identity,
+                                         "source_identity_after": _source_file_identity(os.fstat(source_fd)),
+                                         "target": ref, "target_identity_after": _source_file_identity(final_state),
+                                         "verified_target_identity_before": _source_file_identity(target_state),
+                                         "bytes": size, "created": created})
+                finally:
+                    os.close(target_fd)
+            finally:
+                if partial_fd is not None:
+                    os.close(partial_fd)
+                os.close(source_fd)
+        # A later copy must not invalidate an earlier verified source or target.
+        for index, (row, path, identity, resolved) in enumerate(selected):
+            source_fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                check_source(path, source_fd, identity, resolved)
+                _require(_private_archive_stream(source_fd, os.fstat(source_fd).st_size) == row["sha256"],
+                         "Private archive source changed before completion")
+                check_source(path, source_fd, identity, resolved)
+                observations[index]["source_digest_after"] = row["sha256"]
+            finally:
+                os.close(source_fd)
+        for digest, identity in verified_targets.items():
+            target_fd = os.open(digest, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+            try:
+                _require(_source_file_identity(os.fstat(target_fd)) == identity
+                         == _source_file_identity(os.stat(digest, dir_fd=directory_fd, follow_symlinks=False)),
+                         "Private archive target changed before completion")
+                _require(_private_archive_stream(target_fd, os.fstat(target_fd).st_size) == digest,
+                         "Private archive target digest changed before completion")
+                _require(_source_file_identity(os.fstat(target_fd)) == identity
+                         == _source_file_identity(os.stat(digest, dir_fd=directory_fd, follow_symlinks=False)),
+                         "Private archive target changed during final readback")
+            finally:
+                os.close(target_fd)
+        # Close the whole measured interval after every potentially long read.
+        # These identity checks catch changes to an earlier source/target while
+        # the final later object was being hashed, without re-opening that window.
+        for _row, path, identity, resolved in selected:
+            _require(path.resolve(strict=True) == resolved and _source_file_identity(path.lstat()) == identity,
+                     "Private archive source changed at final identity closure")
+        for digest, identity in verified_targets.items():
+            _require(_source_file_identity(os.stat(digest, dir_fd=directory_fd, follow_symlinks=False)) == identity,
+                     "Private archive target changed at final identity closure")
+        check_directory()
+    finally:
+        os.close(directory_fd)
+    return preserved, {"schema_version": "private-byte-preservation/v1", "status": "UNVERIFIED",
+                       "scope": "Exact private byte preservation only; no classification, parsing, execution or acceptance approval",
+                       "selected_path_count": len(selected), "selected_path_bytes": total,
+                       "whole_operation_source_and_target_revalidation": True,
+                       "unique_target_count": len({ref["sha256"] for ref in preserved.values()}),
+                       "limits": {"max_file_bytes": MAX_PRIVATE_ARCHIVE_FILE_BYTES,
+                                  "max_total_path_bytes": MAX_PRIVATE_ARCHIVE_TOTAL_BYTES,
+                                  "chunk_bytes": PRIVATE_ARCHIVE_CHUNK_BYTES},
+                       "observations": observations}
+
+
 def build_private_inventory(project_dir: str | Path, expected_source_hashes: dict[str, str],
                             repo_root: str | Path, *, archive_dir: str | Path | None = None,
                             historical_artifacts: list[dict[str, Any]] | None = None,
@@ -1384,20 +1602,7 @@ def build_private_inventory(project_dir: str | Path, expected_source_hashes: dic
     _require(names == current_names, "Task inventory changed while being collected")
     preserved: dict[str, dict[str, str]] = {}
     if archive_dir is not None:
-        archive = Path(archive_dir).resolve()
-        _require(not archive.is_relative_to(directory), "Private inventory archive must be outside the task project")
-        archive.mkdir(parents=True, exist_ok=True)
-        for row in entries.values():
-            path = Path(row["path"])
-            if row["entry_type"] != "file" or row["classification"] not in {"review", "transcript"}:
-                continue
-            _require(path.stat().st_size <= MAX_UNIT_BYTES, "Mutable private metadata exceeds the archive bound")
-            target = archive / row["sha256"]
-            if not target.exists():
-                with path.open("rb") as source, target.open("xb") as output:
-                    shutil.copyfileobj(source, output)
-            _require(sha256(target) == row["sha256"], "Preserved private audit bytes changed")
-            preserved[row["path"]] = artifact_ref(target)
+        preserved, _ = _preserve_private_inputs(entries, directory, Path(archive_dir))
     return {"schema_version": "private-task-inventory/v1", "project": str(directory),
             "scope": "All files and symlinks in the registered task project, original/durable sources and recursively referenced task artifacts; unrelated computer files are outside scope",
             "dependencies": {"code_tree_hash": code_identity(root)["code_tree_hash"],
