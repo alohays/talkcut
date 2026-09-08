@@ -1,0 +1,43 @@
+from pathlib import Path
+from datetime import datetime, timezone
+import importlib.util, sys, json, hashlib, copy
+from talkcut.project import init_project, artifact_ref, atomic_json, TalkCutError
+ROOT = FIXTURE_ROOT
+HERE = Path(__file__).resolve().parent
+SOURCE = FIXTURE_SOURCE
+assert hashlib.sha256(SOURCE.read_bytes()).hexdigest() == FIXTURE_SOURCE_SHA
+spec = importlib.util.spec_from_file_location('talkcut.privacy_checks_independent_staged', SOURCE)
+privacy = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = privacy
+spec.loader.exec_module(privacy)
+rows = []
+
+def setup(name, key='runner', old_body=None, current_body=None, namespace='capability/runtime'):
+    case = HERE / name
+    case.mkdir()
+    screen = case / 'screen.bin'
+    speaker = case / 'speaker.bin'
+    screen.write_bytes(b'authored private screen identity ' + name.encode())
+    speaker.write_bytes(b'authored private speaker identity ' + name.encode())
+    directory = case / 'project'
+    project = init_project(directory, screen, speaker)
+    sources = {role: v['sha256'] for role, v in project['sources'].items()}
+    original = directory / namespace / 'runner.py'
+    original.parent.mkdir(parents=True, exist_ok=True)
+    phrase = 'A deliberately authored private observation about five copper birds entering an indigo room.'
+    original.write_text(old_body or '# ' + phrase + '\nprint("old local run")\n')
+    old = artifact_ref(original)
+    preserved = case / 'preserved-old-source.py'
+    preserved.write_bytes(original.read_bytes())
+    metadata = directory / 'capability' / 'state.json'
+    metadata.parent.mkdir(exist_ok=True)
+    atomic_json(metadata, {'state': 'running', 'source_sha256': sources['screen'], key: old})
+    old_metadata = artifact_ref(metadata)
+    metadata_archive = case / 'preserved-old-metadata'
+    metadata_archive.write_bytes(metadata.read_bytes())
+    original.write_text(current_body or 'print("current local run")\n')
+    atomic_json(metadata, {'state': 'done'})
+    atomic_json(directory / 'checkpoint.local.json', {'source_sha256': sources['screen'], 'past_execution': old_metadata})
+    kwargs = {'auxiliary_metadata_history': [{'original': old_metadata, 'snapshot': artifact_ref(metadata_archive)}], 'source_snapshots': [{'original': old, 'snapshot': artifact_ref(preserved), 'scope': 'auxiliary_execution_source'}]}
+    return (case, directory, sources, original, preserved, metadata, metadata_archive, kwargs, phrase)
+# for key in ['runner'

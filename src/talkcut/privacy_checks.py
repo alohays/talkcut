@@ -35,7 +35,11 @@ from urllib.parse import quote, unquote, urlsplit
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 
-from . import privacy_machine_origins, privacy_retention_origins
+from . import (
+    privacy_machine_origins,
+    privacy_oversized_origins,
+    privacy_retention_origins,
+)
 from .contracts import code_identity, object_hash
 from .formal_schemas import formal_schema_types
 from .project import TalkCutError, artifact_ref, load_project, sha256
@@ -952,6 +956,8 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
             family = selected.get("family")
             if family == "independent_privacy_inventory":
                 machine = privacy_machine_origins.verify_independent_inventory(selected, root, read, document)
+            elif family == "oversized_stdout_inventory":
+                machine = privacy_oversized_origins.verify(selected, root, read, document)
             elif family in {"staged_privacy_scan", "revision_privacy_scan"}:
                 machine = privacy_machine_origins.verify_privacy_scan(selected, root, read, document)
             else:
@@ -1111,6 +1117,8 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
             machine = bound["machine"]
             project_field = (privacy_retention_origins.retention_field if retention
                              else privacy_machine_origins.fixed_inventory_field)
+            if bound["machine_family"] == "oversized_stdout_inventory":
+                project_field = privacy_oversized_origins.project_field
             projection = project_field(machine, locator["parent"], locator["selector"])
             selector = locator["selector"]
             _require(isinstance(selector, list) and selector and all(type(part) in {str, int} for part in selector)
