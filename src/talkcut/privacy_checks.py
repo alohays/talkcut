@@ -24,6 +24,7 @@ import tarfile
 import tempfile
 import threading
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -107,6 +108,87 @@ def _command(argv: list[str], cwd: Path, traces: list[dict[str, Any]], *, limit:
     return output
 
 
+@dataclass(frozen=True)
+class _GitObject:
+    oid: str
+    kind: str
+    algorithm: str
+    data: bytes
+
+
+def _verified_git_object(oid: str, kind: str, algorithm: str, data: bytes) -> _GitObject:
+    """Verify an original Git object, including its type/length hash envelope."""
+    _require(algorithm in {"sha1", "sha256"} and kind in {"commit", "tree", "blob", "tag"},
+             "Unsupported Git object format or type")
+    width = 40 if algorithm == "sha1" else 64
+    _require(re.fullmatch(r"[0-9a-f]{" + str(width) + r"}", oid)
+             and len(data) <= MAX_UNIT_BYTES, "Git object identity or byte bound is invalid")
+    actual = hashlib.new(algorithm, kind.encode() + b" " + str(len(data)).encode() + b"\0" + data).hexdigest()
+    _require(actual == oid, "Original Git object bytes do not match their typed identity")
+    return _GitObject(oid, kind, algorithm, data)
+
+
+@dataclass(frozen=True)
+class _GitCommitContext:
+    commit: _GitObject
+    # Exact byte spans of complete OID values, never whole-header exclusions.
+    tokens: tuple[tuple[int, int, str, str], ...]
+    selected_commits_sha256: str
+    targets: tuple[_GitObject, ...]
+
+
+def _git_commit_context(commit: _GitObject, reachable: frozenset[str],
+                        read_object: Callable[[str, str], _GitObject]) -> _GitCommitContext:
+    """Mint target context only for verified objects in the selected original graph."""
+    _require(type(commit) is _GitObject and commit.kind == "commit" and commit.oid in reachable,
+             "Git structural context requires a selected original commit")
+    _verified_git_object(commit.oid, commit.kind, commit.algorithm, commit.data)
+    header, separator, _ = commit.data.partition(b"\n\n")
+    _require(separator and b"\r" not in header and b"\0" not in header,
+             "Unsupported Git commit header framing")
+    lines = header.split(b"\n")
+    width = 40 if commit.algorithm == "sha1" else 64
+    oid_pattern = rb"[0-9a-f]{" + str(width).encode() + rb"}"
+    _require(lines and re.fullmatch(rb"tree " + oid_pattern, lines[0]),
+             "Git commit does not start with one exact tree OID")
+    tokens: list[tuple[int, int, str, str]] = [(5, 5 + width, "tree", lines[0][5:].decode("ascii"))]
+    position, index = len(lines[0]) + 1, 1
+    parents: set[str] = set()
+    while index < len(lines) and lines[index].startswith(b"parent "):
+        line = lines[index]
+        _require(re.fullmatch(rb"parent " + oid_pattern, line), "Git parent OID is malformed")
+        parent = line[7:].decode("ascii")
+        _require(parent in reachable and parent not in parents and len(parents) < MAX_COMMITS,
+                 "Git parent is missing from the original graph or duplicated")
+        parents.add(parent)
+        tokens.append((position + 7, position + 7 + width, "parent", parent))
+        position += len(line) + 1
+        index += 1
+    # Unsupported layouts are scanned ordinarily; no prefix-only exemption.
+    identity = rb"[^\r\n\0]* <[^<>\r\n\0]*> -?[0-9]+ [+-][0-9]{4}"
+    _require(index + 1 < len(lines) and re.fullmatch(rb"author " + identity, lines[index])
+             and re.fullmatch(rb"committer " + identity, lines[index + 1]),
+             "Unsupported Git author or committer header")
+    extra_header = False
+    for line in lines[index + 2:]:
+        if line.startswith(b" "):
+            _require(extra_header, "Git header continuation has no extra header")
+        else:
+            _require(re.fullmatch(rb"[A-Za-z0-9-]+ .+", line)
+                     and line.split(b" ", 1)[0] not in {b"tree", b"parent", b"author", b"committer"},
+                     "Unsupported or repeated Git structural header")
+            extra_header = True
+    targets: list[_GitObject] = []
+    for _, _, field_name, oid in tokens:
+        expected_type = "tree" if field_name == "tree" else "commit"
+        target = read_object(oid, expected_type)
+        _require(type(target) is _GitObject and target.oid == oid and target.kind == expected_type
+                 and target.algorithm == commit.algorithm, "Git structural target has the wrong typed identity")
+        _verified_git_object(target.oid, target.kind, target.algorithm, target.data)
+        targets.append(target)
+    return _GitCommitContext(commit, tuple(tokens), object_hash(sorted(reachable)), tuple(targets))
+
+
 @dataclass
 class Scan:
     private: dict[str, str]
@@ -120,11 +202,22 @@ class Scan:
     transcripts: set[str] = field(default_factory=set)
     total_bytes: int = 0
     exhausted: bool = False
+    seen_contexts: set[tuple[str, str]] = field(default_factory=set)
+    git_structural_metadata: list[dict[str, Any]] = field(default_factory=list)
 
     def unverified(self, label: str, reason: str) -> None:
         self.unknown.append({"location": label, "reason": reason})
 
     def payload(self, data: bytes, label: str, *, depth: int = 0, path: str | None = None) -> None:
+        self._payload(data, label, depth=depth, path=path, commit_context=None)
+
+    def _commit_payload(self, context: _GitCommitContext) -> None:
+        _require(type(context) is _GitCommitContext, "Only internal verified commit context is supported")
+        self._payload(context.commit.data, "git-commit:" + context.commit.oid,
+                      depth=0, path=None, commit_context=context)
+
+    def _payload(self, data: bytes, label: str, *, depth: int, path: str | None,
+                 commit_context: _GitCommitContext | None) -> None:
         if self.exhausted:
             return
         digest = hashlib.sha256(data).hexdigest()
@@ -145,15 +238,20 @@ class Scan:
                 self.credentials.add(digest)
             self.findings.append({"kind": "private_" + kind, "location": label, "sha256": digest})
             return
-        if digest in self.seen:
+        context_key = (digest, "ordinary" if commit_context is None else "verified_git_commit")
+        if context_key in self.seen_contexts:
             return
-        if depth > MAX_DEPTH or len(self.units) >= MAX_UNITS or len(data) > MAX_UNIT_BYTES or self.total_bytes + len(data) > MAX_TOTAL_BYTES:
+        fresh = digest not in self.seen
+        if depth > MAX_DEPTH or len(data) > MAX_UNIT_BYTES or (fresh and (
+                len(self.units) >= MAX_UNITS or self.total_bytes + len(data) > MAX_TOTAL_BYTES)):
             self.unverified(label, "Publication traversal budget exceeded; content was not fully inspected")
             self.exhausted = True
             return
-        self.seen.add(digest)
-        self.total_bytes += len(data)
-        self.units.append({"location": label, "sha256": digest, "bytes": len(data)})
+        self.seen_contexts.add(context_key)
+        if fresh:
+            self.seen.add(digest)
+            self.total_bytes += len(data)
+            self.units.append({"location": label, "sha256": digest, "bytes": len(data)})
         try:
             if data.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
                 with zipfile.ZipFile(io.BytesIO(data)) as archive:
@@ -216,6 +314,32 @@ class Scan:
             for phrase in self.phrases:
                 if phrase in text:
                     phrase_hash = hashlib.sha256(phrase.encode()).hexdigest()
+                    allowed = {(start, end): (role, oid) for start, end, role, oid in commit_context.tokens
+                               if oid == phrase} if commit_context is not None else {}
+                    if allowed:
+                        found_ordinary, offset = False, 0
+                        while (offset := text.find(phrase, offset)) >= 0:
+                            byte_start = len(text[:offset].encode("utf-8"))
+                            span = (byte_start, byte_start + len(phrase.encode("utf-8")))
+                            if span in allowed:
+                                role, oid = allowed[span]
+                                assert commit_context is not None
+                                target = next(item for item in commit_context.targets if item.oid == oid)
+                                self.git_structural_metadata.append({"location": label, "sha256": digest,
+                                    "bytes": len(data), "commit_oid": commit_context.commit.oid,
+                                    "object_format": commit_context.commit.algorithm, "field": role,
+                                    "byte_start": span[0], "byte_end": span[1], "matched_sha256": phrase_hash,
+                                    "target_oid": oid, "disposition": "verified_git_structural_oid",
+                                    "validation": {"commit_type": "commit", "target_type": target.kind,
+                                        "target_sha256": hashlib.sha256(target.data).hexdigest(),
+                                        "target_bytes": len(target.data),
+                                        "selected_commits_sha256": commit_context.selected_commits_sha256},
+                                    "scope": "This occurrence only; private corpus and other occurrences remain protected"})
+                            else:
+                                found_ordinary = True
+                            offset += 1
+                        if not found_ordinary:
+                            continue
                     self.transcripts.add(phrase_hash)
                     self.findings.append({"kind": "protected_transcript_phrase", "location": label, "matched_sha256": phrase_hash})
         except (UnicodeDecodeError, ValueError, OSError, RuntimeError, EOFError, zipfile.BadZipFile, tarfile.TarError) as exc:
@@ -224,19 +348,57 @@ class Scan:
 
 def _git_inventory(root: Path, expected_head: str, scanner: Scan, traces: list[dict[str, Any]]) -> dict[str, Any]:
     def git(*args: str, limit: int = MAX_UNIT_BYTES) -> bytes:
-        return _command(["git", *args], root, traces, limit=limit)
+        return _command(["git", "--no-replace-objects", *args], root, traces, limit=limit)
 
+    algorithm = git("rev-parse", "--show-object-format=storage").decode().strip()
+    _require(algorithm in {"sha1", "sha256"}, "Unsupported Git storage object format")
+    oid_pattern = r"[0-9a-f]{" + str(40 if algorithm == "sha1" else 64) + r"}"
+    _require(git("rev-parse", "--is-shallow-repository").strip() == b"false",
+             "Shallow Git history cannot establish complete original reachability")
     head = git("rev-parse", "--verify", "HEAD").decode().strip()
-    _require(head == expected_head and re.fullmatch(r"[a-f0-9]{40,64}", head), "Publication HEAD changed")
+    _require(head == expected_head and re.fullmatch(oid_pattern, head), "Publication HEAD changed")
     refs = git("for-each-ref", "--format=%(refname) %(objectname) %(objecttype)")
     commits = git("rev-list", "--all", "HEAD").decode().splitlines()
     _require(0 < len(commits) <= MAX_COMMITS and len(commits) == len(set(commits)), "Reachable history is empty or exceeds inspection bounds")
+    reachable = frozenset(commits)
+    _require(all(re.fullmatch(oid_pattern, oid) for oid in commits), "Invalid reachable commit identity")
+    # This cache is independently finite; it never replaces raw scanner units.
+    objects: dict[str, _GitObject] = {}
+    object_bytes = 0
+
+    def read_object(oid: str, kind: str) -> _GitObject:
+        nonlocal object_bytes
+        _require(re.fullmatch(oid_pattern, oid), "Invalid Git structural target identity")
+        if oid in objects:
+            _require(objects[oid].kind == kind, "Git structural target has the wrong actual type")
+            return objects[oid]
+        _require(len(objects) < MAX_UNITS, "Git structural verification object bound exceeded")
+        _require(git("cat-file", "-t", oid).decode().strip() == kind,
+                 "Git structural target has the wrong actual type")
+        size = int(git("cat-file", "-s", oid).decode().strip())
+        _require(0 <= size <= MAX_UNIT_BYTES and object_bytes + size <= MAX_TOTAL_BYTES,
+                 "Git structural verification byte bound exceeded")
+        data = git("cat-file", kind, oid)
+        _require(len(data) == size, "Git structural object size changed")
+        verified = _verified_git_object(oid, kind, algorithm, data)
+        objects[oid] = verified
+        object_bytes += size
+        return verified
+
     blobs: dict[str, set[str]] = {}
     for commit in commits:
         if scanner.exhausted:
             break
-        _require(re.fullmatch(r"[a-f0-9]{40,64}", commit), "Invalid reachable commit identity")
-        scanner.payload(git("cat-file", "commit", commit), "git-commit:" + commit)
+        original = read_object(commit, "commit")
+        try:
+            context = _git_commit_context(original, reachable, read_object)
+        except TalkCutError:
+            # No context survives an unsupported header, missing original parent,
+            # wrong target type or exhausted authority validation budget.
+            scanner.payload(original.data, "git-commit:" + commit)
+            scanner.unverified("git-commit:" + commit, "Original Git structural context could not be verified")
+        else:
+            scanner._commit_payload(context)
         tree = git("ls-tree", "-r", "-z", "--full-tree", commit)
         for item in tree.split(b"\0"):
             if not item:
@@ -265,25 +427,90 @@ def _git_inventory(root: Path, expected_head: str, scanner: Scan, traces: list[d
         _require(len(content) == size, "Git object size changed during inspection")
         for name in sorted(paths):
             scanner.payload(content, "git-blob:" + oid + ":" + name, path=name)
-    # Annotated tag messages are public bytes too, including nested annotations.
-    pending = [line.split()[1] for line in refs.decode().splitlines() if line.split()[2] == "tag"]
+    # Disabling replacements must not hide replacement targets or other direct
+    # refs. Keep every selected ref and follow nested annotated-tag targets.
+    selected_refs: list[dict[str, str]] = []
+    for line in refs.decode().splitlines():
+        fields = line.split()
+        _require(len(fields) == 3 and re.fullmatch(oid_pattern, fields[1])
+                 and fields[2] in {"commit", "tree", "blob", "tag"},
+                 "Selected Git ref has an unsupported identity or object type")
+        selected_refs.append({"name": fields[0], "oid": fields[1], "type": fields[2]})
+    _require(len(selected_refs) <= MAX_UNITS and len({item["name"] for item in selected_refs}) == len(selected_refs),
+             "Selected Git ref count exceeds its bound or names are duplicated")
+    pending: list[tuple[str, str, tuple[str, ...]]] = [(item["oid"], item["type"], ()) for item in selected_refs]
+    ref_objects: dict[str, dict[str, Any]] = {}
     tags: set[str] = set()
     while pending:
-        tag = pending.pop()
-        if tag in tags:
+        oid, kind, ancestors = pending.pop()
+        _require(oid not in ancestors, "Selected annotated tag graph is cyclic")
+        if oid in ref_objects:
+            _require(ref_objects[oid]["type"] == kind, "Selected Git target type is inconsistent")
             continue
-        _require(len(tags) < MAX_UNITS, "Annotated tag traversal exceeds inspection bound")
-        tags.add(tag)
-        content = git("cat-file", "tag", tag)
-        scanner.payload(content, "git-tag:" + tag)
-        if b"\ntype tag\n" in content:
-            pending.append(content.splitlines()[0].split()[1].decode())
+        _require(len(ref_objects) < MAX_UNITS, "Selected Git target traversal exceeds inspection bound")
+        target = read_object(oid, kind)
+        ref_objects[oid] = {"oid": oid, "type": kind, "sha256": hashlib.sha256(target.data).hexdigest(),
+                            "bytes": len(target.data)}
+        if kind == "commit":
+            _require(oid in reachable, "Selected commit target was not in the original scanned graph")
+        elif kind == "tree":
+            # Keep raw tree bytes and inspect every listed leaf using original
+            # object reads. Opaque tree metadata still cannot receive a complete
+            # text-scanning claim or commit-token exemptions.
+            scanner.payload(target.data, "git-ref-tree:" + oid)
+            scanner.unverified("git-ref-tree:" + oid,
+                               "Selected tree metadata is not supported as fully inspected publication text")
+            listing = git("ls-tree", "-r", "-z", "--full-tree", oid)
+            for item in listing.split(b"\0"):
+                if not item:
+                    continue
+                entry, raw_path = item.split(b"\t", 1)
+                mode, leaf_kind, leaf_oid = entry.decode("ascii").split()
+                _require(re.fullmatch(oid_pattern, leaf_oid), "Selected tree leaf has an invalid identity")
+                try:
+                    name = raw_path.decode("utf-8")
+                except UnicodeDecodeError:
+                    scanner.unverified("git-ref-tree:" + oid, "Non-UTF8 selected tree path was not interpreted")
+                    continue
+                if leaf_kind != "blob" or mode not in {"100644", "100755", "120000"}:
+                    scanner.unverified("git-ref-tree:" + oid + ":" + name,
+                                       "Selected tree submodule or unsupported leaf is not fully inspected")
+                    continue
+                leaf = read_object(leaf_oid, "blob")
+                _require(leaf_oid in ref_objects or len(ref_objects) < MAX_UNITS,
+                         "Selected Git target traversal exceeds inspection bound")
+                ref_objects[leaf_oid] = {"oid": leaf_oid, "type": "blob",
+                                        "sha256": hashlib.sha256(leaf.data).hexdigest(), "bytes": len(leaf.data)}
+                scanner.payload(leaf.data, "git-ref-tree:" + oid + ":" + name, path=name)
+                if mode == "120000":
+                    scanner.unverified("git-ref-tree:" + oid + ":" + name,
+                                       "Selected Git symlink target text retained; link was not followed")
+        elif kind == "blob":
+            scanner.payload(target.data, "git-ref-blob:" + oid)
+        else:
+            tags.add(oid)
+            scanner.payload(target.data, "git-tag:" + oid)
+            header, separator, _ = target.data.partition(b"\n\n")
+            lines = header.split(b"\n")
+            _require(separator and len(lines) >= 3 and lines[0].startswith(b"object ")
+                     and lines[1].startswith(b"type ") and lines[2].startswith(b"tag "),
+                     "Selected annotated tag has unsupported target framing")
+            child_oid, child_kind = lines[0][7:].decode("ascii"), lines[1][5:].decode("ascii")
+            _require(re.fullmatch(oid_pattern, child_oid) and child_kind in {"commit", "tree", "blob", "tag"},
+                     "Selected annotated tag has an unsupported target identity or type")
+            _require(not any(line.startswith((b"object ", b"type ", b"tag ")) for line in lines[3:]),
+                     "Selected annotated tag repeats structural target fields")
+            pending.append((child_oid, child_kind, (*ancestors, oid)))
     _require(git("rev-parse", "--verify", "HEAD").decode().strip() == head
              and git("for-each-ref", "--format=%(refname) %(objectname) %(objecttype)") == refs,
              "Git refs changed during publication scanning")
     return {"head": head, "reachable_commits": commits, "reachable_blob_count": len(blobs),
             "blob_paths": {oid: sorted(paths) for oid, paths in blobs.items()},
-            "refs_sha256": hashlib.sha256(refs).hexdigest(), "annotated_tags": sorted(tags)}
+            "refs_sha256": hashlib.sha256(refs).hexdigest(), "annotated_tags": sorted(tags),
+            "object_format": algorithm, "original_objects_without_replacements": True,
+            "structural_oid_occurrences": scanner.git_structural_metadata,
+            "structural_verification": {"objects": len(objects), "bytes": object_bytes},
+            "selected_refs": selected_refs, "selected_ref_objects": list(ref_objects.values())}
 
 
 def _asset_refs(values: Any) -> dict[str, dict[str, Any]]:
@@ -611,12 +838,12 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
                  "Review text source differs from the original request and verification maps")
         _require(source["snapshot"]["sha256"] not in registered, "Registered media cannot supply review text origins")
         traces: list[dict[str, Any]] = []
-        _command(["git", "cat-file", "commit", source["git_revision"]], root, traces)
-        tree = _command(["git", "ls-tree", "-z", source["git_revision"], "--", source["git_path"]], root, traces)
+        _command(["git", "--no-replace-objects", "cat-file", "commit", source["git_revision"]], root, traces)
+        tree = _command(["git", "--no-replace-objects", "ls-tree", "-z", source["git_revision"], "--", source["git_path"]], root, traces)
         expected = ("100644 blob " + source["git_blob"] + "\t" + source["git_path"] + "\0").encode()
         executable = ("100755 blob " + source["git_blob"] + "\t" + source["git_path"] + "\0").encode()
         _require(tree in {expected, executable}, "Review text source is not the exact regular Git tree member")
-        blob = _command(["git", "cat-file", "blob", source["git_blob"]], root, traces)
+        blob = _command(["git", "--no-replace-objects", "cat-file", "blob", source["git_blob"]], root, traces)
         _require(blob == source_data, "Review text preserved source differs from its Git blob")
         try:
             content = source_data.decode("utf-8")

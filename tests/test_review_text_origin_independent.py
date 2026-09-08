@@ -66,7 +66,7 @@ def test_authority_mutation_after_last_long_read_rejects(tmp_path, monkeypatch, 
 
     def command(argv, cwd, traces, **kwargs):
         value = original_command(argv, cwd, traces, **kwargs)
-        if argv[1:3] == ["cat-file", "blob"] and not fired:
+        if argv[:4] == ["git", "--no-replace-objects", "cat-file", "blob"] and not fired:
             fired.append(True)
             if mutation == "same_byte_inode":
                 replacement = target.with_suffix(".replacement")

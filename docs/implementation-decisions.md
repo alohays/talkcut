@@ -142,3 +142,18 @@ protection, and the full private file remains protected. Changed, missing or
 unconsumed origins fail validation. The supplied roots are provenance inputs;
 hash consistency does not authenticate an entirely fabricated replacement
 history or certify a historical review, execution or publication.
+
+## Git object identifiers and selected references
+
+The publication scan verifies original Git object types, lengths and hashes
+before recognizing exact tree and parent identifiers in commit headers. Only
+those byte positions receive structural metadata records. Identical text in a
+message, author field, ordinary blob or archive continues through phrase checks,
+and complete private artifact hashes retain precedence.
+
+Git replacement resolution is disabled for original source and history reads.
+Every selected reference is still retained and its target inspected, including
+replacement blobs, nested annotated tags and selected tree leaves. Original and
+replacement payloads both remain in scope. Unsupported tree metadata, symlinks
+and submodules remain explicitly unverified; traversal limits and changed
+references prevent a completeness claim.
