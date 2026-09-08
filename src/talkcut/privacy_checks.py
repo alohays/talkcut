@@ -416,7 +416,7 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
     _require(all(registered.get(role) == digest for role, digest in expected_source_hashes.items())
              and all(role in expected_source_hashes for role in ("screen", "speaker")),
              "Privacy inventory differs from evaluator-registered sources")
-    fixture_claims, fixture_observations = _synthetic_failure_inventory(synthetic_negative_runs, repo_root, set(registered.values()), replay_ref=synthetic_replay)
+    fixture_claims, fixture_observations = _synthetic_failure_inventory(synthetic_negative_runs, repo_root, set(registered.values()), replay_ref=synthetic_replay, source_snapshots=source_snapshots)
     auxiliary_runtime_observations = _auxiliary_runtime_inventory(auxiliary_runtime_requests, directory, repo_root, set(registered.values()))
     native_runtime_observations = _native_runtime_request_inventory(native_runtime_request_observations, directory, repo_root, set(registered.values()))
     native_reobservations = _native_runtime_alias_inventory(native_runtime_alias_reobservations,
@@ -1855,8 +1855,301 @@ def _verified_synthetic_replay(replay_ref: dict[str, Any] | None, repo: Path) ->
             "scope": "Preserved actual fixed-generator replay; historical execution identities remain unchanged"}
 
 
+def _historical_synthetic_json(ref: Any) -> Any:
+    """Bounded canonical historical metadata; duplicate JSON is never authority."""
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            _require(key not in value, "Historical synthetic JSON contains duplicate keys")
+            value[key] = item
+        return value
+
+    path = _file(ref)
+    _require(path == path.resolve() and path == Path(os.path.abspath(path))
+             and path.stat().st_size <= MAX_UNIT_BYTES,
+             "Historical synthetic metadata is noncanonical or oversized")
+    try:
+        return json.loads(path.read_bytes(), object_pairs_hook=unique)
+    except (ValueError, UnicodeError) as exc:
+        raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Historical synthetic metadata is not JSON") from exc
+
+
+def _historical_synthetic_harnesses(source_snapshots: list[dict[str, Any]] | None,
+                                    run_refs: list[dict[str, Any]], repo: Path,
+                                    registered: set[str]) -> dict[tuple[str, str], dict[str, Any]]:
+    """A source-snapshot extension binds only exact retained historical runs.
+
+    Git bytes, a complete old code identity and current technical grammar are
+    origin observations. They do not attest any historical process execution.
+    """
+    from . import evaluator_negative as negative
+
+    _require(source_snapshots is None or isinstance(source_snapshots, list),
+             "Historical synthetic source snapshots must be an explicit list")
+    selected = [row for row in source_snapshots or []
+                if isinstance(row, dict) and "historical_synthetic_harness" in row]
+    _require(len(selected) <= 32, "Historical synthetic harness inventory exceeds its bound")
+    known_runs = {(ref["path"], ref["sha256"]) for ref in run_refs}
+    _require(not selected or len(known_runs) == len(run_refs), "Historical synthetic run inventory has duplicate references")
+    result: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def syntax_nodes(source: bytes) -> dict[str, ast.AST]:
+        nodes: dict[str, ast.AST] = {}
+        try:
+            syntax = ast.parse(source)
+        except (SyntaxError, ValueError) as exc:
+            raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Historical harness is not Python source") from exc
+        for node in syntax.body:
+            name = None
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                name = node.name
+            elif (isinstance(node, ast.Assign) and len(node.targets) == 1
+                  and isinstance(node.targets[0], ast.Name)):
+                name = node.targets[0].id
+            if name:
+                _require(name not in nodes, "Historical harness has duplicate top-level definitions")
+                nodes[name] = node
+        return nodes
+
+    current_nodes = syntax_nodes(Path(negative.__file__).read_bytes())
+    for locator in selected:
+        _require(set(locator) == {"original", "snapshot", "historical_synthetic_harness"},
+                 "Historical synthetic source locator has unsupported fields")
+        origin, snapshot, binding = locator["original"], locator["snapshot"], locator["historical_synthetic_harness"]
+        for ref in (origin, snapshot):
+            _require(isinstance(ref, dict) and set(ref) == {"path", "sha256"}
+                     and isinstance(ref["path"], str) and isinstance(ref["sha256"], str)
+                     and re.fullmatch(r"[a-f0-9]{64}", ref["sha256"]) is not None,
+                     "Historical synthetic source requires exact typed artifact references")
+        expected_path = repo / "src/talkcut/evaluator_negative.py"
+        _require(repo == repo.resolve() and expected_path == Path(negative.__file__).resolve(),
+                 "Historical harness origin is not the current canonical repository module path")
+        _require(origin["path"] == str(expected_path) and expected_path == expected_path.resolve()
+                 and origin["sha256"] == snapshot["sha256"] and origin["sha256"] not in registered,
+                 "Historical harness original path or preserved digest differs")
+        preserved = _file(snapshot)
+        _require(preserved != expected_path and preserved == preserved.resolve()
+                 and preserved == Path(os.path.abspath(preserved)) and preserved.stat().st_size <= MAX_UNIT_BYTES,
+                 "Historical harness requires a separate canonical bounded snapshot")
+        _require(isinstance(binding, dict) and set(binding) == {"schema_version", "git_revision", "runs"}
+                 and binding["schema_version"] == "historical-synthetic-harness/v1"
+                 and isinstance(binding["git_revision"], str)
+                 and re.fullmatch(r"[a-f0-9]{40}", binding["git_revision"]) is not None
+                 and isinstance(binding["runs"], list) and 0 < len(binding["runs"]) <= 32,
+                 "Historical harness needs a closed Git revision and exact run bindings")
+        revision = binding["git_revision"]
+        traces: list[dict[str, Any]] = []
+        _require(_command(["git", "rev-parse", "--verify", revision + "^{commit}"], repo, traces).decode().strip() == revision,
+                 "Historical harness revision is not an exact commit")
+        listing = _command(["git", "ls-tree", "-r", "-z", "--full-tree", revision], repo, traces)
+        files: dict[str, str] = {}
+        harness_bytes = None
+        total = 0
+        for row in listing.split(b"\0"):
+            if not row:
+                continue
+            header, raw_name = row.split(b"\t", 1)
+            mode, kind, oid = header.decode("ascii").split()
+            name = raw_name.decode("utf-8")
+            path = PurePosixPath(name)
+            included = (path.parts[0] in {"src", "tests", "schemas", ".github", "examples"}
+                        and "__pycache__" not in path.parts and path.suffix not in {".pyc", ".pyo"}) or name in {
+                            "pyproject.toml", "uv.lock", ".python-version", "pytest.ini", "mypy.ini", "ruff.toml", ".ruff.toml"}
+            if not included:
+                continue
+            _require(kind == "blob" and mode in {"100644", "100755"} and name not in files
+                     and not path.is_absolute() and ".." not in path.parts and len(files) < MAX_UNITS,
+                     "Historical code identity contains a nonregular, duplicate or unsupported member")
+            content = _command(["git", "cat-file", "blob", oid], repo, traces)
+            total += len(content)
+            _require(total <= MAX_TOTAL_BYTES, "Historical code identity exceeds its complete byte bound")
+            files[name] = hashlib.sha256(content).hexdigest()
+            if name == "src/talkcut/evaluator_negative.py":
+                harness_bytes = content
+        _require(files.get("src/talkcut/evaluator_negative.py") == origin["sha256"]
+                 and harness_bytes == preserved.read_bytes(), "Historical harness snapshot does not match its exact Git blob")
+        assert harness_bytes is not None
+        old_nodes = syntax_nodes(harness_bytes)
+        grammar = ("SCOPES", "PAIR_NAMES", "REASONS", "SOURCE_MUTATION", "MALFORMED_PROJECT",
+                   "_file", "_json", "_evaluator", "_ConservationReached", "_TimelineProbe", "_timeline_probe",
+                   "_probe_command", "_pair", "_same_except", "_mp4_packet_prefix", "_verify_interrupted_packets", "_mutation")
+        _require(all(name in old_nodes and name in current_nodes
+                     and ast.dump(old_nodes[name], include_attributes=False) == ast.dump(current_nodes[name], include_attributes=False)
+                     for name in grammar), "Historical harness technical grammar differs from the supported current controls")
+        missing_node = old_nodes.get("MISSING_CONTROLS")
+        _require(isinstance(missing_node, ast.Assign), "Historical missing-control declarations are absent")
+        assert isinstance(missing_node, ast.Assign)
+        missing = ast.literal_eval(missing_node.value)
+        _require(isinstance(missing, dict) and set(missing) == set(negative.MISSING_CONTROLS)
+                 and all(isinstance(reason, str) and bool(reason) for reason in missing.values()),
+                 "Historical missing controls have an unsupported denominator")
+        code = {"code_revision": revision, "code_tree_hash": object_hash(files), "files": files}
+        for run_ref in binding["runs"]:
+            _require(isinstance(run_ref, dict) and set(run_ref) == {"path", "sha256"}
+                     and isinstance(run_ref["path"], str) and isinstance(run_ref["sha256"], str)
+                     and (run_ref["path"], run_ref["sha256"]) in known_runs,
+                     "Historical harness names an unscoped or malformed run")
+            key = (run_ref["path"], run_ref["sha256"])
+            _require(key not in result, "Historical synthetic run has duplicate harness bindings")
+            raw = _historical_synthetic_json(run_ref)
+            request = _historical_synthetic_json(raw["request"])
+            receipt_ref = artifact_ref(Path(run_ref["path"]).parent / "receipt.json")
+            receipt = _historical_synthetic_json(receipt_ref)
+            _require(raw.get("harness") == request.get("harness") == receipt.get("harness") == origin
+                     and request.get("code_identity") == code
+                     and raw.get("dependencies") == request.get("dependencies") == receipt.get("dependencies")
+                     and raw["dependencies"].get("code_tree_hash") == code["code_tree_hash"]
+                     and receipt.get("result") == run_ref and receipt.get("request") == raw["request"]
+                     and receipt.get("status") == raw.get("status") == "UNVERIFIED"
+                     and receipt.get("test_only") is True and receipt.get("final_ac12_audit") is False,
+                     "Historical original run/request/receipt/source/Git identities do not agree")
+            result[key] = {"locator": locator, "run": run_ref, "request": raw["request"], "receipt": receipt_ref,
+                           "original_harness": origin, "snapshot": snapshot, "historical_code_identity": code,
+                           "historical_missing_controls": missing, "git_commands": traces,
+                           "classification": "UNCLASSIFIED", "execution_status": "UNVERIFIED"}
+    return result
+
+
+def _replay_historical_synthetic_controls(raw: dict[str, Any], fixture: dict[str, Any],
+                                         history: dict[str, Any], repo: Path) -> dict[str, Any]:
+    """Current fixed technical probes over preserved originals, without AV credit."""
+    from datetime import datetime
+
+    from . import evaluator_negative as negative
+    from .contracts import CHECK_REQUIREMENTS
+
+    _require(raw.get("positive_controls") is None and raw.get("status") == "UNVERIFIED",
+             "Historical diagnostic controls cannot import current positives or aggregate PASS")
+    request = _historical_synthetic_json(raw["request"])
+    _require(request.get("scope") == negative.SCOPES and request.get("positive_controls") is None,
+             "Historical diagnostic scope differs from the seven supported technical controls")
+    cases = raw.get("cases")
+    _require(isinstance(cases, dict) and set(cases) == set(CHECK_REQUIREMENTS["evaluator_negative"]),
+             "Historical synthetic controls must retain the entire ten-case denominator")
+    assert isinstance(cases, dict)
+    root = Path(history["run"]["path"]).parent
+    refs = raw.get("artifacts")
+    _require(isinstance(refs, list) and 0 < len(refs) <= MAX_UNITS,
+             "Historical synthetic artifact denominator is absent")
+    assert isinstance(refs, list)
+    current_code = code_identity(repo)
+
+    def snapshot() -> list[dict[str, Any]]:
+        observed = []
+        names: set[str] = set()
+        for ref in refs:
+            path = _file(ref)
+            _require(path == path.resolve() and path.is_relative_to(root) and str(path) not in names,
+                     "Historical synthetic artifact is duplicated, aliased or outside its original run")
+            names.add(str(path))
+            observed.append({"reference": ref, "identity": _source_file_identity(path.stat())})
+        physical = set()
+        for path in root.rglob("*"):
+            _require(not path.is_symlink(), "Historical synthetic run acquired a linked member")
+            if path.is_file():
+                physical.add(str(path))
+        excluded = {str(root / name) for name in ("attempt.json", "result.json", "receipt.json")}
+        _require(names == physical - excluded, "Historical synthetic run has omitted or extra physical artifacts")
+        for ref in [history["run"], history["request"], history["receipt"], history["snapshot"], raw["fixture"]]:
+            path = _file(ref)
+            observed.append({"reference": ref, "identity": _source_file_identity(path.stat())})
+        return observed
+
+    before = snapshot()
+    artifact_keys = {(ref["path"], ref["sha256"]) for ref in refs}
+
+    def retained(ref: Any) -> None:
+        _require(isinstance(ref, dict) and (ref.get("path"), ref.get("sha256")) in artifact_keys,
+                 "Historical technical selected proof is outside its complete artifact denominator")
+
+    for ref in [raw["request"], raw["fixture"],
+                *[raw[name][key] for name in ("fixture_execution", "identity_initialization") for key in ("stdout", "stderr")]]:
+        retained(ref)
+    processes = []
+    measured: dict[str, bool | None] = {}
+    for case_id in CHECK_REQUIREMENTS["evaluator_negative"]:
+        case = cases[case_id]
+        if case_id in negative.MISSING_CONTROLS:
+            _require(case == {"status": "UNVERIFIED", "scope": "unavailable faithful positive control",
+                              "reason": history["historical_missing_controls"][case_id], "pairs": []},
+                     "Historical missing control was promoted or altered")
+            measured[case_id] = None
+            continue
+        _require(case.get("status") == "UNVERIFIED" and case.get("scope") == negative.SCOPES[case_id]
+                 and [pair.get("name") for pair in case.get("pairs", [])] == list(negative.PAIR_NAMES[case_id]),
+                 "Historical supported technical pair denominator or scope differs")
+        for pair in case["pairs"]:
+            for input_key in ("control_input", "mutation_input"):
+                retained(pair[input_key])
+                _historical_synthetic_json(pair[input_key])
+            negative._mutation(case_id, pair, fixture)
+            for side, input_key in (("control", "control_input"), ("attack", "mutation_input")):
+                process = pair[side]
+                for key in ("stdout", "stderr"):
+                    retained(process[key])
+                command = negative._probe_command(case_id, _file(pair[input_key]), repo)
+                _require(process.get("schema_version") == "negative-process/v1"
+                         and process.get("argv") == command and process.get("cwd") == str(repo)
+                         and process.get("timed_out") is False and type(process.get("exit_code")) is int
+                         and datetime.fromisoformat(process["started_at"]) <= datetime.fromisoformat(process["finished_at"])
+                         and not _file(process["stderr"]).read_text().strip(),
+                         "Historical technical process identity or completion differs from the fixed probe")
+                observed = _historical_synthetic_json(process["stdout"])
+                actual = subprocess.run(command, cwd=repo, env={**os.environ, "PYTHONPATH": str(repo / "src")},
+                                        capture_output=True, text=True, timeout=120, check=False)
+                _require(not actual.stderr.strip(), "Current historical diagnostic replay emitted stderr")
+                actual_response = json.loads(actual.stdout)
+                compared_old, compared_new = observed, actual_response
+                if case_id == "threshold_tamper" and side == "control":
+                    # This production positive reports its own code identity.
+                    # Bind both complete identities, retaining original facts.
+                    identity_fields = {"code_revision", "code_tree_hash", "files"}
+                    old_facts, new_facts = observed.get("facts"), actual_response.get("facts")
+                    _require(isinstance(old_facts, dict) and isinstance(new_facts, dict)
+                             and set(old_facts) == set(new_facts) == identity_fields | {"contract_hash"}
+                             and {key: old_facts[key] for key in identity_fields} == history["historical_code_identity"]
+                             and {key: new_facts[key] for key in identity_fields} == current_code
+                             and old_facts["contract_hash"] == new_facts["contract_hash"],
+                             "Historical/current threshold positive does not bind its exact code and contract facts")
+                    assert isinstance(old_facts, dict) and isinstance(new_facts, dict)
+                    compared_old = {**observed, "facts": {"contract_hash": old_facts["contract_hash"]}}
+                    compared_new = {**actual_response, "facts": {"contract_hash": new_facts["contract_hash"]}}
+                stable_old = re.sub(r"(?<=@ )0x[0-9a-fA-F]+", "0xADDRESS", json.dumps(compared_old, sort_keys=True))
+                stable_new = re.sub(r"(?<=@ )0x[0-9a-fA-F]+", "0xADDRESS", json.dumps(compared_new, sort_keys=True))
+                _require(actual.returncode == process["exit_code"] and stable_old == stable_new,
+                         "Historical technical response differs from current fixed replay")
+                if side == "control":
+                    _require(actual.returncode == 0 and observed.get("status") == "TECHNICAL_CONTROL_PASS",
+                             "Historical technical positive control failed current replay")
+                else:
+                    reason = negative.REASONS.get(f"{case_id}.{pair['name']}", negative.REASONS.get(case_id))
+                    _require(actual.returncode != 0 and reason and reason in observed.get("reason", ""),
+                             "Historical technical fault failed at an unsupported gate")
+                    if case_id == "duplicate_coverage":
+                        _require(observed["facts"]["numerator_seconds"] == "30"
+                                 and observed["facts"]["uncovered_intervals"] == [["30", "90"]],
+                                 "Historical duplicated coverage changed its actual denominator")
+                processes.append({"case_id": case_id, "pair": pair["name"], "side": side,
+                                  "argv": command, "recorded": process, "actual_exit_code": actual.returncode,
+                                  "actual_stdout": actual.stdout, "actual_stderr": actual.stderr})
+            _require(pair["control"]["finished_at"] <= pair["attack"]["started_at"],
+                     "Historical mutation predates its technical positive control")
+        measured[case_id] = True
+    _require(raw.get("measurements") == measured, "Historical technical measurements or nulls were altered")
+    after = snapshot()
+    _require(before == after and code_identity(repo) == current_code,
+             "Historical original artifacts or current code changed during replay")
+    return {"historical_code_identity": history["historical_code_identity"], "current_code_identity": current_code,
+            "threshold_positive_identity_scope": "Exact old/current code facts bound separately; complete original responses retained",
+            "measurements": measured, "case_denominator": len(cases), "technical_case_count": len(negative.SCOPES),
+            "pair_count": sum(len(case["pairs"]) for case in cases.values()), "current_processes": processes,
+            "original_artifact_count": len(refs), "before": before, "after": after,
+            "conservation_equal": True, "classification": "UNCLASSIFIED", "execution_status": "UNVERIFIED"}
+
+
 def _synthetic_failure_inventory(run_refs: list[dict[str, Any]] | None, repo: Path | None,
-                                 registered: set[str], *, replay_ref: dict[str, Any] | None = None) -> tuple[dict[tuple[str, str], dict[str, Any]], list[dict[str, Any]]]:
+                                 registered: set[str], *, replay_ref: dict[str, Any] | None = None,
+                                 source_snapshots: list[dict[str, Any]] | None = None) -> tuple[dict[tuple[str, str], dict[str, Any]], list[dict[str, Any]]]:
     """Resolve only fixed, reproduced public-source fault fixtures as UNCLASSIFIED.
 
     A declared old digest is a test input, never a fabricated artifact ref.
@@ -1871,10 +2164,13 @@ def _synthetic_failure_inventory(run_refs: list[dict[str, Any]] | None, repo: Pa
     claims: dict[tuple[str, str], dict[str, Any]] = {}
     observations: list[dict[str, Any]] = []
     if not run_refs:
+        _require(not any(isinstance(row, dict) and "historical_synthetic_harness" in row for row in source_snapshots or []),
+                 "Historical harness authority has no selected synthetic runs")
         return claims, observations
     _require(repo is not None, "Synthetic failure provenance requires the public repository")
     assert repo is not None
     _require(len(run_refs) <= 32, "Synthetic failure run inventory exceeds its declared bound")
+    histories = _historical_synthetic_harnesses(source_snapshots, run_refs, repo, registered)
     current_harness = artifact_ref(Path(negative.__file__).resolve())
     current_generator = artifact_ref(repo / "examples/recovery.py")
     reproduction = _verified_synthetic_replay(replay_ref, repo)
@@ -1889,18 +2185,20 @@ def _synthetic_failure_inventory(run_refs: list[dict[str, Any]] | None, repo: Pa
         return _json(process["stdout"])
 
     for run_ref in run_refs:
-        raw = _json(run_ref)
+        history = histories.get((run_ref["path"], run_ref["sha256"]))
+        raw = _historical_synthetic_json(run_ref) if history else _json(run_ref)
+        declared_harness = history["original_harness"] if history else current_harness
         _require(raw.get("schema_version") == "evaluator-negative-run/v1" and raw.get("test_only") is True
                  and raw.get("actual_dgist_acceptance") is False and raw.get("final_ac12_audit") is False
                  and raw.get("audiovisual_review") == "UNVERIFIED" and raw.get("owner_acceptance") == "pending",
                  "Synthetic fault evidence was relabelled as actual private acceptance")
         request = _json(raw["request"])
-        _require(raw.get("harness") == current_harness and request.get("harness") == current_harness
+        _require(raw.get("harness") == declared_harness and request.get("harness") == declared_harness
                  and request.get("fixture_source") == current_generator
                  and request.get("dependencies") == raw.get("dependencies")
                  and request.get("code_identity", {}).get("code_tree_hash") == raw["dependencies"].get("code_tree_hash"),
                  "Historical synthetic harness/generator identity is not the exact supported public implementation")
-        _file(raw["harness"])
+        _file(history["snapshot"] if history else raw["harness"])
         _file(request["fixture_source"])
         _require(raw.get("toolchain") == negative.doctor(), "Synthetic fixture toolchain cannot reproduce the recorded bytes")
         receipt_path = Path(run_ref["path"]).parent / "receipt.json"
@@ -1908,7 +2206,7 @@ def _synthetic_failure_inventory(run_refs: list[dict[str, Any]] | None, repo: Pa
         receipt = _json(artifact_ref(receipt_path))
         _require(receipt.get("schema_version") == "evaluator-negative-receipt/v1" and receipt.get("result") == run_ref
                  and receipt.get("run_id") == raw.get("run_id") and receipt.get("completed") is True
-                 and receipt.get("request") == raw["request"] and receipt.get("harness") == current_harness
+                 and receipt.get("request") == raw["request"] and receipt.get("harness") == declared_harness
                  and receipt.get("dependencies") == raw["dependencies"] and receipt.get("operation") == "check:evaluator_negative",
                  "Synthetic fault receipt is not bound to this exact historical result")
         _require(isinstance(raw.get("artifacts"), list) and 0 < len(raw["artifacts"]) <= MAX_UNITS,
@@ -1935,6 +2233,7 @@ def _synthetic_failure_inventory(run_refs: list[dict[str, Any]] | None, repo: Pa
                      for stage, value in fixture["outputs"].items())
                  and set(fixture["outputs"]) == {"baseline", "cut", "restored", "reapplied"},
                  "Recorded fixture renders are not the reproduced public output bytes")
+        historical_replay = _replay_historical_synthetic_controls(raw, fixture, history, repo) if history else None
         pairs = raw.get("cases", {}).get("wrong_hashes", {}).get("pairs", [])
         _require([pair.get("name") for pair in pairs] == ["source_bytes", "output_bytes"],
                  "Both fixed source/output mutation controls are required")
@@ -1986,8 +2285,12 @@ def _synthetic_failure_inventory(run_refs: list[dict[str, Any]] | None, repo: Pa
                     _require(key not in claims or claims[key]["actual_current"] == actual_ref, "Conflicting synthetic failure provenance")
                     claims[key] = row
         observations.append({"run": run_ref, "receipt": artifact_ref(receipt_path), "request": raw["request"],
-                             "harness": current_harness, "generator": current_generator, "rows": rows,
+                             "harness": declared_harness, "generator": current_generator, "rows": rows,
+                             **({"historical_harness": history, "current_harness": current_harness,
+                                 "historical_control_replay": historical_replay} if history else {}),
                              "current_reproduction": reproduction, "completeness": "UNVERIFIED"})
+    _require(artifact_ref(Path(negative.__file__).resolve()) == current_harness,
+             "Current diagnostic harness changed during historical observation")
     return claims, observations
 
 

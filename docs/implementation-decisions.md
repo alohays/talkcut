@@ -99,3 +99,14 @@ have a unique identifier and its own immediately preceding, exactly matching
 empty mirror. Input roles, order, complete canonical capture, final-answer binding
 and the prohibition on unobserved tools or delegated inputs still apply. These
 checks establish transport provenance; they do not approve a model's findings.
+
+## Preserved technical failure records
+
+Changing the evaluator harness previously prevented the privacy inventory from
+reading preserved negative-control runs, because it required their original
+harness reference to match the current file. An explicit source-snapshot locator
+now binds those unchanged records to the exact historical Git revision and its
+complete code identity. The inventory reruns every supported technical control
+with the current implementation and checks conservation of the original files.
+Missing audiovisual controls remain unknown, and historical execution remains
+unverified. This origin check does not establish publication readiness.
