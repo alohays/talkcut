@@ -2,8 +2,10 @@
 
 Every supported case has a successful technical fixture control and a specific
 mutation. The verifier replays a fixed, read-only probe over the preserved
-inputs; it never executes a command supplied by an evidence author. The three
-cases needing an unavailable legitimate editorial/reviewer control stay null.
+inputs; it never executes a command supplied by an evidence author. Three
+optional audiovisual/editorial/actor controls first revalidate unchanged current
+actual positives; absent positives stay null. Revalidation writes only beside
+the private probe inputs and never alters the original provider evidence.
 
 The timeline controls stop at the render-artifact boundary with a sentinel.
 They test the production conservation checks without inventing a successful
@@ -36,6 +38,33 @@ from talkcut.contracts import (
     code_identity,
     expected_contract,
 )
+from talkcut.evaluator_av_controls import (
+    FAULTS as AV_FAULTS,
+)
+from talkcut.evaluator_av_controls import (
+    REASONS as AV_REASONS,
+)
+from talkcut.evaluator_av_controls import (
+    SCOPES as AV_SCOPES,
+)
+from talkcut.evaluator_av_controls import (
+    CounterfactualRejection,
+)
+from talkcut.evaluator_av_controls import (
+    bound_controls as bound_av_controls,
+)
+from talkcut.evaluator_av_controls import (
+    inputs as av_inputs,
+)
+from talkcut.evaluator_av_controls import (
+    probe as probe_av_control,
+)
+from talkcut.evaluator_av_controls import (
+    read as read_av_control,
+)
+from talkcut.evaluator_av_controls import (
+    stable_response as stable_av_response,
+)
 from talkcut.media import doctor, frame_inventory, probe
 from talkcut.project import (
     TalkCutError,
@@ -49,7 +78,7 @@ from talkcut.render import RenderError, validate_render
 MISSING_CONTROLS = {
     "transcript_only": "No legitimate executed audiovisual reviewer positive control is available.",
     "always_keep": "Authored policy labels cannot supply the missing executed editorial positive control.",
-    "fabricated_pass": "No legitimate complete reviewer/actor acceptance ledger positive control is available.",
+    "fabricated_pass": "No legitimate executed current individual reviewer/actor ledger positive control is available.",
 }
 SCOPES = {
     "duplicate_coverage": "production interval-union arithmetic on an explicit 90-second fixture",
@@ -218,16 +247,24 @@ def _timeline_probe(repo: Path, value: dict[str, Any]) -> dict[str, Any]:
 
 
 def _probe(
-    repo: Path, case_id: str, value: dict[str, Any]
+    repo: Path, case_id: str, value: dict[str, Any], *, output_dir: Path | None = None
 ) -> tuple[int, dict[str, Any]]:
     """A fixed probe; exceptions and nonzero CLI returns remain actual failures."""
     response: dict[str, Any] = {
         "schema_version": "negative-probe-response/v1",
         "case_id": case_id,
-        "scope": SCOPES[case_id],
+        "scope": SCOPES[case_id] if case_id in SCOPES else AV_SCOPES[case_id],
     }
     try:
-        if case_id == "duplicate_coverage":
+        if case_id in AV_SCOPES:
+            response.update(
+                test_only=True,
+                counterfactual=value.get("fault") != "none",
+                audiovisual_review="UNVERIFIED",
+                coverage=[],
+            )
+            facts = probe_av_control(repo, case_id, value, output_dir)
+        elif case_id == "duplicate_coverage":
             facts = coverage(
                 [(Fraction(a), Fraction(b)) for a, b in value["domain"]],
                 [(Fraction(a), Fraction(b)) for a, b in value["observed"]],
@@ -307,6 +344,8 @@ def _probe(
         OSError,
     ) as exc:
         response.update(status="FAIL", error_type=type(exc).__name__, reason=str(exc))
+        if isinstance(exc, CounterfactualRejection):
+            response["facts"] = exc.facts
         return 1, response
 
 
@@ -364,6 +403,8 @@ def run_evaluator_negatives(
     repo_root: str | Path,
     output_dir: str | Path,
     dependencies: dict[str, Any] | None = None,
+    *,
+    positive_controls_ref: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Preserve a fresh real run; missing AV controls produce null measurements."""
     repo, root = Path(repo_root).resolve(), Path(output_dir).resolve()
@@ -375,11 +416,20 @@ def run_evaluator_negatives(
     started, identity = _now(), code_identity(repo)
     deps = {**(dependencies or {}), "code_tree_hash": identity["code_tree_hash"]}
     harness_ref = artifact_ref(Path(__file__).resolve())
+    positive_controls = bound_av_controls(positive_controls_ref, repo, deps)
     request_ref = _save(
         root / "request.json",
         {
             "schema_version": "evaluator-negative-request/v1",
             "scope": SCOPES,
+            **(
+                {
+                    "positive_controls": positive_controls_ref,
+                    "positive_control_scope": AV_SCOPES,
+                }
+                if positive_controls_ref is not None
+                else {}
+            ),
             "dependencies": deps,
             "code_identity": identity,
             "harness": harness_ref,
@@ -600,6 +650,20 @@ def run_evaluator_negatives(
         {"interruption": interruption, "partial": artifact_ref(partial)},
     )
 
+    for case_id, positive in positive_controls.items():
+        cases[case_id] = {
+            "status": "UNVERIFIED",
+            "scope": AV_SCOPES[case_id],
+            "pairs": [],
+        }
+        pair(
+            case_id,
+            AV_FAULTS[case_id],
+            av_inputs(case_id, positive, deps, attack=False),
+            av_inputs(case_id, positive, deps, attack=True),
+            {"test_only": True, "counterfactual": True, "fault": AV_FAULTS[case_id]},
+        )
+
     _require(
         code_identity(repo) == identity
         and sha256(harness_ref["path"]) == harness_ref["sha256"],
@@ -618,6 +682,11 @@ def run_evaluator_negatives(
         "fixture_execution": fixture_execution,
         "identity_initialization": init,
         "cases": cases,
+        **(
+            {"positive_controls": positive_controls_ref}
+            if positive_controls_ref is not None
+            else {}
+        ),
         "test_only": True,
         "actual_dgist_acceptance": False,
         "audiovisual_review": "UNVERIFIED",
@@ -966,7 +1035,16 @@ def verify_evaluator_negatives(
         _file(raw.get("harness")) == Path(__file__).resolve(),
         "Different harness supplied the evidence",
     )
+    positive_controls = bound_av_controls(
+        raw.get("positive_controls"), repo, dependencies
+    )
     request = _json(raw.get("request"))
+    _require(
+        request.get("positive_controls") == raw.get("positive_controls")
+        and request.get("positive_control_scope")
+        == (AV_SCOPES if raw.get("positive_controls") is not None else None),
+        "Positive control registry differs from its executed request",
+    )
     _require(
         request.get("dependencies") == dependencies
         and request.get("harness") == raw["harness"]
@@ -1026,7 +1104,7 @@ def verify_evaluator_negatives(
     measured: dict[str, bool | None] = {}
     for case_id in CHECK_REQUIREMENTS["evaluator_negative"]:
         case = cases[case_id]
-        if case_id in MISSING_CONTROLS:
+        if case_id in MISSING_CONTROLS and case_id not in positive_controls:
             _require(
                 case
                 == {
@@ -1040,13 +1118,34 @@ def verify_evaluator_negatives(
             measured[case_id] = None
             continue
         _require(
-            case.get("scope") == SCOPES[case_id]
+            case.get("scope")
+            == (AV_SCOPES[case_id] if case_id in AV_SCOPES else SCOPES[case_id])
             and [item.get("name") for item in case.get("pairs", [])]
-            == list(PAIR_NAMES[case_id]),
+            == (
+                [AV_FAULTS[case_id]]
+                if case_id in AV_SCOPES
+                else list(PAIR_NAMES[case_id])
+            ),
             "Required paired technical control or mutation is missing",
         )
         for pair in case["pairs"]:
-            _mutation(case_id, pair, fixture)
+            if case_id in AV_SCOPES:
+                positive = positive_controls[case_id]
+                _require(
+                    read_av_control(pair["control_input"])
+                    == av_inputs(case_id, positive, dependencies, attack=False)
+                    and read_av_control(pair["mutation_input"])
+                    == av_inputs(case_id, positive, dependencies, attack=True)
+                    and pair.get("mutation")
+                    == {
+                        "test_only": True,
+                        "counterfactual": True,
+                        "fault": AV_FAULTS[case_id],
+                    },
+                    "Audiovisual mutation or unchanged actual positive binding differs",
+                )
+            else:
+                _mutation(case_id, pair, fixture)
             for key, ref_name in (
                 ("control", "control_input"),
                 ("attack", "mutation_input"),
@@ -1079,7 +1178,7 @@ def verify_evaluator_negatives(
                     env={**os.environ, "PYTHONPATH": str(repo / "src")},
                     capture_output=True,
                     text=True,
-                    timeout=120,
+                    timeout=1200 if case_id in AV_SCOPES else 120,
                     check=False,
                 )
                 _require(
@@ -1092,16 +1191,27 @@ def verify_evaluator_negatives(
                 )
                 # FFmpeg emits process-local pointer addresses in its diagnostic
                 # prefix. Preserve them in stdout, compare the remaining text.
-                stable_observed = re.sub(
-                    r"(?<=@ )0x[0-9a-fA-F]+",
-                    "0xADDRESS",
-                    json.dumps(observed, sort_keys=True),
-                )
-                stable_actual = re.sub(
-                    r"(?<=@ )0x[0-9a-fA-F]+",
-                    "0xADDRESS",
-                    json.dumps(actual_response, sort_keys=True),
-                )
+                if case_id in AV_SCOPES:
+                    observed_for_comparison = stable_av_response(
+                        observed, positive_controls[case_id], repo
+                    )
+                    actual_for_comparison = stable_av_response(
+                        actual_response, positive_controls[case_id], repo
+                    )
+                else:
+                    observed_for_comparison, actual_for_comparison = (
+                        observed,
+                        actual_response,
+                    )
+                stable_observed = json.dumps(observed_for_comparison, sort_keys=True)
+                stable_actual = json.dumps(actual_for_comparison, sort_keys=True)
+                if case_id not in AV_SCOPES:
+                    stable_observed = re.sub(
+                        r"(?<=@ )0x[0-9a-fA-F]+", "0xADDRESS", stable_observed
+                    )
+                    stable_actual = re.sub(
+                        r"(?<=@ )0x[0-9a-fA-F]+", "0xADDRESS", stable_actual
+                    )
                 _require(
                     process["exit_code"] == actual_code
                     and stable_observed == stable_actual,
@@ -1114,9 +1224,23 @@ def verify_evaluator_negatives(
                         "The alleged positive control never passed its technical scope",
                     )
                 else:
-                    reason = REASONS.get(
-                        f"{case_id}.{pair['name']}", REASONS.get(case_id)
+                    reason = (
+                        AV_REASONS[case_id]
+                        if case_id in AV_SCOPES
+                        else REASONS.get(
+                            f"{case_id}.{pair['name']}", REASONS.get(case_id)
+                        )
                     )
+                    if case_id in AV_SCOPES:
+                        _require(
+                            observed.get("reason") == reason
+                            and observed.get("facts", {}).get("positive_verified")
+                            is True
+                            and observed.get("facts", {}).get("counterfactual") is True
+                            and observed.get("facts", {}).get("recovery_verified")
+                            is True,
+                            "Counterfactual failed before the actual positive or at an unrelated production gate",
+                        )
                     _require(
                         actual_code != 0
                         and reason
@@ -1158,20 +1282,42 @@ def main() -> int:
     parser.add_argument("operation", choices=("run", "probe"))
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--case", choices=tuple(SCOPES))
+    parser.add_argument("--case", choices=tuple(SCOPES) + tuple(AV_SCOPES))
+    parser.add_argument("--positive-controls", type=Path)
     parser.add_argument("--input", type=Path)
     args = parser.parse_args()
     if args.operation == "probe":
         if args.case is None or args.input is None:
             parser.error("probe requires --case and --input")
         code, response = _probe(
-            args.repo.resolve(), args.case, json.loads(args.input.read_text())
+            args.repo.resolve(),
+            args.case,
+            read_av_control(artifact_ref(args.input))
+            if args.case in AV_SCOPES
+            else json.loads(args.input.read_text()),
+            output_dir=args.input.resolve().parent,
         )
         print(json.dumps(response, sort_keys=True))
         return code
     if args.output is None:
         parser.error("run requires --output")
-    result = run_evaluator_negatives(args.repo, args.output)
+    positive_ref = (
+        artifact_ref(args.positive_controls) if args.positive_controls else None
+    )
+    declared_dependencies = (
+        read_av_control(positive_ref).get("dependencies") if positive_ref else None
+    )
+    if positive_ref is not None:
+        _require(
+            isinstance(declared_dependencies, dict),
+            "Positive controls need declared dependencies",
+        )
+    result = run_evaluator_negatives(
+        args.repo,
+        args.output,
+        dependencies=declared_dependencies,
+        positive_controls_ref=positive_ref,
+    )
     print(json.dumps(result, indent=2))
     return 0 if result["status"] == "PASS" else 1
 

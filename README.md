@@ -195,6 +195,23 @@ Attach the returned run reference as `provider_controls` in the existing
 `failure-input/v1` measurement input. Missing positive evidence leaves these
 controls unverified; synthetic test success cannot replace it.
 
+The evaluator's ten negative cases run through a separate fixed harness:
+
+```sh
+uv run --locked python -m talkcut.evaluator_negative run --repo . --output projects/evaluator-controls --positive-controls POSITIVE_REGISTRY_JSON
+```
+
+The `evaluator-av-positive-controls/v2` registry and individual
+`evaluator-av-positive/v2` envelopes are defined in
+`src/talkcut/evaluator_av_controls.py`. They bind actual current audiovisual
+reviews and complete independently reviewed editorial fixtures for the
+transcript-only, always-keep and fabricated-approval cases. Each intended
+rejection requires a genuine positive, measured conservation, post-fault
+recovery and refusal to reuse the counterfactual as approval. Saved observations
+must match a fresh execution. Omitting the registry still executes the seven
+technical cases and leaves the three missing controls `null`; all ten remain
+visible and the aggregate result is `UNVERIFIED` with exit code `1`.
+
 Native output-bound requests must capture the complete output hash before execution
 and verify its bytes and file identity again afterward. Legacy audio diagnostics
 cannot acquire that scope later. The `native_candidate` adapter can prepare an
