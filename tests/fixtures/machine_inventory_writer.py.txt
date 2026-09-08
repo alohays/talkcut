@@ -1,0 +1,82 @@
+def _known_private_inventory(directory, publication_bodies=None):
+    pending: list[tuple[Path, str]] = []
+    public_candidates: dict[str, dict[str, Any]] = {}
+    unfollowed: list[dict[str, Any]] = []
+    fixture_claims, fixture_observations = _synthetic_failure_inventory()
+    def collect_candidate(candidate_path: Path, original_ref: dict[str, Any], ref: dict[str, Any]) -> None:
+        actual_path = _file(ref)
+        candidate_body = None
+        if actual_path.stat().st_size <= MAX_UNIT_BYTES:
+            try:
+                candidate_body = json.loads(actual_path.read_text())
+            except (ValueError, UnicodeDecodeError):
+                candidate_body = None
+        if contains_transcript(candidate_body):
+            add(candidate_path, 'transcript', ref['sha256'])
+        else:
+            role = body_candidates.get((str(candidate_path), ref['sha256']))
+            candidate = {**ref, 'classification': 'UNCLASSIFIED', 'reason': 'Declared publication body needs its separate content inspection.' if role else 'Synthetic machine code input requires its complete content inspection.', 'matching_git_source_bytes': source_candidates.get(ref['sha256'], [])}
+            if role:
+                candidate['publication_role'] = role
+            if ref is not original_ref:
+                candidate['original_reference'] = original_ref
+                candidate['preservation'] = 'Exact source snapshot only; no execution or publication approval.'
+            public_candidates[str(actual_path)] = candidate
+            unfollowed.append({**ref, 'reason': candidate['reason']})
+    def walk(value: Any, transcript: bool=False, key: str='') -> None:
+        if key in {'toolchain', 'producer', 'code_identity', 'tools_before', 'tools_after'} and (not transcript) and (not contains_transcript(value)):
+            return
+        if isinstance(value, dict):
+            transcript = transcript or explicit_transcript(value)
+            if transcript:
+                protect_values(value)
+            if isinstance(value.get('path'), str) and isinstance(value.get('sha256'), str):
+                path = Path(value['path'])
+                code_or_archive = path.suffix.lower() in {'.py', '.pyi', '.pyc', '.so', '.dylib', '.whl'} or path.name.endswith('.tar.gz')
+                kind = 'media' if value['sha256'] in digests else 'transcript' if transcript else 'media' if path.suffix.lower() in media_suffixes else 'review'
+                canonical_path = path if path.is_absolute() else (repo_root or directory) / path
+                transcript = transcript or value['sha256'] in git_transcripts
+                if transcript and kind != 'media':
+                    kind = 'transcript'
+                public_code = repo_root is not None and any((canonical_path.resolve() == (repo_root / origin['git_path']).resolve() for origin in source_candidates.get(value['sha256'], [])))
+                fixture = fixture_claims.get((str(canonical_path), value['sha256']))
+                if fixture is not None:
+                    _require(not transcript and value['sha256'] not in digests, 'Private source/transcript cannot use synthetic failure provenance')
+                    for actual_ref in (fixture['preserved_original'], fixture['actual_current']):
+                        collect_candidate(Path(actual_ref['path']), actual_ref, actual_ref)
+                elif transcript or value['sha256'] in known:
+                    add(canonical_path, kind if transcript else known[value['sha256']], value['sha256'], historical=True)
+                elif not public_code and kind != 'media' and (code_or_archive or value['sha256'] in source_candidates or value['sha256'] in source_snapshot_hashes or ((str(canonical_path), value['sha256']) in body_candidates)):
+                    candidate_path = path if path.is_absolute() else (repo_root or directory) / path
+                    original_ref = {'path': str(candidate_path), 'sha256': value['sha256']}
+                    ref = source_locators.get((str(candidate_path), value['sha256']), original_ref)
+                    if ref is original_ref and str(candidate_path) in source_paths and (candidate_path == candidate_path.resolve()) and (not candidate_path.is_symlink()) and candidate_path.is_file() and (sha256(candidate_path) != value['sha256']):
+                        _require(re.fullmatch('[a-f0-9]{64}', value['sha256']), 'Historical source digest is invalid')
+                        unresolved_sources[str(candidate_path), value['sha256']] = {**original_ref, 'classification': 'UNCLASSIFIED', 'status': 'UNVERIFIED', 'current_ref': artifact_ref(candidate_path), 'reason': 'Historical source input has no preserved bytes and remains unresolved.'}
+                    else:
+                        collect_candidate(candidate_path, original_ref, ref)
+                elif not public_code and path.is_absolute() and (path.resolve().is_relative_to(directory) or value['sha256'] in digests or transcript):
+                    add(path, kind, value['sha256'], historical=True)
+                elif not public_code:
+                    unfollowed.append({'path': value['path'], 'sha256': value['sha256'], 'reason': 'External source reference needs a separate origin and privacy classification.'})
+            for child_key, child in value.items():
+                walk(child, transcript, child_key)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child, transcript)
+    for role, ref in (publication_bodies or {}).items():
+        _require(role in {"pr_body", "release_body"}, "Unknown publication body role")
+        path = _file(ref)
+        body_candidates[str(path), ref["sha256"]] = role
+    if fixture_observations:
+        replay = fixture_observations[0]["current_reproduction"]
+        for link in replay["external_tool_links"]:
+            unfollowed.append({"path": link["link_path"], "sha256": link["link_bytes_sha256"], "reason": "Explicit original synthetic tool link and canonical target are both retained."})
+    while pending:
+        path, kind = pending.pop()
+        try:
+            value = json.loads(path.read_text())
+        except (ValueError, UnicodeDecodeError):
+            continue
+        walk(value)
+    return known, sorted(phrases), {"completeness": "UNVERIFIED", "known_refs": list(refs.values()), "known_ref_count": len(refs), "public_work_candidates": [row for row in public_candidates.values() if row["sha256"] not in known], "unfollowed_refs": unfollowed, "synthetic_failure_fixtures": fixture_observations}

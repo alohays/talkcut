@@ -35,6 +35,7 @@ from urllib.parse import quote, unquote, urlsplit
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 
+from . import privacy_machine_origins, privacy_retention_origins
 from .contracts import code_identity, object_hash
 from .project import TalkCutError, artifact_ref, load_project, sha256
 from .verification import _junit, _terminate_group
@@ -814,6 +815,18 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
         if ref["sha256"] in authority_cache:
             return authority_cache[ref["sha256"]]
         selected = document(ref)
+        if selected.get("schema_version") == "review-machine-field-authority/v1":
+            family = selected.get("family")
+            if family == "independent_privacy_inventory":
+                machine = privacy_machine_origins.verify_independent_inventory(selected, root, read, document)
+            elif family in {"staged_privacy_scan", "revision_privacy_scan"}:
+                machine = privacy_machine_origins.verify_privacy_scan(selected, root, read, document)
+            else:
+                _require(family == "transcript_corpus_inventory", "Unsupported machine review authority family")
+                machine = privacy_retention_origins.verify_retention_inventory(selected, root, read, document)
+            verified = {"machine": machine, "machine_family": family, "refs": [ref, *machine["refs"]]}
+            authority_cache[ref["sha256"]] = verified
+            return verified
         if selected.get("schema_version") == "review-json-schema-dialect-authority/v1":
             _require(set(selected) == {"schema_version", "parent"}, "Review dialect authority has unsupported fields")
             schema = document(selected["parent"])
@@ -945,6 +958,59 @@ def _review_text_origin_inventory(locators: Any, directory: Path, root: Path | N
 
 
     for locator in locators:
+        if isinstance(locator, dict) and locator.get("kind") in {"machine_inventory_field", "retention_inventory_field"}:
+            _require(set(locator) == {"schema_version", "kind", "parent", "selector", "authority"}
+                     and locator["schema_version"] == "review-text-origin/v1", "Unsupported machine review text origin fields")
+            bound = authority(locator["authority"])
+            retention = locator["kind"] == "retention_inventory_field"
+            _require("machine" in bound and (bound["machine_family"] == "transcript_corpus_inventory") == retention,
+                     "Machine review text kind differs from its bound authority family")
+            parent_path, _ = read(locator["parent"])
+            _require(parent_path.is_relative_to(directory) and locator["parent"]["sha256"] not in registered
+                     and not any(parent_path.is_relative_to(directory / name) for name in
+                                 ("sources", "transcripts", "renders", "reviews", "review", "analysis")),
+                     "Machine review text origin cannot scope source, transcript or audiovisual review namespaces")
+            parent = document(locator["parent"])
+            # The retention verifier checks its complete original descriptor
+            # table and rejects speech markers in the selected inventory. Other
+            # review origins retain the generic recursive transcript refusal.
+            _require(retention or not speech(parent), "Machine review parent contains a transcript context")
+            machine = bound["machine"]
+            project_field = (privacy_retention_origins.retention_field if retention
+                             else privacy_machine_origins.fixed_inventory_field)
+            projection = project_field(machine, locator["parent"], locator["selector"])
+            selector = locator["selector"]
+            _require(isinstance(selector, list) and selector and all(type(part) in {str, int} for part in selector)
+                     and isinstance(projection["value"], str)
+                     and projection["extractions"] == [{"edge": selector, "value": projection["value"]}],
+                     "Machine review origin must extract one exact string leaf")
+            key = (str(parent_path), tuple(selector))
+            _require(key not in seen, "Review text origin selector is duplicated")
+            seen.add(key)
+            try:
+                associated = parent
+                for part in selector[:-1]:
+                    associated = associated[part]
+                selected_leaf = associated[selector[-1]]
+            except (KeyError, IndexError, TypeError) as exc:
+                raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Machine review selector does not exist") from exc
+            _require(not speech(associated) and selected_leaf == projection["value"]
+                     and json.dumps(associated, sort_keys=True) == json.dumps(projection["row"], sort_keys=True),
+                     "Machine review field or complete associated row changed")
+            source_ref = machine["source"]
+            read(source_ref)
+            _require(source_ref["sha256"] not in registered, "Registered private media cannot supply machine review source")
+            original_source = machine.get("original_source", source_ref)
+            _require(original_source["sha256"] == source_ref["sha256"], "Machine source snapshot differs from its original identity")
+            read(locator["parent"])
+            result.append({"parent": locator["parent"], "selector": selector, "kind": locator["kind"],
+                           "source": {"original_path": original_source["path"], "snapshot": source_ref},
+                           "source_snapshot": source_ref, "selected_value": selected_leaf,
+                           "associated_row": projection["row"], "extractions": projection["extractions"],
+                           "authority": locator["authority"], "authority_refs": bound["refs"], "commands": [],
+                           "classification": "review", "claim_status": "UNVERIFIED",
+                           "scope": "Exact original machine-written leaf only; full parent remains private and original execution is not approved"})
+            continue
         _require(isinstance(locator, dict) and locator.get("kind") in {"python_inspection", "document_paragraph", "document_complete", "junit_test_name", "wheel_member_name", "locked_download_url", "json_schema_dialect"},
                  "Unsupported review text origin kind")
         dialect_field = locator["kind"] == "json_schema_dialect"
@@ -1798,10 +1864,15 @@ def _known_private_inventory(project_dir: Path | None, expected_source_hashes: d
         inspect_text(path, True, parse_json=True)
         inspect_text(old_path, True, parse_json=True)
     for observation in text_origins:
+        parent_ref = observation["parent"]
         for authority_ref in observation["authority_refs"]:
+            if (observation["kind"] in {"machine_inventory_field", "retention_inventory_field"}
+                    and authority_ref == parent_ref):
+                # This exact full parent is parsed below. A legitimate retained
+                # descriptor must not relabel its enclosing machine report.
+                continue
             authority_path = Path(authority_ref["path"])
             collect_candidate(authority_path, authority_ref, authority_ref)
-        parent_ref = observation["parent"]
         add(Path(parent_ref["path"]), "review", parent_ref["sha256"], parse_json=True)
         source = observation["source"]
         original = {"path": source["original_path"], "sha256": source["snapshot"]["sha256"]}

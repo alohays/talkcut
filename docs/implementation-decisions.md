@@ -172,3 +172,19 @@ Whole evidence files remain private, and matching text in another review field,
 transcript or unverified prose still contributes its own protected origin.
 Incomplete tables, altered hashes, unselected sources and duplicate origin roots
 are rejected. A validated metadata origin provides no media or release approval.
+
+Machine inventory observations use the same explicit origin and authority arrays.
+They bind retained producer code, its complete calling script, inputs, original
+output and full associated row before extracting a single reason, scope or
+preservation string. Unsupported producer shapes and derived path fields remain
+unverified. The parsers distinguish Python source bytes from an already decoded
+helper string; unsupported encodings or changed interpretations are refused.
+The retained AST grammars have been exercised on Python 3.12.
+
+A retention report can contain a transcript descriptor table beside its machine
+inventory. That specific family validates the complete descriptor structure and
+its source relationships while keeping the whole report private. Other review
+families retain their recursive transcript refusal. The consumer traverses all
+unselected values, retains every dependency and refuses changed parents, private
+source identities, duplicate or unconsumed field selections. A matching private
+copy or a caller-submitted protected phrase still prevents publication.
