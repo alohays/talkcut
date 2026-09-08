@@ -1,0 +1,32 @@
+[project]
+name = "talkcut"
+version = "0.1.0a1"
+description = "Reversible lecture editing with exact timelines and explicit audiovisual evidence gates."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Yunsung Lee" }]
+dependencies = [
+    "jsonschema>=4.26.0",
+    "numpy>=2.5.3",
+]
+
+[project.urls]
+Repository = "https://github.com/alohays/talkcut"
+
+[project.scripts]
+talkcut = "talkcut.__main__:main"
+
+[build-system]
+requires = ["uv_build>=0.11.29,<0.12"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.167.1",
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.6",
+    "types-jsonschema>=4.26.0.20260518",
+]
