@@ -139,15 +139,25 @@ def test_actual_speaker_terminal_duration_and_exact_omission_boundary(media, tmp
     assert timeline["retained_source_frame_count"] == 5
     assert timeline["frame_count"] == 6
     assert as_fraction(timeline["inserted_frames"][0]["source_time"]) == F(7, 2)
+    assert [as_fraction(frame["output_pts"]) for frame in timeline["frames"]] == [
+        F(0), F(1), F(2), F(3), F(7, 2), F(4)
+    ]
     manifest = render(timeline, sources, tmp_path / "exact-end.mp4", preset="ultrafast")
+    assert manifest["validation"]["frame_count"] == 6
+    assert as_fraction(manifest["validation"]["max_frame_pts_error"]) == 0
     raw = subprocess.check_output(["ffmpeg", "-v", "error", "-i", manifest["output"]["path"],
-                                   "-map", "0:v", "-fps_mode", "passthrough", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
+                                   "-map", "0:v", "-fps_mode", "passthrough", "-pix_fmt", "yuv420p", "-f", "rawvideo", "-"])
     layout = manifest["layout"]
     x, y = layout["x"] + layout["width"] // 2, layout["y"] + layout["height"] // 2
-    assert len(raw) == 6 * 160 * 90 * 3
-    samples = [raw[i * 160 * 90 * 3 + (y * 160 + x) * 3 + channel]
-               for i in range(6) for channel in range(3)]
-    # RGB conversion of lossy limited-range YUV may round white to 254.
-    # All three channels must still switch from white to black at exactly 3.5s.
-    assert all(abs(actual - expected) <= 1
-               for actual, expected in zip(samples, [255] * 12 + [0] * 6, strict=True))
+    frame_bytes = 160 * 90 * 3 // 2
+    assert len(raw) == 6 * frame_bytes
+    samples = [[raw[i * frame_bytes + row * 160 + column]
+                for row in range(y - 1, y + 2) for column in range(x - 1, x + 2)]
+               for i in range(6)]
+    (tmp_path / "boundary-luma.json").write_text(json.dumps(samples))
+    # Test inset presence/absence on native Y, without a YUV-to-RGB conversion.
+    # These fixture-only bands are within 16 codes of nominal white235/black16
+    # (and include full-range endpoints), with a 187-code separation. Every
+    # center 3x3 pixel must change class at exactly 3.5s; exact colors are not the gate.
+    assert all(value >= 219 for frame in samples[:4] for value in frame), samples
+    assert all(value <= 32 for frame in samples[4:] for value in frame), samples

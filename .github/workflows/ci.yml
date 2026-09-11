@@ -29,6 +29,12 @@ jobs:
       - run: uv sync --locked --python 3.12
       - run: uv run --locked ruff check src tests examples
       - run: uv run --locked mypy src/talkcut
+      - name: FFmpeg compatibility preflight
+        run: >-
+          uv run --locked pytest -q
+          tests/test_render.py::test_actual_speaker_terminal_duration_and_exact_omission_boundary
+          tests/test_quality.py::test_original_static_black_and_silence_are_not_invented_output_defects
+          tests/test_composite_review.py::test_actual_media_and_transport_parser_control_never_claims_capability
       - name: Unit, contract and actual FFmpeg regression tests
         run: uv run --locked pytest -q
       - name: Execute documented recovery example
