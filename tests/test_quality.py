@@ -172,9 +172,13 @@ def test_original_static_black_and_silence_are_not_invented_output_defects(tmp_p
     command("render", project, "--profile", "diagnostic", "--preset", "ultrafast")
     report = compare_render(load_project(project)["active_render"], tmp_path / "measurements")
     assert report["findings"] == []
-    assert report["video"]["mean_mse_yuv_code_values"] == 0
+    assert report["whole_retained_source_compared"]
+    assert report["video"]["coverage"]["numerator"] == report["video"]["coverage"]["denominator"] == 20
+    # Lossy H.264 and FFmpeg scaler rounding need not be pixel-identical.
+    # Keep the full comparison and require less than one 8-bit code value RMS.
+    assert 0 <= report["video"]["mean_mse_yuv_code_values"] < 1
     assert report["audio"]["source_rms"] == report["audio"]["output_rms"] == 0
-    assert report["status"] == "UNVERIFIED"  # Exact pixels/silence still are not AI approval.
+    assert report["status"] == "UNVERIFIED"  # Measured pixels/silence still are not AI approval.
 
 
 @pytest.mark.parametrize("limit", [0, -1, True, 1.5])

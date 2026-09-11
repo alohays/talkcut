@@ -144,5 +144,10 @@ def test_actual_speaker_terminal_duration_and_exact_omission_boundary(media, tmp
                                    "-map", "0:v", "-fps_mode", "passthrough", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
     layout = manifest["layout"]
     x, y = layout["x"] + layout["width"] // 2, layout["y"] + layout["height"] // 2
-    samples = [raw[i * 160 * 90 * 3 + (y * 160 + x) * 3] for i in range(6)]
-    assert samples == [255, 255, 255, 255, 0, 0]
+    assert len(raw) == 6 * 160 * 90 * 3
+    samples = [raw[i * 160 * 90 * 3 + (y * 160 + x) * 3 + channel]
+               for i in range(6) for channel in range(3)]
+    # RGB conversion of lossy limited-range YUV may round white to 254.
+    # All three channels must still switch from white to black at exactly 3.5s.
+    assert all(abs(actual - expected) <= 1
+               for actual, expected in zip(samples, [255] * 12 + [0] * 6, strict=True))

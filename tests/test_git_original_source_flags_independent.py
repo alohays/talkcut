@@ -28,7 +28,9 @@ def test_original_bound_source_is_read_with_replacement_disabled(tmp_path, monke
         selected, replacement = original_tree, empty_tree
     else:
         selected = original_commit
-        replacement = git(root, "commit-tree", empty_tree, data=b"unrelated commit\n").strip().decode()
+        # This synthetic commit must not depend on the runner's Git identity.
+        replacement = git(root, "-c", "user.name=TalkCut Test", "-c", "user.email=fixture@example.invalid",
+                          "commit-tree", empty_tree, data=b"unrelated commit\n").strip().decode()
     git(root, "replace", selected, replacement)
     assert git(root, "cat-file", kind, selected) != git(root, "--no-replace-objects", "cat-file", kind, selected)
     command = privacy._command

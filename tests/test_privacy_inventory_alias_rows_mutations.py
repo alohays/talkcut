@@ -48,9 +48,21 @@ def test_during_observation_changes_reject(tmp_path, monkeypatch, mutation):
                 other = tmp_path / 'replacement'
                 other.write_bytes(target.read_bytes())
                 os.replace(other, target)
-            elif mutation in {'link_inode', 'link_literal'}:
+            elif mutation == 'link_inode':
+                original = link.lstat()
+                other = tmp_path / 'replacement-link'
+                # Keep the original allocated while creating the replacement:
+                # unlink/recreate may immediately reuse an inode on Linux.
+                other.symlink_to(target.name)
+                replacement = other.lstat()
+                assert (replacement.st_dev, replacement.st_ino) != (original.st_dev, original.st_ino)
+                os.replace(other, link)
+                current = link.lstat()
+                assert (current.st_dev, current.st_ino) == (replacement.st_dev, replacement.st_ino)
+                assert os.readlink(link) == target.name
+            elif mutation == 'link_literal':
                 link.unlink()
-                link.symlink_to(target.name if mutation == 'link_inode' else './' + target.name)
+                link.symlink_to('./' + target.name)
             elif mutation == 'retarget_same_bytes':
                 other = tmp_path / 'other'
                 other.write_bytes(target.read_bytes())
