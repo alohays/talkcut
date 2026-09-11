@@ -1,0 +1,205 @@
+# Implementation decisions
+
+## Exact source timing and terminal frames
+
+The first supported workflow uses measured presentation timestamps and stream
+time bases. Source inspection records every decoded frame's PTS and duration,
+the audio sample inventory, full-decode exit status and raw tool output. It does
+not derive a frame schedule from a nominal frame rate or container duration.
+
+The first real source inspection found a long first video frame. Rendering
+must preserve that initial presentation interval as well as interior intervals;
+assuming that every frame lasts the nominal frame period would shorten the
+lecture. The compiler and renderer therefore validate an explicit presentation
+schedule, including its end. Synthetic regression fixtures also exercise long
+terminal frames without copying private lecture material.
+
+FFprobe's machine-readable frame inventory and FFmpeg's stream selection,
+framesync and timestamp behavior are defined in the upstream
+[ffprobe manual](https://ffmpeg.org/ffprobe.html),
+[FFmpeg manual](https://ffmpeg.org/ffmpeg.html) and
+[filter manual](https://ffmpeg.org/ffmpeg-filters.html).
+
+## Audio correlation and separate visual evidence
+
+Audio offset analysis compares multiple beginning, middle and end windows,
+separating fit and holdout anchors. The uncertainty includes the maximum lag
+variation in independent subwindows and the sample grid. A high correlation
+identifies an audio relationship; it does not establish speaker video alignment
+or lip sync. Those conditions remain unverified until measured audiovisual
+evidence is available.
+
+## Private projects and successful artifacts
+
+Sources are copied to a durable project directory and the copy is accepted only
+after hashes match. Original files remain in place. Each mutable project update
+uses an exclusive local lock, an expected revision and an atomic file replacement;
+the decision history is committed in the same transaction. Content-addressed
+artifacts and prior successful renders are retained for reopening and recovery.
+
+## Evidence must identify the observed media
+
+The acceptance evaluator runs typed checkers over preserved artifacts. It
+recompiles timelines, decodes media and compares actual process output; a receipt
+containing a successful label cannot replace these inputs. Review extraction is
+reconstructed from a fixed recipe and checked against the registered parent
+media. Claimed observation intervals must fit inside the actual submitted clips.
+
+Source/output difference detectors produce investigation intervals, not auditory
+diagnoses. Closing an investigation requires a separate source observation and
+an output observation covering that exact interval, both bound to the comparison
+and finding hashes. The source observation must precede the resolving output
+review. Generic source coverage cannot resolve a specific new output defect.
+
+Interrupted measurements retain their actual exit code and logs. A child that
+handles termination and exits zero is still an interrupted run and cannot create
+successful measurement evidence. Failure controls preserve prior successful
+media and partial attempts; injected ENOSPC at atomic promotion is explicitly a
+filesystem fault test, not a claim that the host disk was filled.
+
+## Verification scope
+
+The installed-package verification runs the documented recovery commands outside
+the checkout, using a newly built wheel and locked runtime dependencies. Public
+tests are collected explicitly from `tests/`; ignored private audit snapshots
+are not part of the public test denominator. Required public tests cannot be
+skipped to make a verification run pass.
+
+Synthetic timing and recovery controls establish technical behavior. They do not
+establish spoken editorial accuracy, audiovisual capability or final lecture
+acceptance. Those measurements remain unknown until their separate required
+inputs and executed reviews are available.
+
+## Explicit origins for copied private observations
+
+The privacy inventory distinguishes an observation's copied source metadata from
+an executable artifact reference. A copied source tree requires an explicitly
+selected parent, an exact full manifest and the original recorder under the same
+observation context. The inventory rechecks every source entry against its
+registered authority. A recorder in another array element or inside the copied
+manifest cannot supply that authority; relative paths never acquire a guessed
+repository root.
+
+Preserved verification-command observations also require their original and
+current bytes, exact command structure and bound logs. Resolving an observation's
+origin does not change the historical command's outcome or certify its execution.
+Unknown references and malformed evidence remain failures. These checks support
+the inventory; they do not establish that a particular private project is ready
+for publication.
+# CLI input capacity and reasoning records
+
+Whole PNG-bearing CLI renderer outputs and canonical session captures have a
+separate 128 MiB inspection bound. Individual frames, final answers, configuration,
+execution metadata and other ordinary artifacts retain the 32 MiB bound. Both
+bounds apply before reading the corresponding file; registration metadata also
+uses strict JSON parsing and verifies the declared bytes and hash.
+
+An observed CLI response may contain up to 64 empty reasoning records. Each must
+have a unique identifier and its own immediately preceding, exactly matching
+empty mirror. Input roles, order, complete canonical capture, final-answer binding
+and the prohibition on unobserved tools or delegated inputs still apply. These
+checks establish transport provenance; they do not approve a model's findings.
+
+## Preserved technical failure records
+
+Changing the evaluator harness previously prevented the privacy inventory from
+reading preserved negative-control runs, because it required their original
+harness reference to match the current file. An explicit source-snapshot locator
+now binds those unchanged records to the exact historical Git revision and its
+complete code identity. The inventory reruns every supported technical control
+with the current implementation and checks conservation of the original files.
+Missing audiovisual controls remain unknown, and historical execution remains
+unverified. This origin check does not establish publication readiness.
+
+## Preserving large private evidence
+
+The private inventory archive previously reused the generic 16 MiB inspection
+limit, so complete metric streams and other large review inputs could prevent
+inventory creation. Private review and transcript inputs are now preserved as
+opaque bytes with separate bounds of 32 GiB per file and 64 GiB across all
+selected paths. Equal-byte paths retain individual mappings when storage is
+reused. Generic parsing and publication scan limits remain unchanged.
+
+Copies use bounded reads, exact byte counts, full hashes and source and target
+identity checks. Archive writes use a pinned directory descriptor. Existing
+successes are preserved, interrupted partials remain available for diagnosis,
+and only complete verified objects enter the returned mapping. Byte preservation
+provides no classification, semantic review or publication approval.
+
+## Source excerpts inside private review records
+
+Private audit records can contain verbatim public source extracts and document
+quotes. Treating every long string in those records as private speech caused
+publication scans to flag the original code. Explicit review-text observations
+now identify exact fields through separately supplied original audit roots,
+complete source maps, preserved Git members and recomputed extraction rows.
+The supported fields are Python inspection imports, function names and selected
+calls, plus complete document or paragraph quotes.
+
+Only the selected occurrence stops contributing a private phrase. An identical
+string in a transcript, unselected review field or private prose keeps its
+protection, and the full private file remains protected. Changed, missing or
+unconsumed origins fail validation. The supplied roots are provenance inputs;
+hash consistency does not authenticate an entirely fabricated replacement
+history or certify a historical review, execution or publication.
+
+## Git object identifiers and selected references
+
+The publication scan verifies original Git object types, lengths and hashes
+before recognizing exact tree and parent identifiers in commit headers. Only
+those byte positions receive structural metadata records. Identical text in a
+message, author field, ordinary blob or archive continues through phrase checks,
+and complete private artifact hashes retain precedence.
+
+Git replacement resolution is disabled for original source and history reads.
+Every selected reference is still retained and its target inspected, including
+replacement blobs, nested annotated tags and selected tree leaves. Original and
+replacement payloads both remain in scope. Unsupported tree metadata, symlinks
+and submodules remain explicitly unverified; traversal limits and changed
+references prevent a completeness claim.
+
+## Generated metadata in private evidence
+
+Explicit origin records now also support complete JUnit test names, wheel member
+names, locked download URLs and the root JSON Schema dialect identifier. Each
+family checks its original source or schema authority and the complete retained
+table before identifying a selected field. JUnit names must belong to an original
+source selected by the recorded test command. Wheel and download records require
+the retained archive bytes; schema validation uses the installed offline dialect.
+
+These checks do not execute old commands or certify their historical success.
+Whole evidence files remain private, and matching text in another review field,
+transcript or unverified prose still contributes its own protected origin.
+Incomplete tables, altered hashes, unselected sources and duplicate origin roots
+are rejected. A validated metadata origin provides no media or release approval.
+
+Machine inventory observations use the same explicit origin and authority arrays.
+They bind retained producer code, its complete calling script, inputs, original
+output and full associated row before extracting a single reason, scope or
+preservation string. Unsupported producer shapes and derived path fields remain
+unverified. The parsers distinguish Python source bytes from an already decoded
+helper string; unsupported encodings or changed interpretations are refused.
+The retained AST grammars have been exercised on Python 3.12.
+
+A retention report can contain a transcript descriptor table beside its machine
+inventory. That specific family validates the complete descriptor structure and
+its source relationships while keeping the whole report private. Other review
+families retain their recursive transcript refusal. The consumer traverses all
+unselected values, retains every dependency and refuses changed parents, private
+source identities, duplicate or unconsumed field selections. A matching private
+copy or a caller-submitted protected phrase still prevents publication.
+
+## Explicit formal artifact types
+
+Formal artifact roles are declared in `talkcut.formal_schemas`. Mentioning a
+schema name in a validator, comment or embedded grammar cannot change the role
+of an unchanged historical metadata record. The installed policy remains the
+minimum protection set, including accepted input contracts without local writers.
+
+Supported output expressions and JSON Schema type constants or enums must be
+covered by an explicit policy declaration; schema files do not extend the policy
+automatically. A caller repository without its own policy can use installed
+types only when this coverage check passes. Missing installed policy prevents
+the guard from loading. The static check does not infer every possible Python
+input contract, so new accepted types require a reviewed declaration. Recursive
+private-source checks and whole-parent preservation remain in force.

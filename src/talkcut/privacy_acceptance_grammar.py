@@ -1,0 +1,3 @@
+"""Reviewed complete original acceptance/CLI/source module shapes (Python 3.12)."""
+
+MODULE_SHAPES = {'src/talkcut/__init__.py': ('285969691ec1e02f75d10f6aa54590073e125ba56d5c4e0f0b11f0d0589f6192',), 'src/talkcut/__main__.py': ('9ccb5d551502b231b971fb7a239f87a816f22ea4e7cc9474a0b34bcdcbb25f4d',), 'src/talkcut/acceptance.py': ('0748ecdb2e58d3272ef3a3b8117d3052d9c8d44adfc077eff1dd9e7e736bc27a', 'd6fd665f68cab872eea72e9843229f77b32177469566b206551d5a631d7aeba6'), 'src/talkcut/contracts.py': ('4dbc5f79d15f44447ca7aefdb50c402cae1973d4e6efcb65bfe1a9d3e2fb6c82',), 'src/talkcut/project.py': ('5ecc58bec8485f9a3c609a901f98d9f3c77bd00fda286cad755aec2b5db87521',)}

@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/alohays/talkcut/schemas/acceptance-manifest.schema.json",
+  "title": "Private goal acceptance evidence index",
+  "type": "object",
+  "required": [
+    "schema_version"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "acceptance-index/v1"
+    },
+    "registration": {
+      "$ref": "#/$defs/ref"
+    },
+    "source_inspections": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ref"
+      }
+    },
+    "timeline": {
+      "$ref": "#/$defs/ref"
+    },
+    "render": {
+      "$ref": "#/$defs/ref"
+    },
+    "analysis": {
+      "$ref": "#/$defs/ref"
+    },
+    "reviews": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ref"
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ref"
+      }
+    },
+    "checks": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ref"
+      }
+    },
+    "snapshot": {
+      "$ref": "#/$defs/ref"
+    },
+    "audit": {
+      "$ref": "#/$defs/ref"
+    },
+    "handoff": {
+      "$ref": "#/$defs/ref"
+    },
+    "release": {
+      "$ref": "#/$defs/ref"
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "edit_disposition": {
+      "enum": [
+        "EDITED",
+        "NO_SAFE_CUTS_VERIFIED",
+        "COMPOSITION_ONLY",
+        "ANALYSIS_UNAVAILABLE"
+      ]
+    },
+    "owner_acceptance": {
+      "const": "pending"
+    },
+    "editorial": {
+      "$ref": "#/$defs/ref"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "ref": {
+      "type": "object",
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

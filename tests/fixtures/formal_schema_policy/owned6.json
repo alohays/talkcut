@@ -1,0 +1,32 @@
+[
+  {
+    "schema": "private-byte-preservation/v1",
+    "role": "formal_artifact",
+    "owner": "talkcut.privacy_checks"
+  },
+  {
+    "schema": "review-json-schema-dialect-authority/v1",
+    "role": "control_contract",
+    "owner": "talkcut.privacy_checks"
+  },
+  {
+    "schema": "review-machine-field-authority/v1",
+    "role": "control_contract",
+    "owner": "talkcut.privacy_checks"
+  },
+  {
+    "schema": "review-text-origin/v1",
+    "role": "control_contract",
+    "owner": "talkcut.privacy_checks"
+  },
+  {
+    "schema": "review-text-source-authority/v1",
+    "role": "control_contract",
+    "owner": "talkcut.privacy_checks"
+  },
+  {
+    "schema": "review-verification-source-authority/v1",
+    "role": "control_contract",
+    "owner": "talkcut.privacy_checks"
+  }
+]

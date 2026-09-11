@@ -1,0 +1,187 @@
+import ast
+import hashlib
+import json
+import subprocess
+import sys
+import time
+import types
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from talkcut.privacy_checks import _known_private_inventory
+ROOT = Path.cwd()
+PROJECT = ROOT / 'projects/fixture-retention'
+OUT = PROJECT / 'evidence/transcript-corpus-independent' / uuid.uuid4().hex
+OUT.mkdir()
+clock = time.monotonic()
+started = datetime.now(timezone.utc).isoformat()
+
+def ref(p):
+    p = Path(p).resolve()
+    return {'path': str(p), 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()}
+
+def digest(s):
+    return hashlib.sha256(s.encode()).hexdigest()
+source = ROOT / 'src/talkcut/privacy_checks.py'
+source_before = ref(source)
+assert source_before['sha256'] == '8d99b31e8da6e4d57686f02e31e047e305d6e6d40f347228dde377a36649c100'
+protected = [ref(PROJECT / n) for n in ['project.json', 'acceptance.local.json', 'checkpoint.local.json']]
+raw_input_path = PROJECT / 'evidence/publication-privacy-priority-fix/raw-input-r3.local.json'
+raw_input = json.loads(raw_input_path.read_text())
+previous_path = PROJECT / 'evidence/publication-privacy-current-781a2b6/payload-diagnostic.stdout'
+previous = json.loads(previous_path.read_text())
+current_r3_path = PROJECT / 'evidence/publication-privacy-classification-fix/actual-verifier-r3.stdout'
+current_r3 = json.loads(current_r3_path.read_text())
+project = json.loads((PROJECT / 'project.json').read_text())
+source_hashes = {k: v['sha256'] for k, v in project['sources'].items()}
+transcript_paths = []
+for p in sorted((PROJECT / 'transcripts').rglob('*')):
+    if p.is_file() and p.suffix.lower() not in {'.wav', '.mp4', '.mp3', '.m4a'}:
+        try:
+            p.read_text()
+        except UnicodeDecodeError:
+            continue
+        transcript_paths.append(p)
+transcripts_before = [ref(p) for p in transcript_paths]
+assert len(transcript_paths) == 19
+known, phrases, inventory = _known_private_inventory(PROJECT, source_hashes, ROOT, historical_artifacts=raw_input['historical_artifacts'], source_snapshots=raw_input['source_snapshots'])
+newset = set(phrases)
+expected = {}
+file_rows = []
+
+def expect(text, origin):
+    if len(text.strip()) >= 40:
+        expected.setdefault(text, []).append(origin)
+
+def speech_walk(value, pointer, origins):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            pos = pointer + '/' + str(key)
+            if key in {'text', 'word', 'utterance', 'transcript', 'sentence'} and isinstance(child, str):
+                origins.append({'pointer': pos, 'characters': len(child), 'sha256': digest(child), 'qualifies_40_chars': len(child.strip()) >= 40})
+                expect(child, {'artifact': current_ref, 'json_pointer': pos, 'field': key})
+            else:
+                speech_walk(child, pos, origins)
+    elif isinstance(value, list):
+        for i, child in enumerate(value):
+            speech_walk(child, pointer + '/' + str(i), origins)
+for p, current_ref in zip(transcript_paths, transcripts_before, strict=True):
+    text = p.read_text()
+    row = {'artifact': current_ref, 'bytes': p.stat().st_size, 'speech_fields': [], 'plain_transcript_lines': []}
+    try:
+        value = json.loads(text)
+    except ValueError:
+        value = None
+    if value is not None:
+        speech_walk(value, '', row['speech_fields'])
+        if isinstance(value, dict):
+            row['schema_version'] = value.get('schema_version')
+            row['source_sha256'] = value.get('source_sha256')
+    if p.name == 'fixture-transcript.txt':
+        for i, line in enumerate(text.splitlines(), 1):
+            row['plain_transcript_lines'].append({'line': i, 'sha256': digest(line), 'characters': len(line), 'qualifies_40_chars': len(line.strip()) >= 40})
+            expect(line, {'artifact': current_ref, 'line': i, 'field': 'plain_transcript_line'})
+    row['private_exact_hash_retained'] = current_ref['sha256'] in known
+    row['assigned_kind'] = known.get(current_ref['sha256'])
+    file_rows.append(row)
+missing = [{'text_private_only': text, 'sha256': digest(text), 'origins': origins} for text, origins in expected.items() if text not in newset]
+old_blob_oid = 'afc6b719d22612354a95cd22f052c91022387b41'
+code = subprocess.check_output(['git', 'cat-file', 'blob', old_blob_oid], cwd=ROOT)
+old_code = OUT / 'old-scanner.gitblob.local.py'
+old_code.write_bytes(code)
+name = 'talkcut._transcript_corpus_old'
+module = types.ModuleType(name)
+module.__package__ = 'talkcut'
+sys.modules[name] = module
+exec(compile(code, str(old_code), 'exec'), module.__dict__)
+fn = next((n for n in ast.parse(code).body if isinstance(n, ast.FunctionDef) and n.name == '_known_private_inventory'))
+walk = next((n for n in fn.body if isinstance(n, ast.FunctionDef) and n.name == 'walk'))
+body = ast.Module(body=[walk], type_ignores=[])
+ast.fix_missing_locations(body)
+oldset = set()
+old_origins = {}
+old_node_files = []
+ns = dict(module.__dict__)
+ns.update({'digests': set(source_hashes.values()), 'media_suffixes': set(), 'directory': PROJECT, 'repo_root': ROOT, 'phrases': oldset, 'unfollowed': [], 'add': lambda *a, **k: None})
+exec(compile(body, str(old_code), 'exec'), ns)
+
+def text_origins(value, pointer, origin, blocked=False):
+    if isinstance(value, dict):
+        if isinstance(value.get('text'), str) and len(value['text'].strip()) >= 40:
+            old_origins.setdefault(value['text'], []).append({**origin, 'json_pointer': pointer + '/text'})
+        for k, v in value.items():
+            if k not in {'toolchain', 'producer', 'code_identity', 'tools_before', 'tools_after'}:
+                text_origins(v, pointer + '/' + str(k), origin)
+    elif isinstance(value, list):
+        for i, v in enumerate(value):
+            text_origins(v, pointer + '/' + str(i), origin)
+for row in previous['private_inventory']['known_refs']:
+    if row['kind'] != 'transcript':
+        continue
+    p = Path(row['path'])
+    actual = ref(p)
+    assert actual['sha256'] == row['sha256']
+    old_node_files.append({**actual, 'bytes': p.stat().st_size, 'within_original_text_inspection_bound': p.stat().st_size <= module.MAX_UNIT_BYTES})
+    if p.stat().st_size > module.MAX_UNIT_BYTES:
+        continue
+    try:
+        text = p.read_text()
+    except UnicodeDecodeError:
+        continue
+    if p.suffix.lower() == '.json':
+        try:
+            value = json.loads(text)
+        except ValueError:
+            continue
+        ns['walk'](value, True)
+        text_origins(value, '', {'artifact': actual})
+    else:
+        for i, line in enumerate(text.splitlines(), 1):
+            if len(line.strip()) >= 40:
+                oldset.add(line)
+                old_origins.setdefault(line, []).append({'artifact': actual, 'line': i})
+assert len(oldset) == previous['protected_phrase_count'], (len(oldset), previous['protected_phrase_count'])
+assert set(old_origins) == oldset
+runtime = PROJECT / 'transcripts/asr-runtime-provenance.local.json'
+runtime_data = json.loads(runtime.read_text())
+runtime_refs = {}
+
+def refs_walk(v, path=''):
+    if isinstance(v, dict):
+        if isinstance(v.get('path'), str) and isinstance(v.get('sha256'), str):
+            runtime_refs.setdefault(v['path'], []).append({'json_pointer': path, 'ref': v})
+        for k, c in v.items():
+            refs_walk(c, path + '/' + str(k))
+    elif isinstance(v, list):
+        for i, c in enumerate(v):
+            refs_walk(c, path + '/' + str(i))
+refs_walk(runtime_data)
+removed = []
+unexplained_removed = []
+for text in sorted(oldset - newset):
+    origins = old_origins[text]
+    classified = []
+    for origin in origins:
+        path = origin['artifact']['path']
+        kind = 'runtime_code_asset' if path in runtime_refs else 'unexplained'
+        classified.append({**origin, 'classification': kind, 'runtime_parent': ref(runtime) if path in runtime_refs else None, 'runtime_pointers': runtime_refs.get(path, [])})
+    row = {'text_private_only': text, 'sha256': digest(text), 'origins': classified}
+    removed.append(row)
+    if any((o['classification'] == 'unexplained' for o in classified)):
+        unexplained_removed.append(row)
+retained_expected = [{'sha256': digest(text), 'characters': len(text), 'origins': origins, 'exact_string_retained': text in newset} for text, origins in sorted(expected.items())]
+for p, before in zip(transcript_paths, transcripts_before, strict=True):
+    assert ref(p) == before
+source_after = ref(source)
+assert source_before == source_after
+assert protected == [ref(PROJECT / n) for n in ['project.json', 'acceptance.local.json', 'checkpoint.local.json']]
+retained = [row for row in file_rows if row['speech_fields'] or row['plain_transcript_lines']]
+assert all((row['private_exact_hash_retained'] for row in retained))
+phrasefile = OUT / 'current-phrases.private.json'
+phrasefile.write_text(json.dumps(sorted(newset), ensure_ascii=False, indent=2) + '\n')
+removedfile = OUT / 'removed-runtime-phrases.private.json'
+removedfile.write_text(json.dumps(removed, ensure_ascii=False, indent=2) + '\n')
+report = {'schema_version': 'transcript-corpus-retention-audit/v1', 'started_at': started, 'finished_at': datetime.now(timezone.utc).isoformat(), 'wall_seconds': time.monotonic() - clock, 'status': 'P1_MISSING_TRANSCRIPT_PHRASE' if missing else 'EXACT_TRANSCRIPT_RETENTION_CONFIRMED', 'source_before': source_before, 'source_after': source_after, 'scope': 'Privacy phrase corpus only, no audio/video observation, spoken accuracy, publication approval or acceptance state change.', 'reproducer': ref(__file__), 'previous_scanner': {'git_blob_oid': old_blob_oid, **ref(old_code)}, 'previous_diagnostic': ref(previous_path), 'latest_prior_r3': ref(current_r3_path), 'actual_current_inventory_inputs': {'registered_source_hashes': source_hashes, 'raw_privacy_input': ref(raw_input_path)}, 'current_inventory': inventory, 'current_phrase_ref': ref(phrasefile), 'current_phrase_count': len(newset), 'prior_r3_phrase_count': current_r3['private_inventory']['derived_phrase_count'], 'previous_exact_phrase_count': len(oldset), 'previous_saved_phrase_count': previous['protected_phrase_count'], 'previous_transcript_node_files': old_node_files, 'transcript_files_checked': file_rows, 'independent_expected_unique_speech_strings': len(expected), 'independent_expected_speech_occurrences': sum(map(len, expected.values())), 'expected_speech_strings': retained_expected, 'missing_speech_strings': missing, 'missing_speech_count': len(missing), 'removed_phrase_count': len(removed), 'removed_phrase_ref': ref(removedfile), 'unexplained_removed': unexplained_removed, 'unexplained_removed_count': len(unexplained_removed), 'runtime_origin_parent': ref(runtime), 'added_phrase_count': len(newset - oldset), 'added_phrase_hashes': sorted((digest(t) for t in newset - oldset)), 'all_actual_speech_file_hashes_still_mandatory_private': True, 'public_runtime_candidates_do_not_imply_public_approval': True, 'protected_project_files_unchanged': protected, 'public_code_unchanged_during_execution': source_before == source_after, 'project_index_mutated': False, 'ai_audio_coverage_seconds': 0, 'ai_video_coverage_seconds': 0, 'publication_privacy': 'UNVERIFIED', 'owner_acceptance': 'pending'}
+p = OUT / 'result.local.json'
+p.write_text(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + '\n')
+print(json.dumps({'result': ref(p), 'status': report['status'], 'source_before': source_before, 'source_after': source_after, 'old_phrase_count': len(oldset), 'current_phrase_count': len(newset), 'expected_unique_speech_strings': len(expected), 'expected_speech_occurrences': report['independent_expected_speech_occurrences'], 'missing_speech_count': len(missing), 'removed_phrase_count': len(removed), 'unexplained_removed_count': len(unexplained_removed), 'added_phrase_count': report['added_phrase_count'], 'wall_seconds': report['wall_seconds']}))

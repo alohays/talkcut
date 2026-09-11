@@ -1,0 +1,36 @@
+"""Synthetic constructor-caller metadata fixture; never historical execution."""
+from pathlib import Path
+from types import SimpleNamespace
+import pytest
+from talkcut.project import artifact_ref, atomic_json
+native = SimpleNamespace(ROOT=Path(__file__).resolve().parents[2], ref=artifact_ref, save=atomic_json)
+
+def launch_fixture(tmp_path):
+    from talkcut.contracts import code_identity, freeze_contract
+
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"authored source fixture")
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"not played; binding-only fixture")
+    contract = tmp_path / "contract.json"
+    freeze_contract(native.ROOT, contract)
+    value = {
+        "schema_version": "private-native-audio-launch/v1",
+        "purpose": "binding test only",
+        "audio": native.ref(audio),
+        "source_artifacts": {"screen": native.ref(source)},
+        "contract": native.ref(contract),
+        "dependencies": {
+            "source_hashes": {"screen": native.ref(source)["sha256"]},
+            "contract_hash": native.ref(contract)["sha256"],
+            "code_tree_hash": code_identity(native.ROOT)["code_tree_hash"],
+        },
+    }
+    launch = tmp_path / "launch.json"
+    native.save(launch, value)
+    return launch, value
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_actual_tiny_child_transport_case_and_summary_binding(tmp_path, changed):
+    launch, value = launch_fixture(tmp_path)
+    assert value["contract"]["path"] == str(launch.parent / "contract.json")

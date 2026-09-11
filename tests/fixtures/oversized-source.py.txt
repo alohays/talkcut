@@ -1,0 +1,1504 @@
+"""Scan exact Git history and publication bytes without publishing anything.
+
+Unknown binaries, links, unreadable members and exhausted traversal limits stay
+UNVERIFIED. Corpus matches and credentials are findings, never printed secrets.
+Remote GitHub bytes must match supplied local publication refs before final
+publication measurements can pass. No command is executed from an input record.
+"""
+
+from __future__ import annotations
+
+import ast
+import gzip
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import tarfile
+import tempfile
+import threading
+import zipfile
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+from typing import Any
+from urllib.parse import quote
+
+from .contracts import code_identity
+from .project import TalkCutError, artifact_ref, load_project, sha256
+from .verification import _terminate_group
+
+MAX_UNIT_BYTES = 16 * 1024 * 1024
+MAX_TOTAL_BYTES = 256 * 1024 * 1024
+MAX_UNITS = 20000
+MAX_DEPTH = 5
+MAX_COMMITS = 10000
+# Finite traversal safeguard, not a quality/coverage denominator. Real preserved
+# whole-frame evidence can exceed 100,000 files; every file still enters inventory.
+MAX_TASK_FILES = 1000000
+CREDENTIALS = {
+    "private_key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
+    "github_token": re.compile(r"\b(?:gh[opusr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
+    "aws_access_key": re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+    "api_secret_key": re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,}\b"),
+}
+
+
+def _require(condition: Any, message: str) -> None:
+    if not condition:
+        raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", message)
+
+
+def _file(ref: Any) -> Path:
+    _require(isinstance(ref, dict) and ref.get("path") and ref.get("sha256"), "A hashed publication artifact is required")
+    path = Path(ref["path"])
+    _require(path.is_absolute() and path.is_file() and not path.is_symlink(), "Publication artifact is absent or a symlink")
+    _require(sha256(path) == ref["sha256"], "Publication artifact changed")
+    if "bytes" in ref:
+        _require(path.stat().st_size == ref["bytes"], "Publication artifact byte count changed")
+    return path
+
+
+def _json(ref: Any) -> Any:
+    return json.loads(_file(ref).read_text())
+
+
+def _command(argv: list[str], cwd: Path, traces: list[dict[str, Any]], *, limit: int = MAX_UNIT_BYTES) -> bytes:
+    """Read bounded actual stdout, with process-group timeout and no shell."""
+    timed_out = threading.Event()
+    with tempfile.TemporaryFile() as stderr:
+        process = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=stderr, start_new_session=True)
+
+        def stop():
+            timed_out.set()
+            _terminate_group(process)
+
+        timer = threading.Timer(60, stop)
+        timer.daemon = True
+        timer.start()
+        assert process.stdout is not None
+        try:
+            output = process.stdout.read(limit + 1)
+            if len(output) > limit:
+                _terminate_group(process)
+            code = process.wait(timeout=10)
+        finally:
+            timer.cancel()
+            process.stdout.close()
+            if process.poll() is None:
+                _terminate_group(process)
+        stderr.seek(0)
+        error = stderr.read(MAX_UNIT_BYTES + 1)
+    traces.append({"argv": argv, "cwd": str(cwd), "exit_code": code, "timed_out": timed_out.is_set(),
+                   "stdout_bytes": len(output), "stdout_sha256": hashlib.sha256(output).hexdigest(),
+                   "stderr_bytes": len(error), "stderr_sha256": hashlib.sha256(error).hexdigest()})
+    _require(code == 0 and not timed_out.is_set() and len(output) <= limit and len(error) <= MAX_UNIT_BYTES,
+             "Actual publication inspection command failed, timed out or exceeded its byte limit")
+    return output
+
+
+@dataclass
+class Scan:
+    private: dict[str, str]
+    phrases: list[str]
+    units: list[dict[str, Any]] = field(default_factory=list)
+    unknown: list[dict[str, str]] = field(default_factory=list)
+    findings: list[dict[str, str]] = field(default_factory=list)
+    seen: set[str] = field(default_factory=set)
+    credentials: set[str] = field(default_factory=set)
+    media: set[str] = field(default_factory=set)
+    transcripts: set[str] = field(default_factory=set)
+    total_bytes: int = 0
+    exhausted: bool = False
+
+    def unverified(self, label: str, reason: str) -> None:
+        self.unknown.append({"location": label, "reason": reason})
+
+    def payload(self, data: bytes, label: str, *, depth: int = 0, path: str | None = None) -> None:
+        if self.exhausted:
+            return
+        digest = hashlib.sha256(data).hexdigest()
+        if path is not None:
+            parts = PurePosixPath(path).parts
+            if PurePosixPath(path).is_absolute() or ".." in parts:
+                self.unverified(label, "Unsafe publication member path")
+                return
+            if "projects" in parts or any(part == ".env" or (part.startswith(".env.") and part not in {".env.example", ".env.sample"}) for part in parts):
+                self.unverified(label, "Private project/environment path appears in publication payload")
+        if digest in self.private:
+            kind = self.private[digest]
+            if kind == "media":
+                self.media.add(digest)
+            elif kind in {"transcript", "review"}:
+                self.transcripts.add(digest)
+            elif kind == "credentials":
+                self.credentials.add(digest)
+            self.findings.append({"kind": "private_" + kind, "location": label, "sha256": digest})
+            return
+        if digest in self.seen:
+            return
+        if depth > MAX_DEPTH or len(self.units) >= MAX_UNITS or len(data) > MAX_UNIT_BYTES or self.total_bytes + len(data) > MAX_TOTAL_BYTES:
+            self.unverified(label, "Publication traversal budget exceeded; content was not fully inspected")
+            self.exhausted = True
+            return
+        self.seen.add(digest)
+        self.total_bytes += len(data)
+        self.units.append({"location": label, "sha256": digest, "bytes": len(data)})
+        try:
+            if data.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
+                with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                    entries = archive.infolist()
+                    if len(entries) > MAX_UNITS or len({entry.filename for entry in entries}) != len(entries):
+                        self.unverified(label, "ZIP has too many or duplicate member paths")
+                        return
+                    for entry in entries:
+                        if self.exhausted:
+                            break
+                        if entry.is_dir():
+                            continue
+                        if (entry.external_attr >> 16) & 0o170000 == 0o120000:
+                            self.unverified(label + "!" + entry.filename, "Archive symlink was not followed")
+                        elif entry.file_size > MAX_UNIT_BYTES:
+                            self.unverified(label + "!" + entry.filename, "Archive member exceeds inspection bound")
+                        else:
+                            self.payload(archive.read(entry), label + "!" + entry.filename, depth=depth + 1, path=entry.filename)
+                return
+            if data.startswith(b"\x1f\x8b"):
+                with gzip.GzipFile(fileobj=io.BytesIO(data)) as compressed:
+                    unpacked = compressed.read(MAX_UNIT_BYTES + 1)
+                if len(unpacked) > MAX_UNIT_BYTES:
+                    self.unverified(label, "Gzip expansion exceeds inspection bound")
+                else:
+                    self.payload(unpacked, label + "!gzip", depth=depth + 1)
+                return
+            if len(data) >= 512 and data[257:262] == b"ustar":
+                with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tar_archive:
+                    tar_entries = tar_archive.getmembers()
+                    if len(tar_entries) > MAX_UNITS or len({entry.name for entry in tar_entries}) != len(tar_entries):
+                        self.unverified(label, "TAR has too many or duplicate member paths")
+                        return
+                    for tar_entry in tar_entries:
+                        if self.exhausted:
+                            break
+                        if tar_entry.isdir():
+                            continue
+                        if not tar_entry.isfile() or tar_entry.issparse():
+                            self.unverified(label + "!" + tar_entry.name, "Archive link or special member was not followed")
+                        elif tar_entry.size > MAX_UNIT_BYTES:
+                            self.unverified(label + "!" + tar_entry.name, "Archive member exceeds inspection bound")
+                        else:
+                            handle = tar_archive.extractfile(tar_entry)
+                            if handle is None:
+                                self.unverified(label + "!" + tar_entry.name, "Archive member cannot be read")
+                            else:
+                                with handle:
+                                    self.payload(handle.read(MAX_UNIT_BYTES + 1), label + "!" + tar_entry.name, depth=depth + 1, path=tar_entry.name)
+                return
+            text = data.decode("utf-8")
+            if "\x00" in text or any(ord(char) < 32 and char not in "\n\r\t\f" for char in text):
+                self.unverified(label, "Unknown binary/control-byte payload")
+                return
+            for kind, pattern in CREDENTIALS.items():
+                for match in pattern.finditer(text):
+                    secret_hash = hashlib.sha256(match.group().encode()).hexdigest()
+                    self.credentials.add(secret_hash)
+                    self.findings.append({"kind": kind, "location": label, "matched_sha256": secret_hash})
+            for phrase in self.phrases:
+                if phrase in text:
+                    phrase_hash = hashlib.sha256(phrase.encode()).hexdigest()
+                    self.transcripts.add(phrase_hash)
+                    self.findings.append({"kind": "protected_transcript_phrase", "location": label, "matched_sha256": phrase_hash})
+        except (UnicodeDecodeError, ValueError, OSError, RuntimeError, EOFError, zipfile.BadZipFile, tarfile.TarError) as exc:
+            self.unverified(label, f"Unreadable or unsupported payload: {type(exc).__name__}")
+
+
+def _git_inventory(root: Path, expected_head: str, scanner: Scan, traces: list[dict[str, Any]]) -> dict[str, Any]:
+    def git(*args: str, limit: int = MAX_UNIT_BYTES) -> bytes:
+        return _command(["git", *args], root, traces, limit=limit)
+
+    head = git("rev-parse", "--verify", "HEAD").decode().strip()
+    _require(head == expected_head and re.fullmatch(r"[a-f0-9]{40,64}", head), "Publication HEAD changed")
+    refs = git("for-each-ref", "--format=%(refname) %(objectname) %(objecttype)")
+    commits = git("rev-list", "--all", "HEAD").decode().splitlines()
+    _require(0 < len(commits) <= MAX_COMMITS and len(commits) == len(set(commits)), "Reachable history is empty or exceeds inspection bounds")
+    blobs: dict[str, set[str]] = {}
+    for commit in commits:
+        if scanner.exhausted:
+            break
+        _require(re.fullmatch(r"[a-f0-9]{40,64}", commit), "Invalid reachable commit identity")
+        scanner.payload(git("cat-file", "commit", commit), "git-commit:" + commit)
+        tree = git("ls-tree", "-r", "-z", "--full-tree", commit)
+        for item in tree.split(b"\0"):
+            if not item:
+                continue
+            header, raw_path = item.split(b"\t", 1)
+            mode, kind, oid = header.decode("ascii").split()
+            try:
+                name = raw_path.decode("utf-8")
+            except UnicodeDecodeError:
+                scanner.unverified("git-tree:" + commit, "Non-UTF8 path was not interpreted")
+                continue
+            if mode not in {"100644", "100755"} or kind != "blob":
+                scanner.unverified("git:" + commit + ":" + name, "Git symlink, submodule or unsupported mode")
+                continue
+            blobs.setdefault(oid, set()).add(name)
+            if len(blobs) > MAX_UNITS:
+                raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Reachable blob count exceeds inspection bound")
+    for oid, paths in blobs.items():
+        if scanner.exhausted:
+            break
+        size = int(git("cat-file", "-s", oid).decode().strip())
+        if size > MAX_UNIT_BYTES:
+            scanner.unverified("git-blob:" + oid, "Reachable blob exceeds inspection byte bound")
+            continue
+        content = git("cat-file", "blob", oid)
+        _require(len(content) == size, "Git object size changed during inspection")
+        for name in sorted(paths):
+            scanner.payload(content, "git-blob:" + oid + ":" + name, path=name)
+    # Annotated tag messages are public bytes too, including nested annotations.
+    pending = [line.split()[1] for line in refs.decode().splitlines() if line.split()[2] == "tag"]
+    tags: set[str] = set()
+    while pending:
+        tag = pending.pop()
+        if tag in tags:
+            continue
+        _require(len(tags) < MAX_UNITS, "Annotated tag traversal exceeds inspection bound")
+        tags.add(tag)
+        content = git("cat-file", "tag", tag)
+        scanner.payload(content, "git-tag:" + tag)
+        if b"\ntype tag\n" in content:
+            pending.append(content.splitlines()[0].split()[1].decode())
+    _require(git("rev-parse", "--verify", "HEAD").decode().strip() == head
+             and git("for-each-ref", "--format=%(refname) %(objectname) %(objecttype)") == refs,
+             "Git refs changed during publication scanning")
+    return {"head": head, "reachable_commits": commits, "reachable_blob_count": len(blobs),
+            "blob_paths": {oid: sorted(paths) for oid, paths in blobs.items()},
+            "refs_sha256": hashlib.sha256(refs).hexdigest(), "annotated_tags": sorted(tags)}
+
+
+def _asset_refs(values: Any) -> dict[str, dict[str, Any]]:
+    _require(isinstance(values, list), "Explicit publication asset inventory is required")
+    refs = {}
+    for ref in values:
+        _require(isinstance(ref, dict) and isinstance(ref.get("name"), str)
+                 and ref["name"] == Path(ref["name"]).name and ref["name"] not in refs, "Publication asset names are absent, unsafe or duplicated")
+        _file(ref)
+        refs[ref["name"]] = ref
+    return refs
+
+
+def _remote(raw: dict[str, Any], root: Path, assets: dict[str, dict[str, Any]], traces: list[dict[str, Any]]) -> dict[str, Any] | None:
+    settings = raw.get("remote_publication")
+    if not settings:
+        return None
+    origin = _command(["git", "remote", "get-url", "origin"], root, traces).decode().strip()
+    match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?", origin)
+    _require(match is not None and settings.get("repository") == match.group(1), "Remote publication is not the configured GitHub repository")
+    assert match is not None
+    repository = match.group(1)
+    number, tag = settings.get("pr_number"), settings.get("tag")
+    _require(type(number) is int and number > 0 and isinstance(tag, str) and tag, "Exact remote PR number and release tag are required")
+
+    def api(endpoint: str) -> Any:
+        return json.loads(_command(["gh", "api", "--hostname", "github.com", endpoint], root, traces))
+
+    pull = api(f"repos/{repository}/pulls/{number}")
+    release = api(f"repos/{repository}/releases/tags/{quote(tag, safe='')}")
+    tagged = api(f"repos/{repository}/commits/{quote(tag, safe='')}")
+    _require(tagged.get("sha") == raw["expected_head"], "Remote release tag does not identify the scanned Git HEAD")
+    _require(pull.get("merged_at") and pull.get("merge_commit_sha") == raw["expected_head"], "Merged PR does not identify the final scanned release commit")
+    _require((pull.get("body") or "").encode() == _file(raw["pr_body"]).read_bytes()
+             and (release.get("body") or "").encode() == _file(raw["release_body"]).read_bytes(),
+             "Remote PR/release body bytes differ from scanned publication bodies")
+    remote_assets = release.get("assets")
+    _require(isinstance(remote_assets, list) and len(remote_assets) == len(assets)
+             and {item["name"] for item in remote_assets} == set(assets), "Remote release assets differ from explicit scanned inventory")
+    for item in remote_assets:
+        ref = assets[item["name"]]
+        _require(type(item.get("id")) is int and 0 <= item.get("size", -1) <= MAX_UNIT_BYTES
+                 and item["size"] == _file(ref).stat().st_size, "Remote release asset size is unsupported or changed")
+        downloaded = _command(["gh", "api", "--hostname", "github.com", "-H", "Accept: application/octet-stream",
+                               f"repos/{repository}/releases/assets/{item['id']}"], root, traces)
+        _require(hashlib.sha256(downloaded).hexdigest() == ref["sha256"], "Actual remote asset bytes differ from the scanned local file")
+    return {"repository": repository, "pr_url": pull["html_url"], "release_url": release["html_url"],
+            "release_id": release["id"], "tag": tag, "head": tagged["sha"],
+            "asset_ids": {item["name"]: item["id"] for item in remote_assets},
+            "body_and_asset_bytes_match": True}
+
+
+def _public_source_candidates(root: Path | None, registered: set[str]) -> tuple[dict[str, list[dict[str, str]]], list[dict[str, Any]], set[str]]:
+    """Find byte identities, never infer privacy or a license from Git membership."""
+    if root is None or not (root / ".git").exists():
+        return {}, [], set()
+    traces: list[dict[str, Any]] = []
+    commits = _command(["git", "rev-list", "--all", "HEAD"], root, traces).decode().splitlines()
+    _require(len(commits) <= MAX_COMMITS, "Public-source candidate history exceeds inspection bounds")
+    objects: dict[str, list[dict[str, str]]] = {}
+    for commit in commits:
+        tree = _command(["git", "ls-tree", "-r", "-z", "--full-tree", commit], root, traces)
+        for row in tree.split(b"\0"):
+            if not row:
+                continue
+            header, raw_path = row.split(b"\t", 1)
+            mode, kind, oid = header.decode("ascii").split()
+            name = raw_path.decode("utf-8")
+            parts = PurePosixPath(name).parts
+            source_path = parts[0] in {"src", "tests", "examples", "docs", "schemas", ".github"} or name in {
+                "README.md", "LICENSE", "CONTRIBUTING.md", "SECURITY.md", "pyproject.toml", "uv.lock", "pytest.ini"}
+            if source_path and mode in {"100644", "100755"} and kind == "blob":
+                objects.setdefault(oid, []).append({"commit": commit, "git_path": name, "git_blob": oid})
+    _require(len(objects) <= MAX_UNITS, "Public-source candidate object count exceeds inspection bounds")
+    candidates: dict[str, list[dict[str, str]]] = {}
+    transcript_hashes: set[str] = set()
+
+    def transcript_body(value: Any) -> bool:
+        if isinstance(value, dict):
+            return (value.get("schema_version") == "transcript/v1" and value.get("source_sha256") in registered
+                    or any(transcript_body(child) for child in value.values()))
+        return isinstance(value, list) and any(transcript_body(child) for child in value)
+    for oid, origins in objects.items():
+        size = int(_command(["git", "cat-file", "-s", oid], root, traces).decode())
+        if size > MAX_UNIT_BYTES:
+            continue
+        data = _command(["git", "cat-file", "blob", oid], root, traces)
+        # Binary fixtures are never a source-code privacy exception.
+        try:
+            decoded = data.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if "\x00" not in decoded:
+            digest = hashlib.sha256(data).hexdigest()
+            candidates[digest] = origins
+            try:
+                if transcript_body(json.loads(decoded)):
+                    transcript_hashes.add(digest)
+            except ValueError:
+                pass
+    return candidates, traces, transcript_hashes
+
+
+def _known_private_inventory(project_dir: Path | None, expected_source_hashes: dict[str, str] | None,
+                             repo_root: Path | None = None, *,
+                             historical_artifacts: list[dict[str, Any]] | None = None,
+                             source_snapshots: list[dict[str, Any]] | None = None,
+                             publication_bodies: dict[str, dict[str, Any]] | None = None,
+                             synthetic_negative_runs: list[dict[str, Any]] | None = None,
+                             synthetic_replay: dict[str, Any] | None = None,
+                             auxiliary_metadata_history: list[dict[str, Any]] | None = None) -> tuple[dict[str, str], list[str], dict[str, Any]]:
+    """Derive mandatory exclusions from the evaluator's registered task.
+
+    Project source identities come from the evaluator, never the corpus author.
+    This graph supplies mandatory entries. Remaining files in this task project
+    and its provenance references need the bounded inventory/classification
+    audit below. Unrelated personal files elsewhere on the computer are outside
+    this check's scope.
+    """
+    unavailable = {"completeness": "UNVERIFIED", "known_refs": [], "reason": "Evaluator-bound project and source identities are required"}
+    if project_dir is None or not expected_source_hashes:
+        return {}, [], unavailable
+    directory = project_dir.resolve()
+    project = load_project(directory)
+    registered = {role: value["sha256"] for role, value in project["sources"].items()}
+    _require(all(registered.get(role) == digest for role, digest in expected_source_hashes.items())
+             and all(role in expected_source_hashes for role in ("screen", "speaker")),
+             "Privacy inventory differs from evaluator-registered sources")
+    fixture_claims, fixture_observations = _synthetic_failure_inventory(synthetic_negative_runs, repo_root, set(registered.values()), replay_ref=synthetic_replay)
+    known: dict[str, str] = {}
+    refs: dict[str, dict[str, Any]] = {}
+    pending: list[tuple[Path, str]] = []
+    json_scheduled: set[str] = set()
+    phrases: set[str] = set()
+    unfollowed: list[dict[str, Any]] = []
+    historical_refs: dict[tuple[str, str], dict[str, Any]] = {}
+    auxiliary_observations: dict[tuple[str, str], dict[str, Any]] = {}
+    auxiliary_locators: dict[tuple[str, str], dict[str, Any]] = {}
+    public_candidates: dict[str, dict[str, Any]] = {}
+    unresolved_sources: dict[tuple[str, str], dict[str, Any]] = {}
+    source_candidates, source_candidate_commands, git_transcripts = _public_source_candidates(repo_root, set(registered.values()))
+    source_paths = {str((repo_root / origin["git_path"]).resolve())
+                    for origins in source_candidates.values() for origin in origins} if repo_root else set()
+    source_locators: dict[tuple[str, str], dict[str, Any]] = {}
+    source_snapshot_hashes: set[str] = set()
+    body_candidates: dict[tuple[str, str], str] = {}
+    for role, ref in (publication_bodies or {}).items():
+        _require(role in {"pr_body", "release_body"}, "Unknown publication body role")
+        path = _file(ref)
+        body_candidates[(str(path), ref["sha256"])] = role
+    auxiliary_source_edges: set[tuple[str, str]] = set()
+    auxiliary_source_current: list[dict[str, Any]] = []
+    _require(auxiliary_metadata_history is None or isinstance(auxiliary_metadata_history, list),
+             "Auxiliary metadata history requires explicit original/snapshot locators")
+    def read_auxiliary_edges(value: Any) -> None:
+        if isinstance(value, dict):
+            if isinstance(value.get("path"), str) and isinstance(value.get("sha256"), str):
+                auxiliary_source_edges.add((value["path"], value["sha256"]))
+            for child in value.values():
+                read_auxiliary_edges(child)
+        elif isinstance(value, list):
+            for child in value:
+                read_auxiliary_edges(child)
+    for locator in auxiliary_metadata_history or []:
+        read_auxiliary_edges(_auxiliary_json(_file(locator["snapshot"]), repo_root, set(registered.values())))
+        _auxiliary_json(Path(locator["original"]["path"]), repo_root, set(registered.values()))
+    _require(source_snapshots is None or isinstance(source_snapshots, list), "Source snapshots must be explicit original/snapshot pairs")
+    for locator in source_snapshots or []:
+        original, snapshot = locator["original"], locator["snapshot"]
+        origin = Path(original["path"])
+        if locator.get("scope") == "auxiliary_execution_source":
+            _require(origin.is_absolute() and origin == origin.resolve() and origin.is_relative_to(directory)
+                     and origin.suffix.lower() in {".py", ".pyi"} and origin.is_file() and not origin.is_symlink()
+                     and not any(origin.is_relative_to(directory / name) for name in ("sources", "renders", "reviews", "review", "transcripts"))
+                     and (str(origin), original["sha256"]) in auxiliary_source_edges,
+                     "Auxiliary execution source requires an exact preserved metadata edge and canonical task source path")
+            for source_path in (origin, _file(snapshot)):
+                _require(source_path.stat().st_size <= MAX_UNIT_BYTES and sha256(source_path) not in set(registered.values()),
+                         "Registered media/source cannot become auxiliary execution code")
+                try:
+                    source_text = source_path.read_text()
+                    ast.parse(source_text)
+                except (ValueError, SyntaxError, UnicodeDecodeError) as exc:
+                    raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Auxiliary execution source must be inspectable Python source bytes") from exc
+                try:
+                    json_source = json.loads(source_text)
+                except ValueError:
+                    json_source = None
+                if isinstance(json_source, dict):
+                    _auxiliary_json(source_path, repo_root, set(registered.values()))
+        else:
+            _require(locator.get("scope") is None and repo_root is not None and origin.is_absolute() and origin == origin.resolve() and any(
+                origin.is_relative_to(repo_root / name) for name in ("src", "tests", "examples", "docs", "schemas", ".github")),
+                "A source snapshot locator must name a canonical public source path")
+        _require(original["sha256"] == snapshot["sha256"], "Preserved source snapshot differs from its original digest")
+        _file(snapshot)
+        source_locators[(str(origin), original["sha256"])] = snapshot
+        source_snapshot_hashes.add(original["sha256"])
+        if locator.get("scope") == "auxiliary_execution_source":
+            auxiliary_source_current.append({"original_reference": original, "preserved_ref": snapshot,
+                                             "current_ref": artifact_ref(origin), "classification": "UNCLASSIFIED",
+                                             "scope": "Auxiliary execution source bytes only; independent content classification required"})
+    preserved_by_hash: dict[str, dict[str, Any]] = {}
+    _require(historical_artifacts is None or isinstance(historical_artifacts, list),
+             "Historical private artifact locators must be an explicit list")
+    for ref in historical_artifacts or []:
+        _file(ref)
+        preserved_by_hash[ref["sha256"]] = ref
+    _require(auxiliary_metadata_history is None or isinstance(auxiliary_metadata_history, list),
+             "Auxiliary metadata history requires explicit original/snapshot locators")
+    for locator in auxiliary_metadata_history or []:
+        original, snapshot = locator["original"], locator["snapshot"]
+        original_path = Path(original["path"])
+        _require(original_path.is_absolute() and original_path == original_path.resolve()
+                 and original_path.is_relative_to(directory) and original_path.is_file() and not original_path.is_symlink(),
+                 "Auxiliary metadata origin must be an actual canonical task file")
+        _require(original["sha256"] == snapshot["sha256"] and str(_file(snapshot)) != str(original_path),
+                 "Auxiliary metadata snapshot does not preserve the declared separate bytes")
+        key = (str(original_path), original["sha256"])
+        _require(key not in auxiliary_locators or auxiliary_locators[key] == snapshot, "Conflicting auxiliary metadata locators")
+        auxiliary_locators[key] = snapshot
+    digests = set(registered.values())
+    media_suffixes = {".mp4", ".mov", ".webm", ".mkv", ".wav", ".mp3", ".aac", ".m4a", ".flac", ".png", ".jpg", ".jpeg"}
+    rank = {"review": 0, "transcript": 1, "media": 2}
+
+    def explicit_transcript(value: Any) -> bool:
+        return (isinstance(value, dict) and value.get("schema_version") == "transcript/v1"
+                and value.get("source_sha256") in digests)
+
+    def contains_transcript(value: Any) -> bool:
+        if explicit_transcript(value):
+            return True
+        if isinstance(value, dict):
+            return any(contains_transcript(child) for child in value.values())
+        return isinstance(value, list) and any(contains_transcript(child) for child in value)
+
+    def protect_values(value: Any, key: str = "") -> None:
+        """Protect this file's private strings; never follow its artifact refs."""
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                protect_values(child, child_key)
+        elif isinstance(value, list):
+            for child in value:
+                protect_values(child, key)
+        elif (isinstance(value, str) and len(value.strip()) >= 40 and
+              (key in {"text", "word", "utterance", "transcript", "sentence"}
+               or (not Path(value).is_absolute() and not re.fullmatch(r"[a-f0-9]{64}", value)))):
+            phrases.add(value)
+
+    def inspect_text(path: Path, protect: bool, parse_json: bool = False) -> None:
+        if path.stat().st_size > MAX_UNIT_BYTES:
+            return
+        try:
+            body = path.read_text()
+        except UnicodeDecodeError:
+            return  # Exact binary bytes remain mandatory, without a text claim.
+        try:
+            value = json.loads(body)
+        except ValueError:
+            if protect:
+                phrases.update(line for line in body.splitlines() if len(line.strip()) >= 40)
+        else:
+            if protect or explicit_transcript(value):
+                protect_values(value)
+            if str(path) not in json_scheduled and (protect or parse_json or path.suffix.lower() == ".json"):
+                pending.append((path, refs[str(path)]["kind"]))
+                json_scheduled.add(str(path))
+
+    def add(path: Path, kind: str, expected: str | None = None, *,
+            historical: bool = False, parse_json: bool = False) -> None:
+        _require(path.is_absolute() and path.is_file() and not path.is_symlink(), "Known private artifact is missing or is a symlink")
+        name = str(path)
+        ref = refs.get(name) or artifact_ref(path)
+        if (expected is not None and ref["sha256"] != expected and historical and kind == "review"
+                and path in {directory / relative for relative in (
+                    "acceptance.local.json", "checkpoint.local.json", "project.json", "reports/acceptance-latest.local.json")}):
+            # A checkpoint can truthfully describe an earlier mutable index.
+            # Only these typed bookkeeping paths can have historical versions;
+            # source, transcript and render references still require exact bytes.
+            _bookkeeping(path, directory)
+            _require(re.fullmatch(r"[a-f0-9]{64}", expected), "Historical bookkeeping digest is invalid")
+            add(path, kind)
+            key = (name, expected)
+            if key in historical_refs:
+                return
+            preserved = preserved_by_hash.get(expected)
+            row: dict[str, Any] = {"path": name, "sha256": expected, "kind": kind,
+                                   "current_ref": {"path": name, "sha256": ref["sha256"]}}
+            historical_refs[key] = row
+            if preserved is None:
+                # This is a deny-list digest, not an assertion that its bytes
+                # were read. No artifact ref is fabricated, and unresolved
+                # history prevents an inventory/audit completeness verdict.
+                known.setdefault(expected, "review")
+                row.update({"status": "UNVERIFIED", "reason": "Historical bookkeeping bytes are not preserved by an explicit verified locator"})
+                return
+            old_path = _file(preserved)
+            _require(old_path.stat().st_size <= MAX_UNIT_BYTES, "Historical bookkeeping exceeds the metadata inspection bound")
+            _private_bookkeeping_payload(path.relative_to(directory).as_posix(), old_path.read_bytes(), directory=directory)
+            add(old_path, kind, expected, parse_json=True)
+            row.update({"status": "RESOLVED", "preserved_ref": {"path": str(old_path), "sha256": expected}})
+            return
+        auxiliary = auxiliary_locators.get((name, expected)) if expected is not None else None
+        if expected is not None and ref["sha256"] != expected and historical and kind == "review" and auxiliary is not None:
+            _require(expected not in digests and ref["sha256"] not in digests,
+                     "Registered source cannot become auxiliary history")
+            old_path = _file(auxiliary)
+            _require(path.stat().st_size <= MAX_UNIT_BYTES and old_path.stat().st_size <= MAX_UNIT_BYTES,
+                     "Auxiliary metadata exceeds the bounded JSON inspection limit")
+            _auxiliary_json(old_path, repo_root, digests)
+            _auxiliary_json(path, repo_root, digests)
+            _require(sha256(path) == ref["sha256"], "Auxiliary current bytes changed during observation")
+            key = (name, expected)
+            if key in auxiliary_observations:
+                return
+            auxiliary_observations[key] = {"original_reference": {"path": name, "sha256": expected},
+                                          "preserved_ref": auxiliary, "current_ref": {"path": name, "sha256": ref["sha256"]},
+                                          "bytes_status": "OBSERVED", "claim_status": "UNVERIFIED",
+                                          "classification": "review", "scope": "Private byte inventory only; no acceptance evidence validation"}
+            add(path, kind, parse_json=True)
+            add(old_path, kind, expected, parse_json=True)
+            # This file's private strings are protected without propagating a
+            # speech label to its runtime/source-code asset references.
+            inspect_text(path, True, parse_json=True)
+            inspect_text(old_path, True, parse_json=True)
+            return
+        if name in refs:
+            _require(expected is None or refs[name]["sha256"] == expected, "Known private reference was relabelled")
+            if rank[kind] > rank[refs[name]["kind"]]:
+                refs[name]["kind"] = kind
+            if rank[kind] > rank.get(known.get(ref["sha256"], ""), -1):
+                known[ref["sha256"]] = kind
+            if kind == "transcript" or parse_json:
+                inspect_text(path, kind == "transcript", parse_json)
+            return
+        _require(len(refs) < MAX_UNITS, "Known private graph exceeds inspection limits")
+        _require(expected is None or ref["sha256"] == expected, "Known private artifact differs from its registered hash")
+        refs[name] = {**ref, "kind": kind}
+        if rank[kind] > rank.get(known.get(ref["sha256"], ""), -1):
+            known[ref["sha256"]] = kind
+        if kind == "transcript" or parse_json or path.suffix.lower() == ".json":
+            inspect_text(path, kind == "transcript", parse_json)
+
+    def walk(value: Any, transcript: bool = False, key: str = "") -> None:
+        if key in {"toolchain", "producer", "code_identity", "tools_before", "tools_after"} and not transcript and not contains_transcript(value):
+            return
+        if isinstance(value, dict):
+            transcript = transcript or explicit_transcript(value)
+            if transcript:
+                protect_values(value)
+            if isinstance(value.get("path"), str) and isinstance(value.get("sha256"), str):
+                path = Path(value["path"])
+                code_or_archive = path.suffix.lower() in {".py", ".pyi", ".pyc", ".so", ".dylib", ".whl"} or path.name.endswith(".tar.gz")
+                kind = "media" if value["sha256"] in digests else "transcript" if transcript else "media" if path.suffix.lower() in media_suffixes else "review"
+                canonical_path = path if path.is_absolute() else (repo_root or directory) / path
+                transcript = transcript or value["sha256"] in git_transcripts
+                if transcript and kind != "media":
+                    kind = "transcript"
+                public_code = repo_root is not None and any(
+                    canonical_path.resolve() == (repo_root / origin["git_path"]).resolve()
+                    for origin in source_candidates.get(value["sha256"], []))
+                fixture = fixture_claims.get((str(canonical_path), value["sha256"]))
+                if fixture is not None:
+                    _require(not transcript and value["sha256"] not in digests,
+                             "Private source/transcript cannot use synthetic failure provenance")
+                    for actual_ref in (fixture["preserved_original"], fixture["actual_current"]):
+                        collect_candidate(Path(actual_ref["path"]), actual_ref, actual_ref)
+                    # The false digest remains a labelled claim; both actual
+                    # byte versions use truthful refs and remain in the corpus.
+                elif transcript or value["sha256"] in known:
+                    # Registered private provenance outranks suffixes, Git byte
+                    # coincidences and paths inside public-code directories.
+                    add(canonical_path, kind if transcript else known[value["sha256"]], value["sha256"], historical=True)
+                elif not public_code and kind != "media" and (code_or_archive or value["sha256"] in source_candidates or value["sha256"] in source_snapshot_hashes
+                                                              or (str(canonical_path), value["sha256"]) in body_candidates):
+                    # References from an ASR/runtime/audit manifest do not make
+                    # copied code or packages lecture content. Keep the exact
+                    # files in the denominator as UNCLASSIFIED, never public.
+                    candidate_path = path if path.is_absolute() else (repo_root or directory) / path
+                    original_ref = {"path": str(candidate_path), "sha256": value["sha256"]}
+                    ref = source_locators.get((str(candidate_path), value["sha256"]), original_ref)
+                    if (ref is original_ref and str(candidate_path) in source_paths
+                            and candidate_path == candidate_path.resolve() and not candidate_path.is_symlink()
+                            and candidate_path.is_file() and sha256(candidate_path) != value["sha256"]):
+                        _require(re.fullmatch(r"[a-f0-9]{64}", value["sha256"]), "Historical source digest is invalid")
+                        # This historical claim has no verified bytes. Keep it
+                        # outside actual artifact refs and block completeness;
+                        # unrelated payload/known-private observations can run.
+                        unresolved_sources[(str(candidate_path), value["sha256"])] = {
+                            **original_ref, "classification": "UNCLASSIFIED", "status": "UNVERIFIED",
+                            "current_ref": artifact_ref(candidate_path),
+                            "reason": "Historical source bytes are not preserved by an explicit verified locator"}
+                    else:
+                        collect_candidate(candidate_path, original_ref, ref)
+                elif not public_code and path.is_absolute() and (path.resolve().is_relative_to(directory) or value["sha256"] in digests or transcript):
+                    add(path, kind, value["sha256"], historical=True)
+                elif not public_code:
+                    unfollowed.append({"path": value["path"], "sha256": value["sha256"], "reason": "External/relative reference is not classified by the known private graph"})
+            for child_key, child in value.items():
+                walk(child, transcript, child_key)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child, transcript)
+
+    def collect_candidate(candidate_path: Path, original_ref: dict[str, Any], ref: dict[str, Any]) -> None:
+        actual_path = _file(ref)
+        # A JSON transcript renamed as code is still private. A
+        # source locator cannot restore changed transcript bytes.
+        candidate_body = None
+        if actual_path.stat().st_size <= MAX_UNIT_BYTES:
+            try:
+                candidate_body = json.loads(actual_path.read_text())
+            except (ValueError, UnicodeDecodeError):
+                candidate_body = None
+        if contains_transcript(candidate_body):
+            add(candidate_path, "transcript", ref["sha256"])
+        else:
+            role = body_candidates.get((str(candidate_path), ref["sha256"]))
+            candidate = {**ref, "classification": "UNCLASSIFIED",
+                         "reason": "Declared publication body requires independent content classification" if role else "Code/archive or matching source bytes require independent content and provenance classification",
+                         "matching_git_source_bytes": source_candidates.get(ref["sha256"], [])}
+            if role:
+                candidate["publication_role"] = role
+            if ref is not original_ref:
+                candidate["original_reference"] = original_ref
+                candidate["preservation"] = "Exact historical source bytes; no current-path equivalence or public approval"
+            public_candidates[str(actual_path)] = candidate
+            unfollowed.append({**ref, "reason": candidate["reason"]})
+
+    def contains_registered(value: Any) -> bool:
+        if isinstance(value, str):
+            return value in digests
+        if isinstance(value, dict):
+            return any(contains_registered(child) for child in value.values())
+        if isinstance(value, list):
+            return any(contains_registered(child) for child in value)
+        return False
+
+    if fixture_observations:
+        replay = fixture_observations[0]["current_reproduction"]
+        _require(not Path(replay["bundle"]["path"]).is_relative_to(directory),
+                 "Synthetic replay archive must be outside the task it inventories")
+        for ref in [replay["bundle"], *replay["artifacts"], *replay["external_inputs"]]:
+            collect_candidate(Path(ref["path"]), ref, ref)
+        for link in replay["external_tool_links"]:
+            unfollowed.append({"path": link["link_path"], "sha256": link["link_bytes_sha256"],
+                               "reason": "Exact current execution-tool alias; link bytes and canonical target both inventoried"})
+    for source in auxiliary_source_current:
+        original, preserved = source["original_reference"], source["preserved_ref"]
+        collect_candidate(Path(original["path"]), original, preserved)
+        ref = source["current_ref"]
+        collect_candidate(Path(ref["path"]), ref, ref)
+    # Explicit verified locators are a complete denominator even when the
+    # incoming metadata edge is under a normally skipped tool/producer key.
+    for (name, expected), snapshot in auxiliary_locators.items():
+        path, old_path = Path(name), _file(snapshot)
+        add(path, "review", expected, historical=True, parse_json=True)
+        add(old_path, "review", expected, parse_json=True)
+        inspect_text(path, True, parse_json=True)
+        inspect_text(old_path, True, parse_json=True)
+    for value in project["sources"].values():
+        add(Path(value["path"]), "media", value["sha256"])
+        add(Path(value["original_path"]), "media", value["sha256"])
+    add(directory / "project.json", "review")
+    for name in ("goal-handoff.local.json", "checkpoint.local.json", "preservation.local.json", "source-registration.local.json", "acceptance.local.json"):
+        if (directory / name).is_file():
+            add(directory / name, "review")
+    # This namespace explicitly stores this lecture's transcript artifacts.
+    # Generated public code copies and synthetic fixture trees are not inferred
+    # to be confidential merely because they share the project parent directory.
+    if (directory / "transcripts").is_dir():
+        for path in sorted((directory / "transcripts").rglob("*")):
+            if path.is_file():
+                kind = "media" if path.suffix.lower() in media_suffixes else "transcript"
+                add(path.absolute(), kind)
+    omitted_public_work = {"implementation-staging", "snapshot", "development-env", "isolated-env", "pytest-basetemp", "recovery-example", "editorial-policy-tmp"}
+    for base in ("renders", "reviews", "review", "analysis", "evidence", "capability", "checkpoints", "reports"):
+        for path in (directory / base).rglob("*.json"):
+            if omitted_public_work.intersection(path.relative_to(directory).parts) or path.stat().st_size > MAX_UNIT_BYTES:
+                continue
+            try:
+                value = json.loads(path.read_text())
+            except (ValueError, UnicodeDecodeError):
+                continue  # Completeness remains UNVERIFIED, never a zero count.
+            if contains_registered(value):
+                add(path.absolute(), "transcript" if isinstance(value, dict) and value.get("schema_version") == "transcript/v1" else "review")
+    for ref in (publication_bodies or {}).values():
+        path = _file(ref)
+        if ref["sha256"] in known:
+            add(path, known[ref["sha256"]], ref["sha256"])
+        else:
+            collect_candidate(path, ref, ref)
+    while pending:
+        path, kind = pending.pop()
+        try:
+            value = json.loads(path.read_text())
+        except (ValueError, UnicodeDecodeError):
+            continue
+        # Namespace/filename privacy protects this file's body, independently
+        # from the provenance of files it references. Only an explicit,
+        # source-bound transcript marker propagates across artifact edges.
+        walk(value)
+    fixture_hashes = {ref["sha256"] for observation in fixture_observations for row in observation["rows"]
+                      for ref in (row["preserved_original"], row["actual_current"])}
+    protected_fixture_hashes = {digest for digest in fixture_hashes if known.get(digest) in {"review", "transcript"}}
+    protected_fixture_hashes.update(ref["sha256"] for ref in refs.values() if ref["sha256"] in fixture_hashes and any(
+        Path(ref["path"]).is_relative_to(directory / name) for name in ("renders", "reviews", "review", "transcripts")))
+    _require(not protected_fixture_hashes, "Known private media/review/transcript cannot use synthetic failure provenance")
+    return known, sorted(phrases), {"completeness": "UNVERIFIED", "project": str(directory), "source_hashes": registered,
+        "known_refs": list(refs.values()), "known_ref_count": len(refs), "derived_phrase_count": len(phrases),
+        "unfollowed_refs": unfollowed,
+        "historical_refs": list(historical_refs.values()),
+        "auxiliary_metadata_history": list(auxiliary_observations.values()),
+        "auxiliary_execution_sources": auxiliary_source_current,
+        "synthetic_failure_fixtures": fixture_observations,
+        "historical_unresolved": [row for row in historical_refs.values() if row["status"] != "RESOLVED"],
+        "unresolved_source_candidates": list(unresolved_sources.values()),
+        "public_work_candidates": [row for row in public_candidates.values() if row["sha256"] not in known],
+        "public_source_candidate_commands": source_candidate_commands,
+        "scope": "Registered task project files and source/derived provenance references",
+        "reason": "Mandatory graph collected; exact task file inventory and separate classification audit have not yet been verified"}
+
+
+def _private_bookkeeping_payload(name: str, data: bytes, *, directory: Path | None = None) -> None:
+    value = json.loads(data)
+    schema, content, kind = {"acceptance.local.json": ("acceptance-index/v1", "checks", dict),
+                            "checkpoint.local.json": ("goal-checkpoint/v1", "criteria", dict),
+                            "reports/acceptance-latest.local.json": ("goal-acceptance/v1", "criteria", list),
+                            "project.json": ("talkcut-project/v1", "sources", dict)}[name]
+    _require(isinstance(value, dict) and value.get("schema_version") == schema
+             and value.get("owner_acceptance") == "pending" and isinstance(value.get(content), kind),
+             "Changed canonical metadata is not supported private bookkeeping")
+    if name == "project.json":
+        from .contracts import validate_project
+        validate_project(value)
+        _require(directory is not None, "Project history requires the registered project context")
+        assert directory is not None
+        current = load_project(directory, verify_sources=False)
+        identities = ("role", "path", "original_path", "sha256", "bytes", "durable")
+        old_sources = {role: {key: source.get(key) for key in identities} for role, source in value["sources"].items()}
+        current_sources = {role: {key: source.get(key) for key in identities} for role, source in current["sources"].items()}
+        _require(old_sources == current_sources, "Historical project changed registered source identities")
+        _require(len(value["events"]) == value["revision"] <= current["revision"]
+                 and value["events"] == current["events"][:value["revision"]],
+                 "Historical project is not a preserved revision of the current decision chain")
+
+
+def _bookkeeping(path: Path, directory: Path, *, referenced_input: bool = False) -> dict[str, Any] | None:
+    """Recognize bounded private measurement/index bytes; never certify their claims."""
+    try:
+        relative = path.relative_to(directory)
+    except ValueError:
+        if referenced_input:
+            _require(path.is_file() and not path.is_symlink() and path.stat().st_size <= MAX_UNIT_BYTES,
+                     "Referenced private measurement input is missing, linked or oversized")
+            value = json.loads(path.read_bytes())
+            if isinstance(value, dict) and value.get("schema_version") == "publication-privacy-input/v1":
+                _require(isinstance(value.get("archives"), list) and isinstance(value.get("release_assets"), list)
+                         and value.get("expected_head") and value.get("pr_body") and value.get("release_body"),
+                         "Referenced publication input is incomplete")
+                return {"kind": "review", "state": "private_referenced_publication_measurement_input"}
+        return None
+    states = {"acceptance.local.json": "private_acceptance_index", "checkpoint.local.json": "private_goal_checkpoint",
+              "project.json": "private_project_revision", "reports/acceptance-latest.local.json": "private_acceptance_report"}
+    index = relative.as_posix() in states
+    measurement = (len(relative.parts) == 3 and relative.parts[0] == "measurements"
+                   and re.fullmatch(r"measurement-[a-f0-9]{32}", relative.parts[1]))
+    if not index and not measurement:
+        return None
+    _require(path.is_file() and not path.is_symlink() and path.stat().st_size <= MAX_UNIT_BYTES,
+             "Private bookkeeping artifact is missing, linked or oversized")
+    data = path.read_bytes()
+    if measurement:
+        _require(path.name in {"stdout.json", "stderr.log", "execution.json", "receipt.json", "evidence.json", "run.json"},
+                 "Unknown new measurement artifact requires another inventory audit")
+        if path.name == "stderr.log":
+            data.decode("utf-8")
+            return {"kind": "review", "state": "private_execution_stderr"}
+        if path.name == "stdout.json" and not data:
+            return {"kind": "review", "state": "private_pending_stdout"}
+    value = json.loads(data)
+    _require(isinstance(value, dict), "Private bookkeeping must contain the expected JSON object")
+    if index:
+        _private_bookkeeping_payload(relative.as_posix(), data, directory=directory)
+        return {"kind": "review", "state": states[relative.as_posix()]}
+    schemas = {"stdout.json": "measurement-result/v1", "receipt.json": "execution-receipt/v1",
+               "evidence.json": "measurement-check/v1", "run.json": "measurement-run/v1"}
+    if path.name == "execution.json":
+        _require(isinstance(value.get("command"), list) and value.get("started_at") and value.get("finished_at")
+                 and value.get("stdout", {}).get("path") == str(path.parent / "stdout.json")
+                 and value.get("stderr", {}).get("path") == str(path.parent / "stderr.log"),
+                 "Changed measurement execution log has a different scope")
+    else:
+        _require(value.get("schema_version") == schemas[path.name], "Changed measurement artifact has an unsupported schema")
+        if path.name in {"receipt.json", "run.json"}:
+            _require(value.get("run_id") == relative.parts[1], "Measurement bookkeeping run identity differs from its directory")
+        if path.name == "receipt.json":
+            _require(str(value.get("operation", "")).startswith("check:") and value.get("owner_acceptance") == "pending",
+                     "Measurement receipt is outside the private bookkeeping operation")
+    return {"kind": "review", "state": "private_measurement_artifact"}
+
+
+def build_private_inventory(project_dir: str | Path, expected_source_hashes: dict[str, str],
+                            repo_root: str | Path, *, archive_dir: str | Path | None = None,
+                            historical_artifacts: list[dict[str, Any]] | None = None,
+                            source_snapshots: list[dict[str, Any]] | None = None,
+                            publication_bodies: dict[str, dict[str, Any]] | None = None,
+                            synthetic_negative_runs: list[dict[str, Any]] | None = None,
+                             synthetic_replay: dict[str, Any] | None = None,
+                            auxiliary_metadata_history: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Collect the finite task denominator for a separate privacy auditor.
+
+    Save result, audit and optional archive_dir outside the task project. The
+    archive preserves private text/metadata inputs which may be updated by
+    normal measurement/index writing. Public runtime files, copied code and
+    generated fixtures are inventory entries awaiting classification, not
+    inferred confidential media. No caller-selected directory exclusion exists.
+    """
+    directory, root = Path(project_dir).resolve(), Path(repo_root).resolve()
+    _, _, known = _known_private_inventory(directory, expected_source_hashes, root,
+                                          historical_artifacts=historical_artifacts, source_snapshots=source_snapshots,
+                                          publication_bodies=publication_bodies, synthetic_negative_runs=synthetic_negative_runs, synthetic_replay=synthetic_replay,
+                                          auxiliary_metadata_history=auxiliary_metadata_history)
+    entries = {ref["path"]: {**ref, "entry_type": "file", "classification": ref["kind"]}
+               for ref in known["known_refs"]}
+    names: set[str] = set()
+    unresolved: list[dict[str, Any]] = [*known["historical_unresolved"], *known["unresolved_source_candidates"]]
+
+    def collect(path: Path, expected: str | None = None) -> None:
+        name = str(path)
+        if name in entries:
+            _require(expected is None or entries[name]["sha256"] == expected, "Inventory reference changed")
+            return
+        _require(len(entries) < MAX_TASK_FILES, "Task inventory exceeds the declared file-count bound")
+        if path.is_symlink():
+            target = os.readlink(path)
+            entries[name] = {"path": name, "entry_type": "symlink", "target": target,
+                             "sha256": hashlib.sha256(os.fsencode(target)).hexdigest(), "classification": "UNCLASSIFIED"}
+        elif path.is_file():
+            ref = artifact_ref(path)
+            _require(expected is None or ref["sha256"] == expected, "Task provenance reference bytes changed")
+            operational = _bookkeeping(path, directory)
+            entries[name] = {**ref, "entry_type": "file", "classification": operational["kind"] if operational else "UNCLASSIFIED"}
+        else:
+            unresolved.append({"path": name, "reason": "Missing or unsupported task provenance artifact"})
+
+    # os.walk does not follow directory symlinks. Their actual link bytes are
+    # still inventoried, and publication scanning rejects links independently.
+    for parent, folders, files in os.walk(directory, followlinks=False):
+        for name in sorted(files + [item for item in folders if (Path(parent) / item).is_symlink()]):
+            path = Path(parent) / name
+            names.add(str(path))
+            collect(path)
+    for ref in known["unfollowed_refs"]:
+        path = Path(ref["path"])
+        collect(path if path.is_absolute() else root / path, ref["sha256"])
+    current_names = {str(Path(parent) / name) for parent, folders, files in os.walk(directory, followlinks=False)
+                     for name in files + [item for item in folders if (Path(parent) / item).is_symlink()]}
+    _require(names == current_names, "Task inventory changed while being collected")
+    preserved: dict[str, dict[str, str]] = {}
+    if archive_dir is not None:
+        archive = Path(archive_dir).resolve()
+        _require(not archive.is_relative_to(directory), "Private inventory archive must be outside the task project")
+        archive.mkdir(parents=True, exist_ok=True)
+        for row in entries.values():
+            path = Path(row["path"])
+            if row["entry_type"] != "file" or row["classification"] not in {"review", "transcript"}:
+                continue
+            _require(path.stat().st_size <= MAX_UNIT_BYTES, "Mutable private metadata exceeds the archive bound")
+            target = archive / row["sha256"]
+            if not target.exists():
+                with path.open("rb") as source, target.open("xb") as output:
+                    shutil.copyfileobj(source, output)
+            _require(sha256(target) == row["sha256"], "Preserved private audit bytes changed")
+            preserved[row["path"]] = artifact_ref(target)
+    return {"schema_version": "private-task-inventory/v1", "project": str(directory),
+            "scope": "All files and symlinks in the registered task project, original/durable sources and recursively referenced task artifacts; unrelated computer files are outside scope",
+            "dependencies": {"code_tree_hash": code_identity(root)["code_tree_hash"],
+                             "source_hashes": expected_source_hashes, "project_hash": sha256(directory / "project.json")},
+            "entries": [entries[name] for name in sorted(entries)], "entry_count": len(entries),
+            "mandatory_private_count": sum(row["classification"] != "UNCLASSIFIED" for row in entries.values()), "unresolved": unresolved,
+            "known_graph": known, "classification_status": "UNVERIFIED",
+            "preserved_private_inputs": preserved,
+            "limits": {"max_task_files": MAX_TASK_FILES},
+            "excluded_directories": []}
+
+
+def _audited_private_inventory(raw: dict[str, Any], directory: Path | None,
+                               expected_sources: dict[str, str] | None, root: Path,
+                               private: dict[str, str], refs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not raw.get("private_inventory_snapshot") or not raw.get("inventory_audit"):
+        return None
+    _require(directory is not None and expected_sources, "Evaluator-bound task identity is required for the inventory audit")
+    assert directory is not None and expected_sources is not None
+    snapshot_ref = raw["private_inventory_snapshot"]
+    _require(not _file(snapshot_ref).is_relative_to(directory.resolve()), "Inventory snapshot must be outside the project it inventories")
+    snapshot = _json(snapshot_ref)
+    current = build_private_inventory(directory, expected_sources, root,
+                                      historical_artifacts=raw.get("historical_artifacts"), source_snapshots=raw.get("source_snapshots"),
+                                      publication_bodies={role: raw[role] for role in ("pr_body", "release_body") if role in raw},
+                                      synthetic_negative_runs=raw.get("synthetic_negative_runs"), synthetic_replay=raw.get("synthetic_replay"),
+                                      auxiliary_metadata_history=raw.get("auxiliary_metadata_history"))
+    _require(snapshot.get("schema_version") == "private-task-inventory/v1" and snapshot.get("project") == current["project"]
+             and snapshot.get("scope") == current["scope"] and snapshot.get("dependencies") == current["dependencies"]
+             and not snapshot.get("unresolved") and not current["unresolved"],
+             "Private inventory snapshot is stale or contains unresolved task references")
+    excluded = raw.get("implementation_run_ids")
+    _require(isinstance(excluded, list) and excluded and all(isinstance(item, str) and item for item in excluded),
+             "Inventory audit must identify its separate implementation runs")
+    assert isinstance(excluded, list)
+    old_entries = {row["path"]: row for row in snapshot["entries"]}
+    current_entries = {row["path"]: row for row in current["entries"]}
+    referenced_inputs = {str((Path(ref["path"]) if Path(ref["path"]).is_absolute() else root / ref["path"]).resolve())
+                         for ref in current["known_graph"]["unfollowed_refs"]}
+    _require(len(old_entries) == snapshot["entry_count"] and set(old_entries).issubset(current_entries),
+             "Private inventory snapshot is stale: an audited task artifact was removed")
+    for path in set(current_entries) - set(old_entries):
+        _require(_bookkeeping(Path(path), directory.resolve(), referenced_input=path in referenced_inputs) is not None and current_entries[path]["entry_type"] == "file",
+                 "Private inventory snapshot is stale: new non-bookkeeping artifact needs a fresh audit")
+    preserved = snapshot.get("preserved_private_inputs", {})
+    input_refs = []
+    for row in snapshot["entries"]:
+        if row["entry_type"] == "file":
+            ref = preserved.get(row["path"], {"path": row["path"], "sha256": row["sha256"]})
+            _require(ref.get("sha256") == row["sha256"], "Preserved audit input differs from the audited original bytes")
+            _file(ref)
+            input_refs.append(ref)
+    extra = raw.get("inventory_classification_evidence", [])
+    _require(isinstance(extra, list), "Inventory classification evidence must be an explicit artifact list")
+    for ref in extra:
+        _file(ref)
+        input_refs.append(ref)
+    from .review import verify_artifact_audit
+    checked = verify_artifact_audit(raw["inventory_audit"], scope="private_inventory", snapshot_ref=snapshot_ref,
+                                   input_refs=input_refs, dependencies=snapshot["dependencies"], excluded_run_ids=set(excluded))
+    response = checked["response"]
+    rows = response.get("private_classifications")
+    _require(isinstance(rows, list) and len(rows) == snapshot["entry_count"], "Auditor did not classify the complete task denominator")
+    assert isinstance(rows, list)
+    entries = old_entries
+    _require(len({row.get("path") for row in rows}) == len(entries), "Audit classifications are duplicated or incomplete")
+    public_count = 0
+    transitions = []
+    for row in rows:
+        entry = entries.get(row.get("path"))
+        _require(entry is not None and row.get("sha256") == entry["sha256"] and row.get("reason"), "Auditor classification targets different bytes or lacks a reason")
+        assert entry is not None
+        kind = row.get("classification")
+        _require(kind in {"media", "transcript", "review", "credentials", "public_work"}, "Unsupported inventory classification")
+        if entry["classification"] != "UNCLASSIFIED":
+            _require(kind == entry["classification"], "Auditor cannot remove a mandatory registered private artifact")
+        if kind == "public_work":
+            _require(current_entries[row["path"]] == entry, "Audited public-work exclusion changed and needs a fresh audit")
+            evidence = row.get("evidence_refs")
+            _require(isinstance(evidence, list) and evidence, "Public runtime/fixture/code exclusions require inspected provenance evidence")
+            inspected = response.get("inspected_artifact_hashes", [])
+            for ref in evidence:
+                _file(ref)
+                _require(ref["sha256"] in inspected, "Public-work exclusion cites evidence the auditor did not inspect")
+                refs.append(ref)
+            public_count += 1
+        elif entry["entry_type"] == "file":
+            private[entry["sha256"]] = kind
+            latest = current_entries[row["path"]]
+            _require(latest["entry_type"] == "file", "Private artifact type changed after the inventory audit")
+            if latest["sha256"] != entry["sha256"]:
+                _require(row["path"] in preserved, "Changed private artifact lacks its preserved pre-audit bytes")
+                if _bookkeeping(Path(row["path"]), directory.resolve(), referenced_input=row["path"] in referenced_inputs) is None:
+                    _require(latest["classification"] == kind, "Changed private artifact has lost its mandatory provenance classification")
+                private[latest["sha256"]] = kind
+                refs.append({"path": latest["path"], "sha256": latest["sha256"]})
+                transitions.append({"path": row["path"], "action": "preserve_old_and_add_current_private_hash",
+                                    "before_sha256": entry["sha256"], "after_sha256": latest["sha256"]})
+        else:
+            _require(current_entries[row["path"]] == entry, "Audited task symlink changed and needs another audit")
+    for path in sorted(set(current_entries) - set(old_entries)):
+        latest = current_entries[path]
+        operational = _bookkeeping(Path(path), directory.resolve(), referenced_input=path in referenced_inputs)
+        _require(operational is not None and latest["entry_type"] == "file",
+                 "Private inventory snapshot is stale: new non-bookkeeping artifact needs a fresh audit")
+        assert operational is not None
+        private[latest["sha256"]] = "review"
+        refs.append({"path": latest["path"], "sha256": latest["sha256"]})
+        transitions.append({"path": path, "action": "add_mandatory_private_bookkeeping", "sha256": latest["sha256"], **operational})
+    refs.extend([snapshot_ref, raw["inventory_audit"], *input_refs])
+    return {"completeness": "PASS", "snapshot": snapshot_ref, "audit": raw["inventory_audit"],
+            "audited_entry_count": snapshot["entry_count"], "entry_count": current["entry_count"],
+            "public_work_exclusions": public_count, "private_transitions": transitions,
+            "scope": current["scope"], "unresolved": []}
+
+
+def verify_release_privacy(raw_ref: dict[str, Any], repo_root: str | Path, *, project_dir: Path | None = None,
+                           expected_source_hashes: dict[str, str] | None = None) -> dict[str, Any]:
+    """Scan actual data now. Missing remote binding or unknown bytes stays null."""
+    root = Path(repo_root).resolve()
+    raw = _json(raw_ref)
+    _require(raw.get("schema_version") == "publication-privacy-input/v1", "Typed publication privacy inputs are required")
+    before = code_identity(root)
+    private: dict[str, str] = {}
+    phrases: list[str] = []
+    corpus_available = False
+    refs = [raw_ref]
+    if raw.get("private_corpus"):
+        corpus = _json(raw["private_corpus"])
+        _require(corpus.get("schema_version") == "private-exclusion-corpus/v1"
+                 and isinstance(corpus.get("file_hashes"), list) and corpus["file_hashes"], "Private exclusion corpus is absent or unsupported")
+        for row in corpus["file_hashes"]:
+            _require(re.fullmatch(r"[a-f0-9]{64}", row.get("sha256", "")) and row.get("kind") in {"media", "transcript", "review", "credentials"}, "Private corpus hash or kind is invalid")
+            _require(row["sha256"] not in private or private[row["sha256"]] == row["kind"], "Conflicting private corpus classifications")
+            private[row["sha256"]] = row["kind"]
+        phrases = corpus.get("protected_transcript_phrases", [])
+        _require(isinstance(phrases, list) and all(isinstance(text, str) and len(text.strip()) >= 40 for text in phrases), "Protected transcript phrases must be explicit substantial text")
+        corpus_available = True
+        refs.append(raw["private_corpus"])
+    submitted = set(private)
+    known, derived_phrases, private_inventory = _known_private_inventory(project_dir, expected_source_hashes, root,
+                                                                      historical_artifacts=raw.get("historical_artifacts"),
+                                                                      source_snapshots=raw.get("source_snapshots"),
+                                                                      publication_bodies={role: raw[role] for role in ("pr_body", "release_body")},
+                                                                      synthetic_negative_runs=raw.get("synthetic_negative_runs"), synthetic_replay=raw.get("synthetic_replay"),
+                                                                      auxiliary_metadata_history=raw.get("auxiliary_metadata_history"))
+    private_inventory["missing_from_submitted_corpus"] = sorted(set(known) - submitted)
+    private.update(known)
+    phrases = sorted(set(phrases) | set(derived_phrases))
+    # Nonempty caller-supplied hashes never establish the denominator. An exact
+    # current task inventory plus separately executed classification audit can.
+    audited = _audited_private_inventory(raw, project_dir, expected_source_hashes, root, private, refs)
+    corpus_complete = audited is not None
+    if audited is not None:
+        private_inventory["classification_audit"] = audited
+        private_inventory["completeness"] = "PASS"
+    refs.extend({"path": ref["path"], "sha256": ref["sha256"]} for ref in private_inventory["known_refs"])
+    scanner = Scan(private, phrases)
+    traces: list[dict[str, Any]] = []
+    inventory = _git_inventory(root, raw["expected_head"], scanner, traces)
+    git_complete = not scanner.unknown
+    archives = _asset_refs(raw.get("archives"))
+    _require(any(name.endswith(".whl") for name in archives) and any(name.endswith(".tar.gz") for name in archives), "Both actual wheel and source distribution must be scanned")
+    assets = _asset_refs(raw.get("release_assets"))
+    for category, items in (("package", archives), ("release_asset", assets)):
+        for name, ref in items.items():
+            path = _file(ref)
+            if path.stat().st_size > MAX_UNIT_BYTES:
+                scanner.unverified(category + ":" + name, "Publication artifact exceeds inspection byte bound")
+            else:
+                scanner.payload(path.read_bytes(), category + ":" + name, path=name)
+            refs.append(ref)
+    for kind in ("pr_body", "release_body"):
+        path = _file(raw.get(kind))
+        if path.stat().st_size > MAX_UNIT_BYTES:
+            scanner.unverified(kind, "Publication body exceeds inspection bound")
+        else:
+            scanner.payload(path.read_bytes(), kind)
+        refs.append(raw[kind])
+    remote = _remote(raw, root, assets, traces)
+    final_head = _command(["git", "rev-parse", "--verify", "HEAD"], root, traces).decode().strip()
+    _require(final_head == inventory["head"] and code_identity(root)["code_tree_hash"] == before["code_tree_hash"], "Code or publication HEAD changed during scanning")
+    complete = not scanner.unknown
+    ready = complete and corpus_complete and remote is not None
+    measured = {"tracked_content_scanned": True if git_complete else None,
+                "assets_scanned": True if complete and remote else None, "body_scanned": True if complete and remote else None,
+                "private_media_count": len(scanner.media) if ready else None,
+                "private_transcript_count": len(scanner.transcripts) if ready else None,
+                "credentials_count": len(scanner.credentials) if ready else None}
+    passed = ready and not scanner.findings and all(value is not None for value in measured.values())
+    return {"schema_version": "publication-privacy-result/v1", "status": "PASS" if passed else "FAIL" if scanner.findings else "UNVERIFIED",
+            "measurements": measured, "dependencies": {"code_tree_hash": before["code_tree_hash"], "public_git_head": inventory["head"]},
+            "evidence_refs": refs, "git": inventory, "remote_publication": remote, "units": scanner.units,
+            "observed_matches": {"private_media_count": len(scanner.media), "private_transcript_count": len(scanner.transcripts), "credentials_count": len(scanner.credentials)},
+            "unknown": scanner.unknown, "findings": [{**item, "severity": "P1", "status": "FAIL"} for item in scanner.findings], "commands": traces,
+            "private_inventory": private_inventory,
+            "coverage": {"unique_content_units": len(scanner.units), "inspected_bytes": scanner.total_bytes,
+                         "all_selected_payloads_read": complete, "private_corpus_available": corpus_available,
+                         "private_corpus_complete": True if corpus_complete else None},
+            "limits": {"max_unit_bytes": MAX_UNIT_BYTES, "max_total_bytes": MAX_TOTAL_BYTES,
+                       "max_units": MAX_UNITS, "max_depth": MAX_DEPTH, "max_commits": MAX_COMMITS},
+            "user_ready": False}
+
+
+def prepare_synthetic_failure_replay(repo_root: str | Path, output_dir: str | Path) -> dict[str, str]:
+    """Persist one fixed public generator run; inventory never regenerates it."""
+    import sys
+
+    from . import evaluator_negative as negative
+    from .project import atomic_json
+    from .verification import _recovery_result, _run_command
+
+    repo, archive = Path(repo_root).resolve(), Path(output_dir).absolute()
+    _require(archive == archive.resolve() and not archive.exists()
+             and not any(archive.is_relative_to(repo / name) for name in ("src", "tests", "schemas", "docs", "examples", ".github")),
+             "Synthetic replay requires a new canonical private archive outside public code")
+    archive.mkdir(parents=True)
+    identity = {"code_identity": code_identity(repo), "producer": artifact_ref(Path(__file__).resolve()),
+                "harness": artifact_ref(Path(negative.__file__).resolve()), "generator": artifact_ref(repo / "examples/recovery.py"),
+                "python": artifact_ref(Path(sys.executable).resolve()), "toolchain": negative.doctor()}
+    atomic_json(archive / "before.json", identity)
+    snapshots = []
+    for name, digest in identity["code_identity"]["files"].items():
+        path = archive / "source" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes((repo / name).read_bytes())
+        _require(sha256(path) == digest, "Code changed while preserving replay sources")
+        snapshots.append({"original": {"path": str(repo / name), "sha256": digest}, "snapshot": artifact_ref(path)})
+    producer = archive / "source" / "privacy-producer.py"
+    producer.write_bytes(Path(__file__).read_bytes())
+    _require(sha256(producer) == identity["producer"]["sha256"], "Replay producer changed while preserving source")
+    target = archive / "generated"
+    argv = [sys.executable, str(repo / "examples/recovery.py"), str(target)]
+    execution = _run_command("fixed-generator", argv, repo, archive, dict(os.environ), timeout=1200)
+    _require(execution["exit_code"] == 0 and not execution["timed_out"] and not execution["interrupted"]
+             and not _file(execution["stderr"]).read_text().strip(), "Fixed public generator failed; partial archive is preserved")
+    _recovery_result(target / "result.json")
+    after = {"code_identity": code_identity(repo), "producer": artifact_ref(Path(__file__).resolve()),
+             "harness": artifact_ref(Path(negative.__file__).resolve()), "generator": artifact_ref(repo / "examples/recovery.py"),
+             "python": artifact_ref(Path(sys.executable).resolve()), "toolchain": negative.doctor()}
+    atomic_json(archive / "after.json", after)
+    _require(identity == after, "Replay code or toolchain changed during generation")
+    artifacts: list[dict[str, str]] = []
+    for path in sorted(archive.rglob("*")):
+        _require(not path.is_symlink(), "Replay generated a symlink")
+        if path.is_file():
+            _require(len(artifacts) < MAX_UNITS, "Replay archive exceeds inspection limits")
+            artifacts.append(artifact_ref(path))
+    bundle = {"schema_version": "synthetic-privacy-replay/v1", "scope": "Fixed generated fixture bytes and execution only; classification and AV remain unverified",
+              "completed": True, "test_only": True, "owner_acceptance": "pending", "audiovisual_review": "UNVERIFIED",
+              "before": artifact_ref(archive / "before.json"), "after": artifact_ref(archive / "after.json"),
+              "source_snapshots": snapshots, "producer_snapshot": artifact_ref(producer),
+              "execution": execution["receipt"], "fixture": artifact_ref(target / "result.json"),
+              "artifacts": artifacts, "artifact_count": len(artifacts)}
+    atomic_json(archive / "bundle.json", bundle)
+    return artifact_ref(archive / "bundle.json")
+
+
+def _verified_synthetic_replay(replay_ref: dict[str, Any] | None, repo: Path) -> dict[str, Any]:
+    import sys
+    from datetime import datetime
+
+    from . import evaluator_negative as negative
+    from .measurement_checks import verify_roundtrip
+    from .verification import _recovery_result
+
+    _require(isinstance(replay_ref, dict), "Preserved synthetic replay bundle is required; run preparation first")
+    assert replay_ref is not None
+    bundle_path = _file(replay_ref)
+    archive = bundle_path.parent
+    bundle = _json(replay_ref)
+    _require(bundle.get("schema_version") == "synthetic-privacy-replay/v1" and bundle.get("completed") is True
+             and bundle.get("test_only") is True and bundle.get("owner_acceptance") == "pending"
+             and bundle.get("audiovisual_review") == "UNVERIFIED", "Synthetic replay is not completed bounded fixture evidence")
+    expected = {"code_identity": code_identity(repo), "producer": artifact_ref(Path(__file__).resolve()),
+                "harness": artifact_ref(Path(negative.__file__).resolve()), "generator": artifact_ref(repo / "examples/recovery.py"),
+                "python": artifact_ref(Path(sys.executable).resolve()), "toolchain": negative.doctor()}
+    _require(_json(bundle["before"]) == expected == _json(bundle["after"]), "Synthetic replay code/harness/toolchain is stale")
+    artifacts = bundle.get("artifacts")
+    _require(isinstance(artifacts, list) and 0 < len(artifacts) == bundle.get("artifact_count") <= MAX_UNITS,
+             "Synthetic replay artifact denominator is invalid")
+    paths = set()
+    for ref in artifacts:
+        path = _file(ref)
+        _require(path.is_relative_to(archive) and path != bundle_path and str(path) not in paths,
+                 "Synthetic replay artifact is duplicated or outside its archive")
+        paths.add(str(path))
+    actual_paths = set()
+    for path in archive.rglob("*"):
+        _require(not path.is_symlink(), "Synthetic replay archive contains a symlink")
+        if path.is_file() and path != bundle_path:
+            actual_paths.add(str(path))
+    _require(paths == actual_paths, "Synthetic replay archive changed or contains unlisted files")
+    _require(all(str(_file(bundle[name])) in paths for name in ("before", "after", "execution", "fixture", "producer_snapshot")),
+             "Synthetic replay evidence is outside its complete archive")
+    snapshots = {row["original"]["path"]: row for row in bundle["source_snapshots"]}
+    _require(len(snapshots) == len(bundle["source_snapshots"]) and set(snapshots) == {str(repo / name) for name in expected["code_identity"]["files"]},
+             "Synthetic replay source snapshot denominator differs from the executed code")
+    for name, digest in expected["code_identity"]["files"].items():
+        row = snapshots[str(repo / name)]
+        _require(row["original"]["sha256"] == row["snapshot"]["sha256"] == digest
+                 and str(_file(row["snapshot"])) in paths, "Synthetic replay source snapshot changed")
+    _require(bundle["producer_snapshot"]["sha256"] == expected["producer"]["sha256"]
+             and str(_file(bundle["producer_snapshot"])) in paths, "Synthetic replay producer snapshot changed")
+    def artifact_edges(value: Any) -> list[dict[str, str]]:
+        found = []
+        if isinstance(value, dict):
+            if isinstance(value.get("path"), str) and isinstance(value.get("sha256"), str):
+                found.append({"path": value["path"], "sha256": value["sha256"]})
+            for child in value.values():
+                found.extend(artifact_edges(child))
+        elif isinstance(value, list):
+            for child in value:
+                found.extend(artifact_edges(child))
+        return found
+
+    allowed_external = {(ref["path"], ref["sha256"]): ref for ref in artifact_edges(expected)}
+    tool_external = {(ref["path"], ref["sha256"]) for ref in artifact_edges(expected["toolchain"])}
+    allowed_external.update({(str(repo / name), digest): {"path": str(repo / name), "sha256": digest}
+                             for name, digest in expected["code_identity"]["files"].items()})
+    source_contents = {row["snapshot"]["path"] for row in bundle["source_snapshots"]} | {bundle["producer_snapshot"]["path"]}
+    external_inputs: dict[str, dict[str, str]] = {}
+    external_tool_links: dict[str, dict[str, Any]] = {}
+    # Frozen source fixtures are verified source bytes, not executed artifact
+    # declarations. Every other actual JSON/log in the generated replay is
+    # closed over its declared byte inventory and exact current execution inputs.
+    for path in [bundle_path, *(Path(name) for name in paths if name not in source_contents)]:
+        _require(path.stat().st_size <= MAX_UNIT_BYTES or path.suffix.lower() not in {".json", ".log"},
+                 "Synthetic replay JSON/log exceeds the inspection bound")
+        if path.stat().st_size > MAX_UNIT_BYTES:
+            continue  # The exact media bytes still remain in artifacts.
+        try:
+            payload = json.loads(path.read_bytes())
+        except (ValueError, UnicodeDecodeError):
+            continue
+        for ref in artifact_edges(payload):
+            if ref["path"] in paths:
+                _file(ref)
+            else:
+                _require((ref["path"], ref["sha256"]) in allowed_external,
+                         "Synthetic replay reference is outside its verified artifact closure")
+                if Path(ref["path"]).is_symlink():
+                    _require((ref["path"], ref["sha256"]) in tool_external,
+                             "Only an exact current execution-tool identity may describe an alias")
+                    target_ref = artifact_ref(Path(ref["path"]).resolve())
+                    _require(target_ref["sha256"] == ref["sha256"], "Execution-tool alias target bytes changed")
+                    link_text = os.readlink(ref["path"])
+                    external_tool_links[ref["path"]] = {"link_path": ref["path"], "link_target": link_text,
+                                                       "link_bytes_sha256": hashlib.sha256(os.fsencode(link_text)).hexdigest(),
+                                                       "declared_target_sha256": ref["sha256"], "actual_target": target_ref}
+                    external_inputs[target_ref["path"]] = target_ref
+                else:
+                    _file(ref)
+                    external_inputs[ref["path"]] = ref
+    fixture_path = _file(bundle["fixture"])
+    target = archive / "generated"
+    _require(fixture_path == target / "result.json", "Synthetic replay fixture has an unrelated path")
+    execution = _json(bundle["execution"])
+    _require(all(str(_file(execution[name])) in paths for name in ("stdout", "stderr")),
+             "Synthetic replay command logs are outside the archive")
+    _require(execution.get("schema_version") == "verification-command/v1"
+             and execution.get("argv") == [sys.executable, str(repo / "examples/recovery.py"), str(target)]
+             and execution.get("cwd") == str(repo) and execution.get("name") == "fixed-generator"
+             and execution.get("exit_code") == 0 and execution.get("timed_out") is False
+             and execution.get("interrupted") is False and execution.get("error") is None
+             and datetime.fromisoformat(execution["started_at"]) <= datetime.fromisoformat(execution["finished_at"]),
+             "Synthetic replay command is unrelated, failed, or incomplete")
+    _require(not _file(execution["stderr"]).read_text().strip()
+             and _json(execution["stdout"]) == {"technical_roundtrip": "PASS", "result": str(fixture_path), "test_only": True, "audiovisual_review": "UNVERIFIED"},
+             "Synthetic replay raw generator output differs from its actual result")
+    checked = _recovery_result(fixture_path)
+    fixture = _json(bundle["fixture"])
+    verify_roundtrip(fixture)
+    steps = _json(fixture["executions"])
+    calls = [node for node in ast.walk(ast.parse((repo / "examples/recovery.py").read_text()))
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "command"
+             and len(node.args) == 2 and isinstance(node.args[0], ast.Constant) and node.args[0].value == "01-generate"]
+    _require(len(calls) == 1 and isinstance(calls[0].args[1], ast.List), "Fixed public generator invocation is ambiguous")
+    argv_node = calls[0].args[1]
+    assert isinstance(argv_node, ast.List)
+    fixed_argv = ast.literal_eval(ast.List(elts=argv_node.elts[:-1], ctx=ast.Load()))
+    _require(len(steps) == 14 and steps[0]["name"] == "01-generate" and steps[0]["argv"][-1] == str(target / "synthetic.mp4"),
+             "Synthetic replay actual generation ledger is incomplete")
+    _require(steps[0]["argv"][:-1] == fixed_argv, "Synthetic replay generation differs from the exact public source command")
+    return {"bundle": replay_ref, "artifacts": artifacts, "external_inputs": list(external_inputs.values()),
+            "external_tool_links": list(external_tool_links.values()), "execution": bundle["execution"],
+            "fixture": bundle["fixture"], "executions": fixture["executions"], "technical_validation": checked,
+            "generator": expected["generator"], "harness": expected["harness"], "code_tree_hash": expected["code_identity"]["code_tree_hash"],
+            "source_sha256": sha256(target / "synthetic.mp4"), "generator_argv_prefix": steps[0]["argv"][:-1],
+            "output_hashes": {stage: value["output"]["sha256"] for stage, value in fixture["outputs"].items()},
+            "scope": "Preserved actual fixed-generator replay; historical execution identities remain unchanged"}
+
+
+def _synthetic_failure_inventory(run_refs: list[dict[str, Any]] | None, repo: Path | None,
+                                 registered: set[str], *, replay_ref: dict[str, Any] | None = None) -> tuple[dict[tuple[str, str], dict[str, Any]], list[dict[str, Any]]]:
+    """Resolve only fixed, reproduced public-source fault fixtures as UNCLASSIFIED.
+
+    A declared old digest is a test input, never a fabricated artifact ref.
+    This does not validate current-code acceptance or confer public approval.
+    """
+    import sys
+    from datetime import datetime
+
+    from . import evaluator_negative as negative
+
+    _require(run_refs is None or isinstance(run_refs, list), "Synthetic failure provenance must be explicit typed run refs")
+    claims: dict[tuple[str, str], dict[str, Any]] = {}
+    observations: list[dict[str, Any]] = []
+    if not run_refs:
+        return claims, observations
+    _require(repo is not None, "Synthetic failure provenance requires the public repository")
+    assert repo is not None
+    _require(len(run_refs) <= 32, "Synthetic failure run inventory exceeds its declared bound")
+    current_harness = artifact_ref(Path(negative.__file__).resolve())
+    current_generator = artifact_ref(repo / "examples/recovery.py")
+    reproduction = _verified_synthetic_replay(replay_ref, repo)
+
+    def process_facts(process: dict[str, Any], argv: list[str]) -> dict[str, Any]:
+        _require(process.get("schema_version") == "negative-process/v1" and process.get("argv") == argv
+                 and process.get("cwd") == str(repo) and process.get("timed_out") is False
+                 and type(process.get("exit_code")) is int, "Synthetic fixture process receipt is unrelated")
+        _require(datetime.fromisoformat(process["started_at"]) <= datetime.fromisoformat(process["finished_at"]),
+                 "Synthetic fixture process time is reversed")
+        _require(not _file(process["stderr"]).read_text().strip(), "Synthetic fixture process has unexpected stderr")
+        return _json(process["stdout"])
+
+    for run_ref in run_refs:
+        raw = _json(run_ref)
+        _require(raw.get("schema_version") == "evaluator-negative-run/v1" and raw.get("test_only") is True
+                 and raw.get("actual_dgist_acceptance") is False and raw.get("final_ac12_audit") is False
+                 and raw.get("audiovisual_review") == "UNVERIFIED" and raw.get("owner_acceptance") == "pending",
+                 "Synthetic fault evidence was relabelled as actual private acceptance")
+        request = _json(raw["request"])
+        _require(raw.get("harness") == current_harness and request.get("harness") == current_harness
+                 and request.get("fixture_source") == current_generator
+                 and request.get("dependencies") == raw.get("dependencies")
+                 and request.get("code_identity", {}).get("code_tree_hash") == raw["dependencies"].get("code_tree_hash"),
+                 "Historical synthetic harness/generator identity is not the exact supported public implementation")
+        _file(raw["harness"])
+        _file(request["fixture_source"])
+        _require(raw.get("toolchain") == negative.doctor(), "Synthetic fixture toolchain cannot reproduce the recorded bytes")
+        receipt_path = Path(run_ref["path"]).parent / "receipt.json"
+        _require(receipt_path.is_file() and not receipt_path.is_symlink(), "Completed synthetic run receipt is missing")
+        receipt = _json(artifact_ref(receipt_path))
+        _require(receipt.get("schema_version") == "evaluator-negative-receipt/v1" and receipt.get("result") == run_ref
+                 and receipt.get("run_id") == raw.get("run_id") and receipt.get("completed") is True
+                 and receipt.get("request") == raw["request"] and receipt.get("harness") == current_harness
+                 and receipt.get("dependencies") == raw["dependencies"] and receipt.get("operation") == "check:evaluator_negative",
+                 "Synthetic fault receipt is not bound to this exact historical result")
+        _require(isinstance(raw.get("artifacts"), list) and 0 < len(raw["artifacts"]) <= MAX_UNITS,
+                 "Synthetic fault artifact denominator is missing")
+        artifacts = {(str(_file(ref)), ref["sha256"]) for ref in raw["artifacts"]}
+        fixture = _json(raw["fixture"])
+        _require(fixture.get("schema_version") == "recovery-example/v1" and fixture.get("test_only") is True
+                 and fixture.get("audiovisual_review") == "UNVERIFIED" and fixture.get("owner_acceptance") == "pending",
+                 "Synthetic fixture provenance is not a public recovery fixture")
+        fixture_directory = Path(fixture["project"]).parent
+        execution = raw["fixture_execution"]
+        process_facts(execution, [sys.executable, str(repo / "examples/recovery.py"), str(fixture_directory)])
+        _require(execution["exit_code"] == 0, "Synthetic fixture generator failed")
+        steps = _json(fixture["executions"])
+        _require(isinstance(steps, list) and len(steps) == 14 and steps[0].get("name") == "01-generate"
+                 and steps[0].get("exit_code") == 0, "Actual synthetic generation ledger is incomplete")
+        for name in ("stdout", "stderr"):
+            _file(steps[0][name])
+        _require(steps[0]["argv"] == [*reproduction["generator_argv_prefix"], str(fixture_directory / "synthetic.mp4")]
+                 and sha256(fixture_directory / "synthetic.mp4") == reproduction["source_sha256"],
+                 "Recorded source bytes are not the reproduced fixed public generator output")
+        _require(all(_file(value["output"]).is_file()
+                     and value["output"]["sha256"] == reproduction["output_hashes"].get(stage)
+                     for stage, value in fixture["outputs"].items())
+                 and set(fixture["outputs"]) == {"baseline", "cut", "restored", "reapplied"},
+                 "Recorded fixture renders are not the reproduced public output bytes")
+        pairs = raw.get("cases", {}).get("wrong_hashes", {}).get("pairs", [])
+        _require([pair.get("name") for pair in pairs] == ["source_bytes", "output_bytes"],
+                 "Both fixed source/output mutation controls are required")
+        rows = []
+        for pair in pairs:
+            negative._mutation("wrong_hashes", pair, fixture)
+            for side, input_key in (("control", "control_input"), ("attack", "mutation_input")):
+                path = _file(pair[input_key])
+                command = negative._probe_command("wrong_hashes", path, repo)
+                observed = process_facts(pair[side], command)
+                actual = subprocess.run(command, cwd=repo, capture_output=True, text=True, timeout=120, check=False)
+                _require(not actual.stderr.strip() and actual.returncode == pair[side]["exit_code"]
+                         and json.loads(actual.stdout) == observed, "Synthetic fault response differs from actual fixed probe replay")
+                if side == "control":
+                    _require(actual.returncode == 0 and observed.get("status") == "TECHNICAL_CONTROL_PASS", "Synthetic fault positive control failed")
+                else:
+                    _require((actual.returncode == (2 if pair["name"] == "source_bytes" else 1)) and negative.REASONS[f"wrong_hashes.{pair['name']}"] in observed.get("reason", ""),
+                             "Synthetic fault did not reject for the required reason")
+            _require(pair["control"]["finished_at"] <= pair["attack"]["started_at"], "Synthetic mutation predates its control")
+            a, b = _json(pair["control_input"]), _json(pair["mutation_input"])
+            if pair["name"] == "source_bytes":
+                original = load_project(a["project"])
+                mutant = _json(artifact_ref(Path(b["project"]) / "project.json"))
+                changes = [(mutant["sources"][role], original["sources"][role]) for role in original["sources"]]
+                initialization = raw["identity_initialization"]
+                process_facts(initialization, [sys.executable, "-m", "talkcut", "init", a["project"], "--screen",
+                                              str(fixture_directory / "synthetic.mp4"), "--speaker", str(fixture_directory / "synthetic.mp4"), "--json"])
+                _require(initialization["exit_code"] == 0, "Synthetic identity initialization failed")
+            else:
+                changes = [(b["output"], a["output"])]
+            for declared, original in changes:
+                preserved = artifact_ref(_file(original))
+                current_path = Path(declared["path"])
+                _require(current_path.is_absolute() and current_path.is_file() and not current_path.is_symlink(), "Synthetic current artifact is missing or a symlink")
+                actual_ref = artifact_ref(current_path)
+                _require(preserved["sha256"] == declared["sha256"], "Synthetic old digest lacks preserved original bytes")
+                _require(not ({preserved["sha256"], actual_ref["sha256"]} & registered), "Registered private source cannot become a synthetic fixture")
+                _require((preserved["path"], preserved["sha256"]) in artifacts and (actual_ref["path"], actual_ref["sha256"]) in artifacts,
+                         "Synthetic before/after bytes are outside the actual run artifact inventory")
+                row = {"declared_reference": {"path": declared["path"], "sha256": declared["sha256"]},
+                       "preserved_original": preserved, "actual_current": actual_ref, "case": "wrong_hashes." + pair["name"],
+                       "historical_run": run_ref, "classification": "UNCLASSIFIED", "status": "MEASURED",
+                       "reason": "Exact reproduced synthetic failure fixture; separate classification audit required"}
+                rows.append(row)
+                # Exact current artifact refs and the one deliberate old claim
+                # all resolve to truthful current/original inventory entries.
+                for key in ((declared["path"], declared["sha256"]), (actual_ref["path"], actual_ref["sha256"]),
+                            (preserved["path"], preserved["sha256"])):
+                    _require(key not in claims or claims[key]["actual_current"] == actual_ref, "Conflicting synthetic failure provenance")
+                    claims[key] = row
+        observations.append({"run": run_ref, "receipt": artifact_ref(receipt_path), "request": raw["request"],
+                             "harness": current_harness, "generator": current_generator, "rows": rows,
+                             "current_reproduction": reproduction, "completeness": "UNVERIFIED"})
+    return claims, observations
+
+
+def _auxiliary_json(path: Path, repo: Path | None, registered: set[str]) -> dict[str, Any]:
+    """Read auxiliary bytes without accepting a formal artifact's truth claims."""
+    _require(path.is_absolute() and path.is_file() and not path.is_symlink()
+             and path.stat().st_size <= MAX_UNIT_BYTES, "Auxiliary metadata exceeds the bounded JSON inspection limit")
+    try:
+        value = json.loads(path.read_bytes())
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise TalkCutError("PUBLICATION_PRIVACY_UNVERIFIED", "Auxiliary historical bytes must be bounded JSON metadata") from exc
+    reserved: set[str] = set(re.findall(r"[a-z][a-z0-9_-]*/v[0-9]+", Path(__file__).read_text()))
+    if repo is not None:
+        for base, pattern in ((repo / "src/talkcut", "*.py"), (repo / "schemas", "*.json")):
+            for source in base.rglob(pattern):
+                reserved.update(re.findall(r"[a-z][a-z0-9_-]*/v[0-9]+", source.read_text()))
+    def immutable_claim(item: Any) -> bool:
+        if isinstance(item, dict):
+            return (item.get("schema_version") in reserved
+                    or item.get("schema_version") == "transcript/v1" and item.get("source_sha256") in registered
+                    or any(immutable_claim(child) for child in item.values()))
+        return isinstance(item, list) and any(immutable_claim(child) for child in item)
+    _require(isinstance(value, dict) and not immutable_claim(value),
+             "Immutable source/transcript/review/measurement/render evidence cannot use auxiliary history")
+    return value
