@@ -5,13 +5,16 @@ import json
 from pathlib import Path
 
 import pytest
-from schema_role_independent_constants import FORMAL_SCHEMAS
+from schema_role_independent_constants import (
+    FORMAL_SCHEMAS as HISTORICAL_FORMAL_SCHEMAS,
+)
 from test_schema_role_guard_independent import copied_schema_repo as repository_fixture
 
 from talkcut import formal_schemas, privacy_checks
 from talkcut.project import TalkCutError
 
 copied_schema_repo = repository_fixture
+FORMAL_SCHEMAS = (*HISTORICAL_FORMAL_SCHEMAS, "draft-evaluation/v1")
 
 
 def declaration_value(path, name):

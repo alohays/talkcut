@@ -14,7 +14,8 @@ FIXTURES = ROOT / 'tests/fixtures/formal_schema_policy'
 LEGACY = json.loads((FIXTURES / 'legacy140.json').read_bytes())
 OWNED = json.loads((FIXTURES / 'owned6.json').read_bytes())
 HISTORICAL = json.loads((FIXTURES / 'historical11.json').read_bytes())
-PROTECTED = [*LEGACY, *[row['schema'] for row in OWNED]]
+DRAFT = {'schema': 'draft-evaluation/v1', 'owner': 'talkcut.draft', 'role': 'formal_artifact'}
+PROTECTED = [*LEGACY, *[row['schema'] for row in OWNED], DRAFT['schema']]
 
 
 @pytest.mark.parametrize('schema', PROTECTED)
@@ -33,8 +34,8 @@ def test_each_old_and_explicit_type_stays_private(tmp_path, schema, nested):
 def test_exact_policy_floor_and_explicit_owners():
     assert len(LEGACY) == len(set(LEGACY)) == 140
     assert tuple(LEGACY) == policy.LEGACY_SCHEMA_TYPES
-    assert tuple(OWNED) == policy.FORMAL_SCHEMA_DECLARATIONS
-    assert len(policy.formal_schema_types()) == 146
+    assert (*OWNED, DRAFT) == policy.FORMAL_SCHEMA_DECLARATIONS
+    assert len(policy.formal_schema_types()) == 147
     assert set(LEGACY) <= policy.formal_schema_types()
 
 
@@ -289,16 +290,16 @@ def test_malformed_source_refuses_without_import(tmp_path):
 
 
 def test_cache_rechecks_added_changed_and_removed_sources(tmp_path):
-    assert len(policy.formal_schema_types(tmp_path)) == 146
+    assert len(policy.formal_schema_types(tmp_path)) == 147
     source = tmp_path / 'src/talkcut/producer.py'
     source.parent.mkdir(parents=True)
     source.write_text('def produce():\n    return {"schema_version": "transcript/v1"}\n')
-    assert len(policy.formal_schema_types(tmp_path)) == 146
+    assert len(policy.formal_schema_types(tmp_path)) == 147
     source.write_text(source.read_text().replace('transcript/v1', 'unowned-output/v1'))
     with pytest.raises(TalkCutError):
         policy.formal_schema_types(tmp_path)
     source.unlink()
-    assert len(policy.formal_schema_types(tmp_path)) == 146
+    assert len(policy.formal_schema_types(tmp_path)) == 147
 
 
 @pytest.mark.parametrize('kind', ['python', 'schema'])
@@ -324,7 +325,7 @@ def test_recursive_directory_alias_refuses_even_after_cache(tmp_path, relative):
     folder = repo / relative
     folder.mkdir(parents=True)
     external.mkdir()
-    assert len(policy.formal_schema_types(repo)) == 146
+    assert len(policy.formal_schema_types(repo)) == 147
     (folder / 'nested').symlink_to(external, target_is_directory=True)
     with pytest.raises(TalkCutError):
         policy.formal_schema_types(repo)
@@ -334,7 +335,7 @@ def test_cached_read_rechecks_all_sources_after_lookup(tmp_path, monkeypatch):
     source = tmp_path / 'src/talkcut/producer.py'
     source.parent.mkdir(parents=True)
     source.write_text('def produce():\n    return {"schema_version": "transcript/v1"}\n')
-    assert len(policy.formal_schema_types(tmp_path)) == 146
+    assert len(policy.formal_schema_types(tmp_path)) == 147
     original, calls, fired = policy._files, 0, False
     def mutation(repo):
         nonlocal calls, fired

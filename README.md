@@ -4,12 +4,15 @@ TalkCut is a local, reversible lecture editing CLI. It preserves a screen
 recording's full canvas and overlays the speaker's full frame in the upper-right
 corner, applying one measured source timeline to video and one audio source.
 
-**Development status: alpha candidate, not a completed lecture-quality release.**
+**Development status: first-edit alpha.**
 Source preservation, full decode/PTS inspection, container geometry, rational
 cut/restore, compositing, technical QC, conservative acoustic analysis, review
 clip generation, evidence import and fail-closed acceptance evaluation are
-implemented. The first real lecture's complete audiovisual acceptance and public
-release are still pending. No owner acceptance is implied.
+implemented. The practical draft workflow produces a first edit with explicit
+timing assumptions and technical checks. Formal whole-lecture audiovisual
+certification remains incomplete. No owner acceptance is implied. The
+[first-edit MVP scope](docs/plans/0003-first-edit-mvp.md) records the owner's
+revised completion criteria separately from the strict acceptance contract.
 
 ## Install and verify
 
@@ -48,9 +51,37 @@ Use your own paths. The entire `projects/` directory is ignored by Git.
 
 ```sh
 uv run --locked talkcut init projects/my-lecture --screen /path/to/screen.mp4 --speaker /path/to/speaker.mp4 --json
-uv run --locked talkcut acceptance freeze projects/my-lecture/frozen-contract.local.json --json
 uv run --locked talkcut inspect projects/my-lecture --full-decode --json
 uv run --locked talkcut sync analyze projects/my-lecture --json
+```
+
+For a first edit, choose a single audio source and supply the constant offsets
+onto the screen recording's clock. Zero offsets retain the original common PTS
+assumption; audio correlation alone does not verify video or lip alignment.
+Use the latest revision returned by `status`. Edge trim values are durations
+removed from the beginning/end, in seconds, and require a reason based on review
+of your recording. Internal pauses and speech are preserved.
+
+```sh
+uv run --locked talkcut status projects/my-lecture --json
+# Replace REVISION with the current integer. Use only reviewed trim durations.
+uv run --locked talkcut draft build projects/my-lecture --audio-source screen --audio-offset 0 --speaker-offset 0 --trim-start 0 --trim-end 0 --reason "Preserve the complete recording for the first composition" --expected-revision REVISION --json
+uv run --locked talkcut render projects/my-lecture --profile draft --json
+uv run --locked talkcut draft evaluate projects/my-lecture --json
+```
+
+`draft evaluate` re-decodes the complete output and checks its source, plan,
+timeline, geometry and sample/frame schedule. `DRAFT_TECHNICALLY_READY` means
+these technical checks passed; it is not a whole-video AI review or owner
+approval. Inspect the actual result and its reported synchronization assumptions.
+Rebuild with different edge trim values to restore or revise the first edit;
+earlier plans and successful MP4s remain preserved. The selected draft cannot be
+rendered as a strict master.
+
+The separate strict workflow begins with a frozen contract and diagnostic render:
+
+```sh
+uv run --locked talkcut acceptance freeze projects/my-lecture/frozen-contract.local.json --json
 uv run --locked talkcut plan build projects/my-lecture --diagnostic --json
 uv run --locked talkcut render projects/my-lecture --profile diagnostic --json
 uv run --locked talkcut qc projects/my-lecture --json

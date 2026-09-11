@@ -92,6 +92,21 @@ def parser_for_cli() -> argparse.ArgumentParser:
     import_sync.add_argument("--model", type=Path, required=True)
     import_sync.add_argument("--expected-revision", type=int, required=True)
     import_sync.add_argument("--json", action="store_true")
+    draft = commands.add_parser("draft", help="Build and technically evaluate an explicit common-clock edge edit")
+    drafts = draft.add_subparsers(dest="action", required=True)
+    draft_build = drafts.add_parser("build")
+    draft_build.add_argument("project", type=Path)
+    draft_build.add_argument("--audio-source", choices=("screen", "speaker"), required=True)
+    draft_build.add_argument("--speaker-offset", required=True)
+    draft_build.add_argument("--audio-offset", required=True)
+    draft_build.add_argument("--trim-start", required=True, help="Duration removed from the beginning")
+    draft_build.add_argument("--trim-end", required=True, help="Duration removed from the end")
+    draft_build.add_argument("--reason", required=True)
+    draft_build.add_argument("--expected-revision", type=int, required=True)
+    draft_build.add_argument("--json", action="store_true")
+    draft_evaluate = drafts.add_parser("evaluate")
+    draft_evaluate.add_argument("project", type=Path)
+    draft_evaluate.add_argument("--json", action="store_true")
     plan = commands.add_parser(
         "plan", help="Build, decide and restore immutable source-time plans"
     )
@@ -129,7 +144,7 @@ def parser_for_cli() -> argparse.ArgumentParser:
         render.add_argument("project", type=Path)
         render.add_argument(
             "--profile",
-            choices=("diagnostic", "review", "master"),
+            choices=("diagnostic", "review", "master", "draft"),
             default="diagnostic",
         )
         render.add_argument("--preset", default="medium")
@@ -324,6 +339,16 @@ def execute(args: argparse.Namespace) -> tuple[dict, int]:
         from .sync import analyze_project as analyze_sync_project
 
         return analyze_sync_project(args.project), 1
+    if args.command == "draft":
+        from .draft import build_draft, evaluate_draft
+
+        if args.action == "evaluate":
+            return evaluate_draft(args.project), 0
+        return build_draft(
+            args.project, audio_source=args.audio_source, speaker_offset=args.speaker_offset,
+            audio_offset=args.audio_offset, trim_start=args.trim_start, trim_end=args.trim_end,
+            reason=args.reason, expected_revision=args.expected_revision,
+        ), 0
     if args.command == "plan":
         if args.action == "set-audio-profile":
             from .plan import set_audio_profile

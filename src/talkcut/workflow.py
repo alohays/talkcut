@@ -43,6 +43,11 @@ def render_project(
             raise TalkCutError(
                 "STALE_TIMELINE", "Resolved timeline depends on a different plan"
             )
+        if profile == "draft":
+            from .draft import validate_draft_plan
+
+            if validate_draft_plan(project, plan) != timeline:
+                raise TalkCutError("STALE_TIMELINE", "Draft timeline differs from its complete plan")
         if profile == "master" and (
             plan["test_only"] or plan["timing"]["status"] != "PASS"
         ):

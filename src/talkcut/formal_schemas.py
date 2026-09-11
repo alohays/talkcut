@@ -172,6 +172,7 @@ FORMAL_SCHEMA_DECLARATIONS: tuple[dict[str, str], ...] = (
     {"schema": 'review-text-origin/v1', "owner": "talkcut.privacy_checks", "role": 'control_contract'},
     {"schema": 'review-text-source-authority/v1', "owner": "talkcut.privacy_checks", "role": 'control_contract'},
     {"schema": 'review-verification-source-authority/v1', "owner": "talkcut.privacy_checks", "role": 'control_contract'},
+    {"schema": 'draft-evaluation/v1', "owner": "talkcut.draft", "role": 'formal_artifact'},
 )
 
 # This is a finite coverage alarm, not Python execution or data-flow analysis.
