@@ -1,269 +1,111 @@
 # TalkCut
 
-TalkCut is a local, reversible lecture editing CLI. It preserves a screen
-recording's full canvas and overlays the speaker's full frame in the upper-right
-corner, applying one measured source timeline to video and one audio source.
+Turn a screen recording and a speaker recording into a lecture video you can revise.
 
-**Development status: first-edit alpha.**
-Source preservation, full decode/PTS inspection, container geometry, rational
-cut/restore, compositing, technical QC, conservative acoustic analysis, review
-clip generation, evidence import and fail-closed acceptance evaluation are
-implemented. The practical draft workflow produces a first edit with explicit
-timing assumptions and technical checks. Formal whole-lecture audiovisual
-certification remains incomplete. No owner acceptance is implied. The
-[first-edit MVP scope](docs/plans/0003-first-edit-mvp.md) records the owner's
-revised completion criteria separately from the strict acceptance contract.
+![Concept illustration of a complete lecture screen, a speaker inset and a shared audio timeline.](docs/assets/talkcut-hero.png)
 
-## Install and verify
+TalkCut is a local command-line editor. It keeps the screen recording's full
+canvas, overlays the speaker's full frame in the upper-right corner, and uses
+one selected audio source. Every cut follows the same measured timeline across
+video and audio. Original recordings, earlier plans and successful renders stay
+available when you change your mind.
 
-Python 3.12+, [uv](https://docs.astral.sh/uv/) and separately installed FFmpeg and
-ffprobe are required. Dependencies are locked; FFmpeg is not bundled.
+**First-edit alpha.** You can compose a lecture, apply reviewed start/end trims,
+and check the complete output's decode, timing and geometry. Synchronization
+assumptions are explicit. Whole-lecture audiovisual certification and owner
+acceptance remain separate work; automatic disfluency removal is deferred.
+
+[Get started](docs/getting-started.md) · [Documentation](docs/README.md) ·
+[CLI reference](docs/cli-reference.md) · [Contribute](CONTRIBUTING.md)
+
+## How it works
+
+<picture>
+  <source media="(max-width: 600px)" srcset="docs/assets/workflow-mobile.svg">
+  <img src="docs/assets/workflow.svg" alt="Four steps: preserve and inspect both recordings, build an explicit draft, render, then evaluate and watch the result.">
+</picture>
+
+`init` saves hash-verified copies. `inspect` records the actual presentation
+timestamps (PTS) and audio samples. A draft records your audio choice, constant
+offsets and any edge trims. The plan compiles to one timeline, which the renderer
+encodes into an MP4.
+`draft evaluate` then rechecks the current plan and fully decodes its output.
+
+The cover illustration is conceptual. TalkCut's interface is the CLI, and the
+[architecture guide](docs/architecture.md) explains the actual artifacts and time mapping.
+
+## Make your first edit
+
+Install Python 3.12+, [uv](https://docs.astral.sh/uv/) and FFmpeg with ffprobe.
+FFmpeg is a separate system dependency. From a checkout of this repository:
 
 ```sh
-uv sync --locked
+uv sync --locked --python 3.12
 uv run --locked talkcut doctor --json
-uv run --locked pytest -q
-uv run --locked ruff check src tests examples
-uv run --locked mypy src/talkcut
-uv build
-uv run --locked talkcut verify --output projects/oss-verification --json
 ```
 
-Tests use generated media, including 100 cuts, fractional frame rates, irregular
-PTS, speaker coverage boundaries, AAC padding and process/storage failures.
-The measured local development environment is macOS 26.6.2 on Apple Silicon,
-Python 3.12.13, uv 0.11.29 and FFmpeg/ffprobe 8.1.2. Other Python versions and
-Linux remain unverified until their corresponding execution results are recorded.
-Passing fixtures is not a certification of a real lecture or general editorial
-accuracy. CI targets Linux and macOS; a configured job is not evidence that its
-current remote run passed. The private acceptance report records actual results.
-
-`verify` executes the locked suite in a fresh development environment, builds a
-wheel, installs its exact runtime dependencies into another isolated environment,
-and runs the recovery example outside the repository. It preserves JUnit, command
-logs, installed-file checks and generated media. Its successful exit describes
-those technical checks; independent fixture/support audit and lecture acceptance
-remain separate.
-
-## Start a private project
-
-Use your own paths. The entire `projects/` directory is ignored by Git.
+Use your own recording paths. `projects/` is ignored by Git.
 
 ```sh
-uv run --locked talkcut init projects/my-lecture --screen /path/to/screen.mp4 --speaker /path/to/speaker.mp4 --json
+uv run --locked talkcut init projects/my-lecture \
+  --screen /path/to/screen.mp4 --speaker /path/to/speaker.mp4 --json
 uv run --locked talkcut inspect projects/my-lecture --full-decode --json
-uv run --locked talkcut sync analyze projects/my-lecture --json
+uv run --locked talkcut status projects/my-lecture --json
 ```
 
-For a first edit, choose a single audio source and supply the constant offsets
-onto the screen recording's clock. Zero offsets retain the original common PTS
-assumption; audio correlation alone does not verify video or lip alignment.
-Use the latest revision returned by `status`. Edge trim values are durations
-removed from the beginning/end, in seconds, and require a reason based on review
-of your recording. Internal pauses and speech are preserved.
+Replace `REVISION` below with the integer returned by `status`. This first pass
+keeps the whole recording and assumes both sources share a clock. For different
+start times, set reviewed offsets using the [timing guide](docs/getting-started.md#3-choose-the-timing-and-build-a-draft).
+Constant offsets cannot correct clock drift.
 
 ```sh
-uv run --locked talkcut status projects/my-lecture --json
-# Replace REVISION with the current integer. Use only reviewed trim durations.
-uv run --locked talkcut draft build projects/my-lecture --audio-source screen --audio-offset 0 --speaker-offset 0 --trim-start 0 --trim-end 0 --reason "Preserve the complete recording for the first composition" --expected-revision REVISION --json
+uv run --locked talkcut draft build projects/my-lecture \
+  --audio-source screen --audio-offset 0 --speaker-offset 0 \
+  --trim-start 0 --trim-end 0 \
+  --reason "Preserve the complete recording for the first composition" \
+  --expected-revision REVISION --json
 uv run --locked talkcut render projects/my-lecture --profile draft --json
 uv run --locked talkcut draft evaluate projects/my-lecture --json
 ```
 
-`draft evaluate` re-decodes the complete output and checks its source, plan,
-timeline, geometry and sample/frame schedule. `DRAFT_TECHNICALLY_READY` means
-these technical checks passed; it is not a whole-video AI review or owner
-approval. Inspect the actual result and its reported synchronization assumptions.
-Rebuild with different edge trim values to restore or revise the first edit;
-earlier plans and successful MP4s remain preserved. The selected draft cannot be
-rendered as a strict master.
+Open the MP4 at `output.path` in the render response. Check the timing, speaker
+placement and sound in the actual video. `DRAFT_TECHNICALLY_READY` means the
+technical checks passed; audiovisual review and owner approval remain pending.
+Rebuild with different reviewed edge trims to revise or restore the edit.
 
-The separate strict workflow begins with a frozen contract and diagnostic render:
+To try TalkCut with generated media, run the
+[recovery walkthrough](docs/recovery.md), which exercises a cut and restoration
+without using a personal recording.
 
-```sh
-uv run --locked talkcut acceptance freeze projects/my-lecture/frozen-contract.local.json --json
-uv run --locked talkcut plan build projects/my-lecture --diagnostic --json
-uv run --locked talkcut render projects/my-lecture --profile diagnostic --json
-uv run --locked talkcut qc projects/my-lecture --json
-uv run --locked talkcut qc projects/my-lecture --compare-source --json
-```
+## Choose the right workflow
 
-`init` makes hash-verified durable copies and retains originals. `inspect` decodes
-selected streams completely and inventories actual PTS, durations and samples.
-Unknown display geometry is rejected unless MP4 track dimensions and transforms
-provide explicit compatible evidence. Reported frame rates alone are not used to
-compile a timeline.
+| Your task | Read |
+| --- | --- |
+| Compose and revise a first lecture edit | [Getting started](docs/getting-started.md) |
+| Find a command, flag or exit code | [CLI reference](docs/cli-reference.md) |
+| Lower audio level or recover after a failed render | [Audio processing](docs/audio-processing.md) · [Recovery](docs/recovery.md) |
+| Understand exact timing, stored artifacts and invalidation | [Architecture](docs/architecture.md) |
+| Work through strict audiovisual review and acceptance | [Acceptance](docs/acceptance.md) · [Evidence reference](docs/evidence-reference.md) |
+| Change the code or maintain the docs | [Contributing](CONTRIBUTING.md) · [Documentation guide](docs/documentation.md) |
 
-Audio correlation reports measured fit/holdout anchors; video alignment and lip
-sync remain unverified. This anchor profile currently requires zero source
-origins and at least 45 seconds. A diagnostic plan is explicitly test-only and
-cannot render a master or become `READY_FOR_OWNER`.
+The strict first-lecture evaluator is bound to the registered DGIST dataset and
+its frozen contract. Diagnostic renders and draft technical checks cannot satisfy
+that contract. [RFC 0003](docs/plans/0003-first-edit-mvp.md) defines the separately
+scoped first-edit handoff; the [acceptance guide](docs/acceptance.md) distinguishes
+its status from strict readiness and owner acceptance.
 
-Use `sync import --model verified-sync.json --expected-revision REVISION` to
-adopt a source mapping after separate executed audio, visual and lip-sync anchor
-reviews. Import validates the exact source bytes and measurements, preserves the
-previous artifacts and invalidates derived plans and output reviews. Output
-anchors still require their own verification.
+## Supported scope
 
-## Reversible decisions and review
+The initial source profile is H.264, 8-bit progressive SDR, with mono or stereo
+AAC. Unsupported display transforms, non-square pixels, clocks and unresolved
+gaps are rejected. The renderer preserves screen presentation intervals and
+handles speaker coverage boundaries explicitly. Compositing re-encodes the video.
 
-```sh
-uv run --locked talkcut status projects/my-lecture --json
-uv run --locked talkcut plan add-test-cut projects/my-lecture --start 10 --end 12 --expected-revision 3 --json
-uv run --locked talkcut plan decide projects/my-lecture --candidate CANDIDATE_ID --decision accept --expected-revision 4 --json
-uv run --locked talkcut plan restore projects/my-lecture --candidate CANDIDATE_ID --expected-revision 5 --json
-```
+Cloud analysis is disabled by default. No cloud SDK, paid API or automatic
+provider fallback is configured. Local speech recognition alone does not provide
+audiovisual review. Subtitles, chapters, slide reconstruction, a graphical editor,
+podcasts and lecture publishing are outside this workflow.
 
-Use the revision returned by the previous command, rather than copying the example
-revision numbers blindly. Test cuts remain excluded from real acceptance. Each
-change stores an immutable plan/timeline and invalidates dependent output review.
-A stale revision is rejected. Reopening verifies sources and the decision chain.
-Failed renders preserve logs, partial files and previous successful outputs.
-Rerunning a failed encode starts a fresh encode; identical successful requests
-reuse only matching, verified artifacts.
-
-The render CLI preserves the actual worker stdout, stderr and exit status and
-registers the resulting media references for acceptance. Successful review imports
-also register their verified execution and capability references. These records
-retain diagnostic flags and unknown review status; registration is not approval.
-
-The [executable recovery example and failure guide](docs/recovery.md) reproduce
-this roundtrip with generated media and preserve the commands and measured results.
-
-`analyze` measures the complete selected source audio and accepts versioned
-transcript and audiovisual context imports. Silence duration or an empty
-transcript alone never authorizes deletion. Without executed audiovisual context,
-the result is `ANALYSIS_UNAVAILABLE`; it is not a verified keep-all edit.
-Demonstrations, questions, reading time and meaningful corrections are protected.
-Disfluency removal requires a separate reviewer execution bound to the candidate.
-
-`review build` extracts every deletion with context, every seam from the actual
-render and overlapping source/output windows. Creating these clips does not
-review them. `review import` checks actual provider receipts, clip identities,
-modalities, observation coverage and demonstrated capability. Cloud analysis is
-disabled by default. No cloud SDK, paid API or automatic provider fallback is
-configured. Local ASR also does not substitute for audiovisual review.
-
-Composite review receipts bind the actual audio model execution, PCM analysis,
-timestamped images and a separate final reviewer to one request and calibrated
-recipe. The CLI image route also verifies its original session, raw child results,
-input hashes and process completion. An independent registration audit is required;
-diagnostic results cannot be promoted retroactively. Composite semantic review
-does not yet support dense-motion or lip-sync precision approval.
-
-After rendering the final master and importing its separate candidate reviews,
-`editorial prepare` captures the current analysis, plan, timeline and output.
-Use the returned snapshot path when binding those reviews:
-
-```sh
-uv run --locked talkcut editorial prepare projects/my-lecture --json
-uv run --locked talkcut editorial bind projects/my-lecture --snapshot SNAPSHOT_JSON --review-import REVIEW_IMPORT_JSON --json
-```
-
-Repeat `--review-import` for each applicable imported review. Binding revalidates
-the original proposals, distinct reviewer executions and prompts, current cut
-boundaries, and source/output hashes. It captures the local verification command
-and indexes its result. Every applied cut needs current audiovisual evidence,
-including cuts selected by the automatic preparation/silence policy. With no
-applied cuts, supply `--no-safe-cuts-audit AUDIT_JSON` and the full-source review
-imports; the audit must independently cover every original candidate and explain
-why no safe deletion remains. Diagnostic output and analysis-free keep-all plans
-cannot bind. Changed code, media or decisions require a fresh binding.
-
-`qc --compare-source` streams every retained full-resolution frame outside the
-speaker rectangle and every valid PCM sample against the measured source mapping.
-It records pixel/waveform differences and potential new black, freeze, silence,
-clipping and discontinuity intervals. Detector thresholds identify investigation
-candidates; they are not semantic quality thresholds. Full comparison coverage
-does not resolve the findings or certify important-content visibility and listening.
-
-## Acceptance boundaries
-
-The [first-lecture plan](docs/plans/0001-dgist-first-lecture.md),
-[review protocol](docs/validation/lecture-review-protocol.md) and
-[autonomous acceptance contract](docs/plans/0002-autonomous-goal-contract.md)
-define the required evidence. The original planning documents remain frozen
-contract snapshots. [Implementation decisions](docs/implementation-decisions.md)
-record observed constraints and subsequent technical choices.
-
-```sh
-uv run --locked talkcut acceptance evaluate projects/my-lecture --render RENDER_ID --contract projects/my-lecture/frozen-contract.local.json --json
-uv run --locked talkcut prepare-release projects/my-lecture --contract projects/my-lecture/frozen-contract.local.json --json
-```
-
-The first-lecture evaluator is specifically bound to the privately registered
-DGIST dataset and AC01–AC13. It is not a generic certificate for arbitrary media.
-Missing, stale, incomplete or unsupported evidence cannot pass. Full source,
-deletions, seams and actual output coverage are recomputed. Exit codes are
-`0` for the requested successful operation, `1` for failed/unverified acceptance,
-and `2` for invalid input or execution failure. Technical-only QC returns `1`
-until its separate audiovisual obligations are resolved.
-
-`acceptance measure PROJECT --check CHECK_ID --input RAW_INPUTS_JSON --contract
-CONTRACT_JSON --json` runs a typed checker in a separate process and preserves
-its actual stdout, stderr, exit code and immutable evidence receipt. A zero exit
-means measurement execution completed; unknown measurements remain `null`.
-It does not promote media or establish acceptance. The input schemas live in
-the corresponding `*_checks.py` modules; unrelated success logs and hand-entered
-PASS labels cannot substitute for their source artifacts. `acceptance evaluate`
-recomputes those measurements before applying AC01–AC13.
-
-Provider failure controls require an unchanged, current audiovisual review import
-and its complete source, output, contract and timeline references:
-
-```sh
-uv run --locked python -m talkcut.provider_failure_checks --input PROVIDER_INPUT_JSON --repo . --output projects/provider-controls
-```
-
-The `provider-failure-input/v1` schema is defined in
-`src/talkcut/provider_failure_checks.py`. Its six fixed faults test completion,
-modality, timestamps, empty output and truncation through the production import
-gates, followed by an actual unchanged-positive recovery and byte-conservation
-checks. Timeout and budget cases inject normalized failure outcomes; they do not
-exhaust a provider or account. The controls execute no models, retain labelled
-counterfactuals with zero review coverage, and reject their later promotion.
-Attach the returned run reference as `provider_controls` in the existing
-`failure-input/v1` measurement input. Missing positive evidence leaves these
-controls unverified; synthetic test success cannot replace it.
-
-The evaluator's ten negative cases run through a separate fixed harness:
-
-```sh
-uv run --locked python -m talkcut.evaluator_negative run --repo . --output projects/evaluator-controls --positive-controls POSITIVE_REGISTRY_JSON
-```
-
-The `evaluator-av-positive-controls/v2` registry and individual
-`evaluator-av-positive/v2` envelopes are defined in
-`src/talkcut/evaluator_av_controls.py`. They bind actual current audiovisual
-reviews and complete independently reviewed editorial fixtures for the
-transcript-only, always-keep and fabricated-approval cases. Each intended
-rejection requires a genuine positive, measured conservation, post-fault
-recovery and refusal to reuse the counterfactual as approval. Saved observations
-must match a fresh execution. Omitting the registry still executes the seven
-technical cases and leaves the three missing controls `null`; all ten remain
-visible and the aggregate result is `UNVERIFIED` with exit code `1`.
-
-Native output-bound requests must capture the complete output hash before execution
-and verify its bytes and file identity again afterward. Legacy audio diagnostics
-cannot acquire that scope later. The `native_candidate` adapter can prepare an
-explicitly unregistered intake leaf from an original bounded process and complete
-PCM trace; independent registration and final composite validation must still
-recheck the original evidence after the terminal review runs.
-
-`READY_FOR_OWNER` is distinct from `OWNER_ACCEPTED`. Code release additionally
-requires independent audit, reproducibility, passing CI, reviewed merge and an
-alpha release. Private recordings, transcripts, review evidence and credentials
-must never be included in public commits, packages, PRs or release assets.
-
-## Scope and license
-
-The initial source profile is H.264 8-bit progressive SDR with mono/stereo AAC.
-Non-square display pixels, rotation/crop transforms, unsupported clocks and
-unresolved gaps are explicitly rejected. The renderer preserves source screen
-presentation intervals and inserts only documented events needed for speaker
-coverage boundaries. It does not claim lossless pixels after compositing.
-
-Subtitles, chapters, slide reconstruction, GUI editing, podcasts and publishing
-lectures are outside this first workflow. See [CONTRIBUTING](CONTRIBUTING.md) and
-[SECURITY](SECURITY.md). TalkCut code is [MIT licensed](LICENSE); third-party
-executables, dependencies, models and recordings retain their own terms.
+Keep recordings, transcripts, review evidence and credentials in private storage;
+see [SECURITY.md](SECURITY.md). TalkCut code is [MIT licensed](LICENSE).
+Third-party executables, dependencies, models and recordings retain their own terms.

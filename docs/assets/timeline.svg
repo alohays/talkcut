@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="594" viewBox="0 0 1200 594" role="img" aria-labelledby="title desc">
+<title id="title">One cut, one shared output clock</title><desc id="desc">Illustrative 12-second timeline: remove source interval [4,7). Screen, speaker and selected audio all retain [0,4) and [7,12), producing a 9-second output. Draft editing is limited to edge trims; this internal cut illustrates the general timeline model.</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#465c6c"/></marker>
+<pattern id="hatch" width="10" height="10" patternUnits="userSpaceOnUse" patternTransform="rotate(35)"><rect width="10" height="10" fill="#f9e2dc"/><path d="M0 0V10" stroke="#dfada0" stroke-width="2"/></pattern></defs>
+<rect width="100%" height="100%" rx="18" fill="#f7fafb"/>
+<g font-family="Arial, Helvetica, sans-serif" fill="#172b3a">
+<text x="36" y="49" font-size="29" fill="#172b3a" font-weight="700" text-anchor="start">One cut, one shared output clock</text>
+<text x="36" y="82" font-size="21" fill="#465c6c" font-weight="400" text-anchor="start">Illustrative cut/restore example. First-edit drafts trim edges only.</text>
+<text x="36" y="125" font-size="21" fill="#465c6c" font-weight="400" text-anchor="start">Source time (s)</text>
+<text x="263" y="125" font-size="21" fill="#465c6c" font-weight="400" text-anchor="middle">0</text>
+<path d="M263 137L263 337" fill="none" stroke="#465c6c" stroke-width="2" stroke-dasharray="6 6"/>
+<text x="535" y="125" font-size="21" fill="#465c6c" font-weight="400" text-anchor="middle">4</text>
+<path d="M535 137L535 337" fill="none" stroke="#465c6c" stroke-width="2" stroke-dasharray="6 6"/>
+<text x="739" y="125" font-size="21" fill="#465c6c" font-weight="400" text-anchor="middle">7</text>
+<path d="M739 137L739 337" fill="none" stroke="#465c6c" stroke-width="2" stroke-dasharray="6 6"/>
+<text x="1079" y="125" font-size="21" fill="#465c6c" font-weight="400" text-anchor="middle">12</text>
+<path d="M1079 137L1079 337" fill="none" stroke="#465c6c" stroke-width="2" stroke-dasharray="6 6"/>
+<text x="36" y="182" font-size="22" fill="#172b3a" font-weight="700" text-anchor="start">Screen</text>
+<rect x="263" y="153" width="272" height="44" rx="4" fill="#d7eee7" stroke="none"/>
+<rect x="535" y="153" width="204" height="44" rx="0" fill="url(#hatch)" stroke="none"/>
+<rect x="739" y="153" width="340" height="44" rx="4" fill="#dfeafb" stroke="none"/>
+<text x="399" y="182" font-size="21" fill="#172b3a" font-weight="400" text-anchor="middle">A · keep 4 s</text>
+<text x="637.0" y="182" font-size="21" fill="#172b3a" font-weight="400" text-anchor="middle">remove 3 s</text>
+<text x="909.0" y="182" font-size="21" fill="#172b3a" font-weight="400" text-anchor="middle">B · keep 5 s</text>
+<text x="36" y="242" font-size="22" fill="#172b3a" font-weight="700" text-anchor="start">Speaker</text>
+<rect x="263" y="213" width="272" height="44" rx="4" fill="#d7eee7" stroke="none"/>
+<rect x="535" y="213" width="204" height="44" rx="0" fill="url(#hatch)" stroke="none"/>
+<rect x="739" y="213" width="340" height="44" rx="4" fill="#dfeafb" stroke="none"/>
+<text x="399" y="242" font-size="21" fill="#172b3a" font-weight="400" text-anchor="middle">A · keep 4 s</text>
+<text x="637.0" y="242" font-size="21" fill="#172b3a" font-weight="400" text-anchor="middle">remove 3 s</text>
+<text x="909.0" y="242" font-size="21" fill="#172b3a" font-weight="400" text-anchor="middle">B · keep 5 s</text>
+<text x="36" y="302" font-size="22" fill="#172b3a" font-weight="700" text-anchor="start">Selected audio</text>
+<rect x="263" y="273" width="272" height="44" rx="4" fill="#d7eee7" stroke="none"/>
+<rect x="535" y="273" width="204" height="44" rx="0" fill="url(#hatch)" stroke="none"/>
+<rect x="739" y="273" width="340" height="44" rx="4" fill="#dfeafb" stroke="none"/>
+<text x="399" y="302" font-size="21" fill="#172b3a" font-weight="400" text-anchor="middle">A · keep 4 s</text>
+<text x="637.0" y="302" font-size="21" fill="#172b3a" font-weight="400" text-anchor="middle">remove 3 s</text>
+<text x="909.0" y="302" font-size="21" fill="#172b3a" font-weight="400" text-anchor="middle">B · keep 5 s</text>
+<path d="M263 341L263 411" fill="none" stroke="#465c6c" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M739 341L535 411" fill="none" stroke="#465c6c" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M1079 341L875 411" fill="none" stroke="#465c6c" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="36" y="456" font-size="22" fill="#172b3a" font-weight="700" text-anchor="start">Shared output</text>
+<rect x="263" y="428" width="272" height="48" rx="4" fill="#d7eee7" stroke="none"/>
+<rect x="535" y="428" width="340" height="48" rx="4" fill="#dfeafb" stroke="none"/>
+<text x="399" y="459" font-size="22" fill="#172b3a" font-weight="400" text-anchor="middle">A · [0, 4)</text>
+<text x="705.0" y="459" font-size="22" fill="#172b3a" font-weight="400" text-anchor="middle">B · [4, 9)</text>
+<text x="263" y="507" font-size="21" fill="#465c6c" font-weight="400" text-anchor="middle">0 s</text>
+<text x="535" y="507" font-size="21" fill="#465c6c" font-weight="400" text-anchor="middle">4 s</text>
+<text x="875" y="507" font-size="21" fill="#465c6c" font-weight="400" text-anchor="middle">9 s</text>
+<text x="36" y="554" font-size="22" fill="#465c6c" font-weight="400" text-anchor="start">For B: output time = source time − 3 s. The original 12 s of media stays intact.</text>
+</g></svg>
