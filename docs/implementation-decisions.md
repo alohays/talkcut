@@ -1,5 +1,28 @@
 # Implementation decisions
 
+[Documentation index](README.md) · [Architecture](architecture.md) · [Evidence reference](evidence-reference.md)
+
+These notes explain the technical policies behind TalkCut. For commands, start
+with the [first-edit guide](getting-started.md); for acceptance obligations, use
+the [acceptance guide](acceptance.md) and its linked contracts.
+
+## On this page
+
+- [Source timing and terminal frames](#exact-source-timing-and-terminal-frames)
+- [Audio correlation](#audio-correlation-and-separate-visual-evidence)
+- [Private projects and artifacts](#private-projects-and-successful-artifacts)
+- [Evidence identity](#evidence-must-identify-the-observed-media)
+- [Verification scope](#verification-scope)
+- [Copied private observations](#explicit-origins-for-copied-private-observations)
+- [CLI input limits](#cli-input-capacity-and-reasoning-records)
+- [Preserved failure records](#preserved-technical-failure-records)
+- [Large private evidence](#preserving-large-private-evidence)
+- [Source excerpts in review records](#source-excerpts-inside-private-review-records)
+- [Git object identifiers](#git-object-identifiers-and-selected-references)
+- [Generated metadata](#generated-metadata-in-private-evidence)
+- [Formal artifact types](#explicit-formal-artifact-types)
+
+
 ## Exact source timing and terminal frames
 
 The first supported workflow uses measured presentation timestamps and stream
@@ -86,7 +109,7 @@ origin does not change the historical command's outcome or certify its execution
 Unknown references and malformed evidence remain failures. These checks support
 the inventory; they do not establish that a particular private project is ready
 for publication.
-# CLI input capacity and reasoning records
+## CLI input capacity and reasoning records
 
 Whole PNG-bearing CLI renderer outputs and canonical session captures have a
 separate 128 MiB inspection bound. Individual frames, final answers, configuration,

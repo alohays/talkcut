@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="440" height="878" viewBox="0 0 440 878" role="img" aria-labelledby="title desc">
+<title id="title">From recordings to a first edit</title><desc id="desc">The same first-edit workflow as the wide diagram, arranged vertically for narrow screens.</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#465c6c"/></marker>
+<pattern id="hatch" width="10" height="10" patternUnits="userSpaceOnUse" patternTransform="rotate(35)"><rect width="10" height="10" fill="#f9e2dc"/><path d="M0 0V10" stroke="#dfada0" stroke-width="2"/></pattern></defs>
+<rect width="100%" height="100%" rx="18" fill="#f7fafb"/>
+<g font-family="Arial, Helvetica, sans-serif" fill="#172b3a">
+<text x="24" y="42" font-size="29" fill="#172b3a" font-weight="700" text-anchor="start">From recordings</text>
+<text x="24" y="77" font-size="29" fill="#172b3a" font-weight="700" text-anchor="start">to a first edit</text>
+<rect x="24" y="103" width="392" height="148" rx="10" fill="#ffffff" stroke="#cbd8df"/>
+<rect x="40" y="119" width="37" height="30" rx="7" fill="#d7eee7" stroke="none"/>
+<text x="58.5" y="141" font-size="19" fill="#172b3a" font-weight="700" text-anchor="middle">01</text>
+<text x="90" y="142" font-size="23" fill="#172b3a" font-weight="700" text-anchor="start">Preserve + inspect</text>
+<text x="40" y="178" font-size="21" fill="#465c6c" font-weight="400" text-anchor="start">Screen and speaker</text>
+<text x="40" y="204" font-size="21" fill="#465c6c" font-weight="400" text-anchor="start">Hash-verified copies</text>
+<text x="40" y="230" font-size="21" fill="#465c6c" font-weight="400" text-anchor="start">Complete PTS inventory</text>
+<path d="M220 257L220 275" fill="none" stroke="#465c6c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="24" y="282" width="392" height="148" rx="10" fill="#ffffff" stroke="#cbd8df"/>
+<rect x="40" y="298" width="37" height="30" rx="7" fill="#dfeafb" stroke="none"/>
+<text x="58.5" y="320" font-size="19" fill="#172b3a" font-weight="700" text-anchor="middle">02</text>
+<text x="90" y="321" font-size="23" fill="#172b3a" font-weight="700" text-anchor="start">Build a draft</text>
+<text x="40" y="357" font-size="21" fill="#465c6c" font-weight="400" text-anchor="start">Choose one audio source</text>
+<text x="40" y="383" font-size="21" fill="#465c6c" font-weight="400" text-anchor="start">Set constant offsets</text>
+<text x="40" y="409" font-size="21" fill="#465c6c" font-weight="400" text-anchor="start">Review any edge trims</text>
+<path d="M220 436L220 454" fill="none" stroke="#465c6c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="24" y="461" width="392" height="148" rx="10" fill="#ffffff" stroke="#cbd8df"/>
+<rect x="40" y="477" width="37" height="30" rx="7" fill="#d7eee7" stroke="none"/>
+<text x="58.5" y="499" font-size="19" fill="#172b3a" font-weight="700" text-anchor="middle">03</text>
+<text x="90" y="500" font-size="23" fill="#172b3a" font-weight="700" text-anchor="start">Render</text>
+<text x="40" y="536" font-size="21" fill="#465c6c" font-weight="400" text-anchor="start">Full screen canvas</text>
+<text x="40" y="562" font-size="21" fill="#465c6c" font-weight="400" text-anchor="start">Full-frame speaker inset</text>
+<text x="40" y="588" font-size="21" fill="#465c6c" font-weight="400" text-anchor="start">One shared cut timeline</text>
+<path d="M220 615L220 633" fill="none" stroke="#465c6c" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="24" y="640" width="392" height="148" rx="10" fill="#ffffff" stroke="#cbd8df"/>
+<rect x="40" y="656" width="37" height="30" rx="7" fill="#dfeafb" stroke="none"/>
+<text x="58.5" y="678" font-size="19" fill="#172b3a" font-weight="700" text-anchor="middle">04</text>
+<text x="90" y="679" font-size="23" fill="#172b3a" font-weight="700" text-anchor="start">Evaluate + watch</text>
+<text x="40" y="715" font-size="21" fill="#465c6c" font-weight="400" text-anchor="start">Check decode and timing</text>
+<text x="40" y="741" font-size="21" fill="#465c6c" font-weight="400" text-anchor="start">Open the actual MP4</text>
+<text x="40" y="767" font-size="21" fill="#465c6c" font-weight="400" text-anchor="start">Owner review is pending</text>
+<text x="24" y="829" font-size="21" fill="#465c6c" font-weight="400" text-anchor="start">Earlier plans and successful outputs</text>
+<text x="24" y="857" font-size="21" fill="#465c6c" font-weight="400" text-anchor="start">stay available when you revise.</text>
+</g></svg>
